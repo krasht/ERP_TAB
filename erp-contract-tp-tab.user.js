@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.16
+// @version      0.71.17
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.16';
+    const SELF_VERSION = '0.71.17';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5098,37 +5098,32 @@
         return { login, pwdPppoe, pwdStat };
     }
 
-    /** Собирает письмо под выбранный набор доступов. */
-    function buildMailBody(kind, data, contractNo) {
+    /**
+     * Собирает письмо под выбранный набор доступов.
+     *
+     * Только сами доступы, без подписей и пояснений: абоненту нужно скопировать
+     * логин и пароль, а «Договор: …» и фраза про сотрудника поддержки только
+     * удлиняли письмо. Номер договора и так есть в теме письма.
+     */
+    function buildMailBody(kind, data) {
         const d = data || {};
-        const num = contractNo || d.login || '';
-        const lines = [];
+        const login = d.login || '—';
 
-        if (kind === 'pppoe') {
-            lines.push('Доступ в интернет (PPPoE):');
-            lines.push('Логин: ' + (d.login || '—'));
-            lines.push('Пароль: ' + (d.pwdPppoe || '—'));
-        } else if (kind === 'stats') {
-            lines.push('Доступ к личному кабинету / статистике:');
-            lines.push('Логин: ' + (d.login || '—'));
-            lines.push('Пароль: ' + (d.pwdStat || '—'));
-        } else {
-            // both — оба блока в одном письме
-            lines.push('Доступ в интернет (PPPoE):');
-            lines.push('Логин: ' + (d.login || '—'));
-            lines.push('Пароль: ' + (d.pwdPppoe || '—'));
-            lines.push('');
-            lines.push('Доступ к личному кабинету / статистике:');
-            lines.push('Логин: ' + (d.login || '—'));
-            lines.push('Пароль: ' + (d.pwdStat || '—'));
-        }
+        const pppoe = [
+            'Доступ в интернет (PPPoE):',
+            'Логин: ' + login,
+            'Пароль: ' + (d.pwdPppoe || '—'),
+        ];
+        const cabinet = [
+            'Доступ к личному кабинету:',
+            'Логин: ' + login,
+            'Пароль: ' + (d.pwdStat || '—'),
+        ];
 
-        lines.push('');
-        lines.push('Договор: ' + (num || '—'));
-        lines.push('');
-        lines.push('Пароли выданы сотрудником технической поддержки.');
-        lines.push('Если вы не запрашивали доступы, сообщите нам об этом.');
-        return lines.join('\n');
+        if (kind === 'pppoe') return pppoe.join('\n');
+        if (kind === 'stats') return cabinet.join('\n');
+        // both — оба блока в одном письме, разделённые пустой строкой
+        return pppoe.join('\n') + '\n\n' + cabinet.join('\n');
     }
 
     /** Тема письма — одна для всех наборов, чтобы абонент узнавал его в ящике. */
@@ -5179,7 +5174,7 @@
             <div class="tp-mail-preview">
                 <div class="tp-mail-preview-title">Письмо</div>
                 <div class="tp-mail-preview-subject">${esc(buildMailSubject(s.contractNo))}</div>
-                <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d, s.contractNo))}</pre>
+                <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d))}</pre>
             </div>
             <button type="button" class="tp-btn tp-mail-send"${(noTo || noPwd) ? ' disabled' : ''}>Отправить</button>
             ${noTo ? '<span class="tp-mail-hint is-bad">В договоре не заполнен E-mail — впишите адрес вручную.</span>' : ''}
@@ -5248,7 +5243,7 @@
             const state = panel._tpMail || {};
             const kind = kindEl ? kindEl.value : 'pppoe';
             panel._tpMailKind = kind;
-            if (preview) preview.textContent = buildMailBody(kind, state.data, state.contractNo);
+            if (preview) preview.textContent = buildMailBody(kind, state.data);
             if (subjectEl) subjectEl.textContent = buildMailSubject(state.contractNo);
             // Кнопка активна, только если для выбранного набора есть пароль
             const d = state.data || {};
@@ -5305,7 +5300,7 @@
                     typeId: sender,
                     to,
                     subject: buildMailSubject(state.contractNo),
-                    text: buildMailBody(kind, state.data, state.contractNo),
+                    text: buildMailBody(kind, state.data),
                 });
                 if (!sent.ok) {
                     say('is-bad', 'Письмо не отправлено: ' + (sent.message || 'причина неизвестна')
