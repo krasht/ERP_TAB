@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.15
+// @version      0.71.16
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.15';
+    const SELF_VERSION = '0.71.16';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -83,6 +83,50 @@
 
     const DEFAULT_DAYS = 3;
     const DEFAULT_COMMENT = 'Доверительный платёж';
+
+    /*
+     * Отправка доступа на почту.
+     *
+     * В ERP письмо — это сообщение процесса (/user/message.do), а не отдельная
+     * «почтовая» ручка. Отсюда устройство операции:
+     *   1) создаём процесс типа «1 Линия / Обращение абонента» на договоре;
+     *   2) в нём создаём сообщение нужного типа (typeId = адрес отправителя);
+     *   3) закрываем процесс статусом «Завершено».
+     *
+     * Почему именно так, а не «просто отправить письмо»: сообщение в ERP без
+     * процесса не существует, а оставлять открытое обращение на каждый показ
+     * пароля — мусор в очередях поддержки. Поэтому обращение создаётся, письмо
+     * уходит и обращение тут же закрывается.
+     */
+
+    /** Процесс «1 Линия / Обращение абонента» — его ID типа в этой базе. */
+    const PROCESS_TYPE_LINE1 = '28';
+    /** Статус «Завершено» — им ERP закрывает процесс. */
+    const PROCESS_STATUS_DONE = '4';
+    /** Промежуточный «В работе»: из «Новый» в «Завершено» напрямую нельзя. */
+    const PROCESS_STATUS_WORK = '2';
+
+    /**
+     * Адреса, с которых ERP умеет отправлять письма (typeId сообщения).
+     *
+     * Список — это типы сообщений, настроенные в биллинге; берём их из формы
+     * создания сообщения, а не хардкодим: у другой базы адреса будут свои.
+     * Здесь только значения по умолчанию и порядок для выпадающего списка.
+     */
+    const MAIL_SENDERS = [
+        { id: '2', email: 'support@avanta-telecom.ru' },
+        { id: '1', email: 'it@avanta-telecom.ru' },
+        { id: '3', email: 'monitoring@avanta-telecom.ru' },
+        { id: '4', email: 'smr@avanta-telecom.ru' },
+        { id: '6', email: 'opora@avanta-telecom.ru' },
+    ];
+    /** Отправитель по умолчанию — поддержка. */
+    const MAIL_DEFAULT_SENDER = '2';
+    /** Куда отправлять, если в договоре не заполнен E-mail. */
+    const MAIL_FALLBACK_TO = '';
+    /** Ключи localStorage для запоминания выбора оператора. */
+    const MAIL_STORE_SENDER = 'erpTpMailSender';
+    const MAIL_STORE_TO = 'erpTpMailTo';
 
     /**
      * Абонплата договора в двух видах: в месяц и в день.
@@ -488,8 +532,11 @@
         if (/^<!DOCTYPE|^<html/i.test(raw) || !plain) {
             return { ok: false, message: 'Биллинг вернул пустой ответ' };
         }
-        // HTML-страница ошибки: вытаскиваем первую осмысленную фразу
-        const err = plain.match(/(Ошибка|Exception|не найден|нельзя|недопустим)[^.]{0,150}/i);
+        // Текстовый отказ ERP: «Переход со статуса 1 на статус 4 невозможен»,
+        // «Действие запрещено», «не найдено». Раньше здесь ловились только
+        // «нельзя/недопустим», и отказ с «невозможен» считался успехом —
+        // обращение после письма оставалось открытым, а оператор видел «Готово».
+        const err = plain.match(/(Ошибка|Exception|не найден|нельзя|недопустим|невозможен|запрещено)[^.]{0,150}/i);
         return { ok: !err, message: err ? err[0] : plain.slice(0, 200) };
     };
 
@@ -863,6 +910,146 @@
 
             const onu = parseGetoltOnu(html);
             return { ok: true, onu, href, reason: onu.length ? '' : 'empty' };
+        },
+
+        /* ------------------------------------------- почта: процесс и сообщение */
+
+        /**
+         * Создание процесса «1 Линия / Обращение абонента» на договоре.
+         *
+         * ERP делает это формой /user/process/link.do с method=linkedProcessCreate:
+         * привязка к объекту (contract:bill) и тип процесса. Возвращает
+         * { ok, id, message }: id нужен, чтобы создать в процессе сообщение
+         * и потом закрыть его.
+         *
+         * Ответ — JSON {"status":"ok","data":{"process":{"id":…}}}. Если ERP
+         * вернула HTML или ошибку, id не будет — вызывающий покажет причину.
+         */
+        async createProcess(cid, opts) {
+            const id = cid || this.contractId();
+            if (!id) throw new Error('Нет ID договора');
+            const o = opts || {};
+
+            const body = new URLSearchParams({
+                method: 'linkedProcessCreate',
+                id: String(id),
+                objectType: 'contract:bill',
+                objectTitle: o.objectTitle || this.contractNumber(id) || '',
+                billingId: 'bill',
+                typeId: String(o.typeId || PROCESS_TYPE_LINE1),
+                description: o.description || '',
+            });
+
+            const res = await fetch('/user/process/link.do', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            });
+            const text = await res.text();
+
+            let json = null;
+            try { json = JSON.parse(text); } catch (e) { /* не JSON — разберём текстом */ }
+
+            const processId = json && json.data && json.data.process && json.data.process.id;
+            if (processId) return { ok: true, id: String(processId), message: '' };
+
+            if (json && json.status && json.status !== 'ok') {
+                return { ok: false, id: '', message: String(json.message || json.status).slice(0, 160) };
+            }
+            const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            const err = plain.match(/(Ошибка|Exception|не найден|запрещено|нельзя)[^.]{0,120}/i);
+            return { ok: false, id: '', message: (err ? err[0] : plain).slice(0, 160) };
+        },
+
+        /**
+         * Отправка сообщения в процессе — это и есть отправка письма.
+         *
+         * Форма ERP (/user/message.do, method=processMessageCreateUpdate):
+         *   processId — процесс, к которому привязано сообщение;
+         *   typeId    — тип сообщения, он же адрес отправителя
+         *               (support@, it@, monitoring@…);
+         *   to        — получатель (может быть несколько через запятую);
+         *   subject   — тема; text — тело;
+         *   tagId     — «вложить историю» (0 — не вкладывать).
+         *
+         * Возвращает { ok, message }. Успех ERP отдаёт как {"status":"ok"}.
+         */
+        async sendProcessMessage(processId, opts) {
+            const pid = processId || '';
+            if (!pid) throw new Error('Нет ID процесса');
+            const o = opts || {};
+
+            const body = new URLSearchParams({
+                method: 'processMessageCreateUpdate',
+                processId: String(pid),
+                id: '',
+                areaId: 'process-message-add',
+                checkEmptySubject: '1',
+                to: o.to || '',
+                toCc: o.toCc || '',
+                updateTags: '1',
+                tagId: String(o.tagId || '0'),
+                data: '',
+                subject: o.subject || '',
+                text: o.text || '',
+                addFileId: '',
+                typeId: String(o.typeId || MAIL_DEFAULT_SENDER),
+            });
+
+            const res = await fetch('/user/message.do', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            });
+            const text = await res.text();
+            return jsonVerdict(text);
+        },
+
+        /**
+         * Закрытие процесса: перевод в «Завершено».
+         *
+         * Отдельного метода «закрыть» у ERP нет — закрытие это переход в
+         * финальный статус. Но переход не всегда прямой: у типа «1 Линия /
+         * Обращение абонента» из «Новый» (1) сразу в «Завершено» (4) биллинг
+         * отвечает «Переход со статуса 1 на статус 4 невозможен». Свежесозданное
+         * обращение всегда в «Новый», поэтому идём через «В работе» (2):
+         * проверено на живом процессе — 1 → 2 → 4 проходит.
+         *
+         * Сначала пробуем прямой переход: если администратор разрешил 1 → 4,
+         * лишний шаг не нужен. Не вышло — идём через промежуточный статус.
+         */
+        async closeProcess(processId, comment) {
+            const pid = processId || '';
+            if (!pid) return { ok: false, message: 'нет ID процесса' };
+
+            const setStatus = async (statusId) => {
+                const body = new URLSearchParams({
+                    id: String(pid),
+                    method: 'processStatusUpdate',
+                    statusId: String(statusId),
+                    comment: comment || '',
+                });
+                const res = await fetch('/user/process.do', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body,
+                });
+                const text = await res.text();
+                return jsonVerdict(text);
+            };
+
+            const direct = await setStatus(PROCESS_STATUS_DONE);
+            if (direct.ok) return direct;
+
+            // Прямой переход запрещён — поднимаем в «В работе» и закрываем оттуда
+            const work = await setStatus(PROCESS_STATUS_WORK);
+            if (!work.ok) {
+                return { ok: false, message: direct.message || work.message || 'переход запрещён' };
+            }
+            return setStatus(PROCESS_STATUS_DONE);
         },
 
         /**
@@ -2714,6 +2901,37 @@
         .tp-whiteip-dev-name { font-size: 12.5px; font-weight: 550; color: var(--tp-fg2); }
         .tp-whiteip-dev-name.is-bad { color: var(--tp-red); }
 
+        /* ---- отправка доступа на почту */
+        .tp-mail-form { display: flex; flex-direction: column; gap: 10px; }
+        .tp-mail-to {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 13px;
+        }
+        .tp-mail-to[data-empty] { border-color: var(--tp-red); }
+        /* Предпросмотр письма: оператор видит, что уйдёт абоненту, до отправки.
+           Моноширинный шрифт и переносы — потому что это готовый текст письма,
+           и перенос строки в нём значим. */
+        .tp-mail-preview {
+            border: 1px solid var(--tp-border); border-radius: 10px;
+            padding: 8px 10px; background: rgba(127,127,127,.06);
+        }
+        .tp-mail-preview-title {
+            font-size: 10px; font-weight: 700; letter-spacing: .06em;
+            text-transform: uppercase; color: var(--tp-fg3); margin-bottom: 4px;
+        }
+        .tp-mail-preview-subject {
+            font-size: 12.5px; font-weight: 600; margin-bottom: 6px;
+        }
+        .tp-mail-preview-text {
+            margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 11.5px; line-height: 1.5; color: var(--tp-fg2);
+            white-space: pre-wrap; word-break: break-word;
+            max-height: 170px; overflow-y: auto;
+        }
+        .tp-mail-hint { font-size: 11px; line-height: 1.4; color: var(--tp-fg3); }
+        .tp-mail-hint.is-bad { color: var(--tp-red); }
+        .tp-mail .tp-msg:empty { display: none; }
+
         /* ---- примечания */
         .tp-memo-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
         .tp-memo-actions .tp-btn { padding: 7px 14px; }
@@ -3500,6 +3718,25 @@
         </div>`;
 
         /*
+         * «Отправить на почту» — выдача доступов абоненту письмом.
+         *
+         * Стоит сразу под «Оборудованием»: это тоже действие с абонентом,
+         * а не справочные данные. Данные для письма (логин и пароль PPPoE,
+         * пароль статистики, адрес получателя) подставляются сами — оператору
+         * остаётся выбрать, что отправлять, и нажать кнопку.
+         *
+         * Устройство ERP: письмо — это сообщение процесса. Поэтому за кулисами
+         * создаётся обращение «1 Линия», в нём сообщение, и обращение сразу
+         * закрывается (см. ERP.createProcess / sendProcessMessage / closeProcess).
+         */
+        const mailCard = `<div class="tp-card tp-mail tp-lazy" data-lazy="mail">
+            <div class="tp-card-title">
+                <span class="tp-dot"></span>Отправить на почту
+            </div>
+            <div class="tp-lazy-body">${skeleton(3)}</div>
+        </div>`;
+
+        /*
          * «Сервисы» — техническая карточка договора в биллинге.
          *
          * Скрипт запрашивал дерево сервисов (inet.do?method=serviceTree) сразу
@@ -3541,6 +3778,7 @@
                     ${sessionsCard}
                     ${servicesCard}
                     ${eqCard}
+                    ${mailCard}
                 </div>
             </div>
         </div>`;
@@ -4818,6 +5056,278 @@
     }
 
 
+    /* ------------------------------------------------ отправка доступа на почту */
+
+    /**
+     * Сохранение/чтение настроек почты (отправитель и получатель).
+     *
+     * Оператор отправляет письма весь день, и каждый раз выбирать адрес заново —
+     * лишние клики. Запоминаем последний выбор в localStorage: он общий для всех
+     * договоров, потому что «с какой почты я пишу» — свойство оператора,
+     * а не абонента.
+     */
+    const mailStore = {
+        get(key, def) {
+            try { return window.localStorage.getItem(key) || def; } catch (e) { return def; }
+        },
+        set(key, value) {
+            try { window.localStorage.setItem(key, String(value)); } catch (e) { /* приватный режим */ }
+        },
+    };
+
+    /** Адрес из карточки договора (поле E-mail), без угловых скобок. */
+    function contractEmail(panel) {
+        const el = panel && panel.querySelector('.tp-client-group');
+        // Поле E-mail рисуется ссылкой mailto: в группе «Контакты»
+        const link = panel && panel.querySelector('a[href^="mailto:"]');
+        if (link) return String(link.getAttribute('href') || '').replace(/^mailto:/i, '').trim();
+        // Запасной путь: значение из params() могло остаться текстом
+        const m = el ? (el.innerText.match(/[\w.+-]+@[\w.-]+\.\w+/) || [])[0] : '';
+        return m || '';
+    }
+
+    /** Данные для письма: логины и пароли, которые скрипт уже знает. */
+    function mailPayload(panel) {
+        const st = panel._tpWhiteIp || {};
+        const creds = st.creds || {};
+        const login = creds.login || '';
+        const pwdPppoe = creds.password || '';
+        // Пароль статистики — то же поле, что в блоке «Доступы»
+        const stat = panel.querySelector('.tp-pwd-val[data-pwd]');
+        const pwdStat = stat ? (stat.dataset.pwd || '') : '';
+        return { login, pwdPppoe, pwdStat };
+    }
+
+    /** Собирает письмо под выбранный набор доступов. */
+    function buildMailBody(kind, data, contractNo) {
+        const d = data || {};
+        const num = contractNo || d.login || '';
+        const lines = [];
+
+        if (kind === 'pppoe') {
+            lines.push('Доступ в интернет (PPPoE):');
+            lines.push('Логин: ' + (d.login || '—'));
+            lines.push('Пароль: ' + (d.pwdPppoe || '—'));
+        } else if (kind === 'stats') {
+            lines.push('Доступ к личному кабинету / статистике:');
+            lines.push('Логин: ' + (d.login || '—'));
+            lines.push('Пароль: ' + (d.pwdStat || '—'));
+        } else {
+            // both — оба блока в одном письме
+            lines.push('Доступ в интернет (PPPoE):');
+            lines.push('Логин: ' + (d.login || '—'));
+            lines.push('Пароль: ' + (d.pwdPppoe || '—'));
+            lines.push('');
+            lines.push('Доступ к личному кабинету / статистике:');
+            lines.push('Логин: ' + (d.login || '—'));
+            lines.push('Пароль: ' + (d.pwdStat || '—'));
+        }
+
+        lines.push('');
+        lines.push('Договор: ' + (num || '—'));
+        lines.push('');
+        lines.push('Пароли выданы сотрудником технической поддержки.');
+        lines.push('Если вы не запрашивали доступы, сообщите нам об этом.');
+        return lines.join('\n');
+    }
+
+    /** Тема письма — одна для всех наборов, чтобы абонент узнавал его в ящике. */
+    function buildMailSubject(contractNo) {
+        return 'Доступы к интернету — договор ' + (contractNo || '');
+    }
+
+    /**
+     * Блок «Отправить на почту».
+     *
+     * Состав: получатель (подставляется из договора, можно поправить),
+     * отправитель (адреса ERP), что отправляем (PPPoE / статистика / оба),
+     * кнопка и результат. Текст письма оператор не правит: он всегда один
+     * и тот же по смыслу, а лишнее поле только замедляет работу.
+     */
+    function renderMail(panel, state) {
+        const s = state || {};
+        const to = s.to || '';
+        const sender = s.sender || MAIL_DEFAULT_SENDER;
+        const kind = s.kind || 'pppoe';
+        const d = s.data || {};
+        const noTo = !to;
+        const noPwd = (kind === 'pppoe' || kind === 'both') ? !d.pwdPppoe
+            : !d.pwdStat;
+
+        const senderOpts = MAIL_SENDERS.map((m) =>
+            `<option value="${esc(m.id)}"${String(m.id) === String(sender) ? ' selected' : ''}>${esc(m.email)}</option>`
+        ).join('');
+
+        return `<div class="tp-mail-form">
+            <label class="tp-field">
+                <span>Получатель</span>
+                <input type="text" class="tp-mail-to" value="${esc(to)}"
+                       placeholder="почта абонента"${noTo ? ' data-empty="1"' : ''}>
+            </label>
+            <label class="tp-field">
+                <span>Отправитель</span>
+                <select class="tp-mail-from">${senderOpts}</select>
+            </label>
+            <label class="tp-field">
+                <span>Что отправить</span>
+                <select class="tp-mail-kind">
+                    <option value="pppoe"${kind === 'pppoe' ? ' selected' : ''}>Логин и пароль PPPoE</option>
+                    <option value="stats"${kind === 'stats' ? ' selected' : ''}>Логин и пароль личного кабинета</option>
+                    <option value="both"${kind === 'both' ? ' selected' : ''}>Оба доступа</option>
+                </select>
+            </label>
+            <div class="tp-mail-preview">
+                <div class="tp-mail-preview-title">Письмо</div>
+                <div class="tp-mail-preview-subject">${esc(buildMailSubject(s.contractNo))}</div>
+                <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d, s.contractNo))}</pre>
+            </div>
+            <button type="button" class="tp-btn tp-mail-send"${(noTo || noPwd) ? ' disabled' : ''}>Отправить</button>
+            ${noTo ? '<span class="tp-mail-hint is-bad">В договоре не заполнен E-mail — впишите адрес вручную.</span>' : ''}
+            ${!noTo && noPwd ? '<span class="tp-mail-hint is-bad">Нет пароля для выбранного доступа — отправка невозможна.</span>' : ''}
+            <span class="tp-msg tp-mail-msg"></span>
+        </div>`;
+    }
+
+    /** Загрузка данных для блока почты. */
+    async function loadMail(panel, cid) {
+        const generation = genOf(panel);
+        const id = cid || panel.dataset.contractId;
+        if (!id) return null;
+
+        // Логин и пароли уже добыты блоком «Белый IP»; если он ещё не успел —
+        // ждём его состояние, чтобы не дублировать запросы к contractCards.
+        let st = panel._tpWhiteIp;
+        if (!st) {
+            st = await erpOnce(panel, 'whiteIpState', () => loadWhiteIp(panel, id)).catch(() => null);
+        }
+
+        if (genOf(panel) !== generation) return null;
+        if (!document.contains(panel)) return null;
+
+        const data = mailPayload(panel);
+        const savedTo = mailStore.get(MAIL_STORE_TO, '');
+        const contractTo = contractEmail(panel);
+        const state = {
+            // Получатель: приоритет у договора — он точнее запомненного вручную
+            to: contractTo || savedTo || MAIL_FALLBACK_TO,
+            sender: mailStore.get(MAIL_STORE_SENDER, MAIL_DEFAULT_SENDER),
+            kind: panel._tpMailKind || 'pppoe',
+            data,
+            contractNo: (st && st.creds && st.creds.login) || ERP.contractNumber(id) || '',
+        };
+        panel._tpMail = state;
+
+        fillLazy(panel, 'mail', renderMail(panel, state));
+        mountMail(panel);
+        return state;
+    }
+
+    /** Обработчики блока почты: смена полей и отправка. */
+    function mountMail(panel) {
+        const card = panel.querySelector('.tp-mail');
+        if (!card) return;
+        const btn = card.querySelector('.tp-mail-send');
+        if (!btn || btn.dataset.bound === '1') return;
+        btn.dataset.bound = '1';
+
+        const msg = card.querySelector('.tp-mail-msg');
+        const say = (cls, text) => {
+            if (!msg) return;
+            msg.className = 'tp-msg tp-mail-msg ' + cls;
+            msg.textContent = text;
+        };
+
+        const toEl = card.querySelector('.tp-mail-to');
+        const fromEl = card.querySelector('.tp-mail-from');
+        const kindEl = card.querySelector('.tp-mail-kind');
+        const preview = card.querySelector('.tp-mail-preview-text');
+        const subjectEl = card.querySelector('.tp-mail-preview-subject');
+
+        // Перерисовка предпросмотра при смене набора доступов
+        const refreshPreview = () => {
+            const state = panel._tpMail || {};
+            const kind = kindEl ? kindEl.value : 'pppoe';
+            panel._tpMailKind = kind;
+            if (preview) preview.textContent = buildMailBody(kind, state.data, state.contractNo);
+            if (subjectEl) subjectEl.textContent = buildMailSubject(state.contractNo);
+            // Кнопка активна, только если для выбранного набора есть пароль
+            const d = state.data || {};
+            const hasPwd = (kind === 'pppoe' || kind === 'both') ? !!d.pwdPppoe : !!d.pwdStat;
+            if (btn) btn.disabled = !hasPwd || !(toEl && toEl.value.trim());
+        };
+
+        if (kindEl) kindEl.addEventListener('change', refreshPreview);
+        if (toEl) {
+            toEl.addEventListener('input', () => {
+                panel._tpMail = Object.assign({}, panel._tpMail, { to: toEl.value.trim() });
+                mailStore.set(MAIL_STORE_TO, toEl.value.trim());
+                refreshPreview();
+            });
+        }
+        if (fromEl) {
+            fromEl.addEventListener('change', () => {
+                panel._tpMail = Object.assign({}, panel._tpMail, { sender: fromEl.value });
+                mailStore.set(MAIL_STORE_SENDER, fromEl.value);
+            });
+        }
+
+        btn.addEventListener('click', async () => {
+            const state = panel._tpMail || {};
+            const cid = panel.dataset.contractId;
+            const to = toEl ? toEl.value.trim() : state.to;
+            const sender = fromEl ? fromEl.value : state.sender;
+            const kind = kindEl ? kindEl.value : 'pppoe';
+
+            if (!to) { say('is-bad', 'Укажите почту получателя'); return; }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+                say('is-bad', 'Похоже, адрес указан с ошибкой: ' + to);
+                return;
+            }
+
+            btn.disabled = true;
+            say('', 'Отправляю…');
+
+            let processId = '';
+            try {
+                // 1) Обращение «1 Линия» — без него сообщение в ERP не создать
+                const created = await ERP.createProcess(cid, {
+                    description: 'Выдача доступов на почту',
+                });
+                if (!created.ok) {
+                    say('is-bad', 'Не удалось создать обращение: ' + (created.message || 'причина неизвестна'));
+                    btn.disabled = false;
+                    return;
+                }
+                processId = created.id;
+
+                // 2) Само письмо — сообщение процесса нужного типа (адрес отправителя)
+                const sent = await ERP.sendProcessMessage(processId, {
+                    typeId: sender,
+                    to,
+                    subject: buildMailSubject(state.contractNo),
+                    text: buildMailBody(kind, state.data, state.contractNo),
+                });
+                if (!sent.ok) {
+                    say('is-bad', 'Письмо не отправлено: ' + (sent.message || 'причина неизвестна')
+                        + ' · обращение #' + processId + ' оставлено открытым');
+                    btn.disabled = false;
+                    return;
+                }
+
+                // 3) Обращение закрываем: письмо ушло, держать его в очереди незачем
+                const closed = await ERP.closeProcess(processId, 'Доступы отправлены на почту');
+                const closeNote = closed.ok ? '' : ' · обращение #' + processId + ' закрыть не удалось';
+
+                say('is-ok', 'Отправлено на ' + to + closeNote);
+                btn.disabled = false;
+            } catch (e) {
+                say('is-bad', 'Ошибка: ' + (e.message || e)
+                    + (processId ? ' · обращение #' + processId : ''));
+                btn.disabled = false;
+            }
+        });
+    }
+
     /* ---------------------------------------------------------- примечания */
 
     /**
@@ -6092,14 +6602,26 @@
         loadAccesses(panel, id).catch(() => {});
 
         // Белый IP: текущие публичные адреса и свободные из категории «IPoE белые»
-        loadWhiteIp(panel, id).catch((e) => {
+        const whiteIpPromise = loadWhiteIp(panel, id).catch((e) => {
             // Истёкшую сессию показываем её собственным текстом: общее «не удалось
             // загрузить» оператор читает как сбой плагина и идёт искать причину.
             const lost = /Сессия ERP истекла/.test(e && e.message || '');
             fillLazy(panel, 'whiteIp', lost
                 ? `<div class="tp-err">${esc(e.message)}</div>`
                 : '<div class="tp-hint">Не удалось загрузить данные по белым IP.</div>');
+            return null;
         });
+
+        // Почта: логин и пароли берём из состояния «Белого IP», поэтому ждём его.
+        // Отдельного запроса к биллингу блоку не нужно — только чтение DOM.
+        whiteIpPromise
+            .then(() => loadMail(panel, id))
+            .catch((e) => {
+                const lost = /Сессия ERP истекла/.test(e && e.message || '');
+                fillLazy(panel, 'mail', lost
+                    ? `<div class="tp-err">${esc(e.message)}</div>`
+                    : '<div class="tp-hint">Не удалось подготовить письмо.</div>');
+            });
 
         alive('balance', balanceOnce(), (bal) => {
             fillLazy(panel, 'balance', buildBalanceHtml(bal));
