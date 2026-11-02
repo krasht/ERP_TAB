@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.4
+// @version      0.71.5
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.4';
+    const SELF_VERSION = '0.71.5';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -2983,10 +2983,27 @@
      *   −30…−25       — средний;
      *   < −30         — плохой.
      * Держим те же границы, чтобы «Для ТП» не спорила с вкладкой GetOLT.
+     *
+     * ВАЖНО: это пороги для RX — мощности, которую ONU принимает от OLT.
+     * К TX они неприменимы. TX — мощность передатчика самого ONU, у неё
+     * паспортное окно совсем другое: GPON Class B+ 0.5…5 дБм, и «+1.7 дБм»
+     * здесь норма, а не «засвет». Пока пороги применялись к обоим лучам,
+     * любое положительное TX красилось красным: 1.71 > −15, значит «засвет».
+     * Поэтому TX оценивается отдельно, по своим границам.
      */
-    function signalVerdict(dbm) {
+    function signalVerdict(dbm, kind) {
         const v = toNum(dbm);
         if (!Number.isFinite(v)) return '';
+
+        // TX (передатчик ONU): норма 0.5…5 дБм по G.984.2 Class B+.
+        // Ниже 0 — модуль деградирует; выше +7 — выход за паспорт, обычно
+        // следствие ошибки калибровки или неисправного модуля.
+        if (kind === 'tx') {
+            if (v > 7) return 'bad';
+            if (v < 0) return 'warn';
+            return 'good';
+        }
+
         if (v >= -15) return 'bad';       // засвет
         if (v > -25) return 'good';
         if (v > -30) return 'warn';
@@ -3190,12 +3207,17 @@
     }
 
     /** Цветной бейдж уровня сигнала: good / warn / bad. */
-    function signalChip(label, dbm) {
+    function signalChip(label, dbm, kind) {
         const v = toNum(dbm);
         if (!Number.isFinite(v)) return '';
-        const verdict = signalVerdict(v) || 'warn';
+        const verdict = signalVerdict(v, kind) || 'warn';
         const sign = v > 0 ? '+' : '';
-        return `<span class="tp-chip tp-sig is-${verdict}" title="${esc(label)}: ${v.toFixed(1)} дБм">`
+        // Подсказка при наведении объясняет, по каким границам оценено:
+        // у RX и TX они разные, и «красный» на +1.7 дБм иначе выглядит ошибкой.
+        const hint = kind === 'tx'
+            ? 'норма 0.5…5 дБм'
+            : 'норма −15…−25 дБм';
+        return `<span class="tp-chip tp-sig is-${verdict}" title="${esc(label)}: ${v.toFixed(1)} дБм (${hint})">`
             + `${esc(label)} ${sign}${v.toFixed(1)} дБм</span>`;
     }
 
@@ -3215,8 +3237,8 @@
                 ].filter(Boolean).join(' · ');
 
                 const chips = [
-                    signalChip('Rx', o.rx),
-                    signalChip('Tx', o.tx),
+                    signalChip('Rx', o.rx, 'rx'),
+                    signalChip('Tx', o.tx, 'tx'),
                 ].filter(Boolean).join('');
 
                 // Телеметрия модуля: температура, напряжение, дистанция
