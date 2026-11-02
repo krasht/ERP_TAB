@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.21
+// @version      0.71.22
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.21';
+    const SELF_VERSION = '0.71.22';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -9489,6 +9489,15 @@
     // и проверять чаще бессмысленно — сервер вернёт ту же шапку.
     const UPDATE_CDN_MIN_MS = 5 * 60 * 1000;
     const UPDATE_SEEN_KEY = 'erpTpUpdateSeenVersion';
+    /**
+     * Пауза после нажатия «Обновить», в течение которой баннер не показываем.
+     *
+     * Даёт оператору время дойти до вкладки Tampermonkey, поставить версию
+     * и перезагрузить ERP. Если за это время он не успел (или установка не
+     * удалась), баннер вернётся — скрипт в странице всё ещё старый.
+     */
+    const UPDATE_SNOOZE_KEY = 'erpTpUpdateSnoozeUntil';
+    const UPDATE_SNOOZE_MS = 5 * 60 * 1000;
 
     /**
      * Применение обновления.
@@ -9622,7 +9631,8 @@
         const actions = document.createElement('div');
         actions.className = 'tp-upd-actions';
 
-        // «Позже» запоминает версию: баннер не всплывает заново на каждой странице
+        // «Позже» — осознанный отказ от этой версии: запоминаем её навсегда,
+        // чтобы окно не всплывало на каждой странице.
         const later = document.createElement('button');
         later.type = 'button';
         later.textContent = 'Позже';
@@ -9631,15 +9641,21 @@
             box.remove();
         });
 
-        // «Обновить» открывает файл: Tampermonkey покажет свою страницу
-        // установки. Баннер снимаем сразу и запоминаем версию, чтобы он не
-        // всплывал на каждой странице, пока оператор ставит обновление.
+        // «Обновить» открывает файл: Tampermonkey показывает свою страницу
+        // установки. Баннер снимаем, но версию в «отложенные» НЕ пишем —
+        // вместо этого ставим паузу на несколько минут.
+        //
+        // Почему так: раньше здесь запоминалась версия, и если установка не
+        // проходила (оператор не дошёл до Tampermonkey, закрыл вкладку, ставил
+        // из-под VPN), баннер пропадал навсегда, а человек продолжал работать
+        // на старом коде. Теперь по истечении паузы проверка снова покажет
+        // окно, если версия в браузере всё ещё старая.
         const ok = document.createElement('button');
         ok.type = 'button';
         ok.className = 'tp-upd-ok';
         ok.textContent = 'Обновить';
         ok.addEventListener('click', () => {
-            updateStoreSet(UPDATE_SEEN_KEY, remoteVersion);
+            updateStoreSet(UPDATE_SNOOZE_KEY, String(Date.now() + UPDATE_SNOOZE_MS));
             box.remove();
             applyUpdate();
         });
@@ -9680,11 +9696,15 @@
                 updateBannerRemove();
                 return;
             }
-            // Эту версию уже отложили («Позже»/«Обновить») — баннер не нужен
+            // Эту версию отложили кнопкой «Позже» — больше не показываем
             if (updateStoreGet(UPDATE_SEEN_KEY) === remote) {
                 updateBannerRemove();
                 return;
             }
+            // Нажимали «Обновить» недавно — даём время поставить версию.
+            // Пауза короткая: если установка не удалась, окно вернётся.
+            const snooze = Number(updateStoreGet(UPDATE_SNOOZE_KEY)) || 0;
+            if (Date.now() < snooze) return;
             updateBannerMount(remote);
         } catch (e) { /* нет сети, файл недоступен — не мешаем работе */ }
     }
