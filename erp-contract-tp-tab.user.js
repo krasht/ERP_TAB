@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.13
+// @version      0.71.14
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.13';
+    const SELF_VERSION = '0.71.14';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3665,7 +3665,15 @@
         if (!cid) return null;
 
         const generation = panel ? genOf(panel) : '';
-        if (showLoading) body.innerHTML = '<div class="tp-loading" style="padding:8px">Загрузка…</div>';
+        // Показ «Загрузка…» пишем напрямую, поэтому кэш сравниваемого HTML
+        // обязательно сбрасываем. Иначе setHtmlIfChanged помнит ПРЕЖНЮЮ
+        // разметку, считает новую «такой же» и не перерисовывает её: на экране
+        // навсегда остаётся «Загрузка…». Воспроизводилось так: История →
+        // Ошибки → История (данные те же, значит сравнение даёт «не изменилось»).
+        if (showLoading) {
+            body.__tpHtml = null;
+            body.innerHTML = '<div class="tp-loading" style="padding:8px">Загрузка…</div>';
+        }
 
         try {
             const data = await ERP.sessions(sessKindOf(container), cid);
@@ -3677,6 +3685,7 @@
         } catch (e) {
             if (panel && genOf(panel) !== generation) return null;
             if (!document.contains(container)) return null;
+            body.__tpHtml = null;
             body.innerHTML = `<div class="tp-err">Не удалось загрузить сессии: ${esc(e.message || e)}</div>`;
             return null;
         }
