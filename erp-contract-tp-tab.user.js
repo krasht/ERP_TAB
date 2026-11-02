@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.7
+// @version      0.71.8
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.7';
+    const SELF_VERSION = '0.71.8';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -7591,10 +7591,7 @@
         const panelStyle = document.getElementById('tp-info-style');
         if (panelStyle) panelStyle.remove();
         // Баннер «доступна новая версия» и его стили
-        const updateBanner = document.getElementById('tp-update-banner');
-        if (updateBanner) updateBanner.remove();
-        const updateStyle = document.getElementById('tp-update-style');
-        if (updateStyle) updateStyle.remove();
+        updateBannerRemove();
     }
 
     /**
@@ -8848,6 +8845,14 @@
         return m ? m[1] : null;
     }
 
+    /** Снять баннер обновления и его стили (если он есть). */
+    function updateBannerRemove() {
+        const el = document.getElementById('tp-update-banner');
+        if (el) el.remove();
+        const style = document.getElementById('tp-update-style');
+        if (style) style.remove();
+    }
+
     function updateBannerMount(remoteVersion) {
         const id = 'tp-update-banner';
         if (document.getElementById(id)) return;
@@ -8925,13 +8930,26 @@
             box.remove();
         });
 
-        // Обновление делает сам менеджер скриптов: страница лишь открывает URL
+        // Обновление делает сам менеджер скриптов: страница лишь открывает URL.
+        //
+        // Баннер убираем сразу. Раньше кнопка только открывала вкладку, а окно
+        // оставалось висеть поверх ERP — оператор нажимал «Обновить», ставил
+        // новую версию и продолжал видеть то же приглашение. Причём повторное
+        // нажатие уже ничего не давало: URL тот же, менеджер считает скрипт
+        // установленным и молча закрывает вкладку. Убрать баннер можно было
+        // только «Позже» или перезагрузкой страницы.
+        //
+        // Почему не оставляем баннер «до перезагрузки»: после установки новая
+        // версия всё равно не заработает без перезагрузки страницы, а висящее
+        // приглашение выглядит как сломанная кнопка. Запоминаем версию, чтобы
+        // окно не вернулось на следующей странице.
         const ok = document.createElement('button');
         ok.type = 'button';
         ok.className = 'tp-upd-ok';
         ok.textContent = 'Обновить';
         ok.addEventListener('click', () => {
             updateStoreSet(UPDATE_SEEN_KEY, remoteVersion);
+            box.remove();
             window.open(SELF_URL, '_blank', 'noopener');
         });
 
@@ -8957,8 +8975,18 @@
         updateStoreSet(UPDATE_CHECK_KEY, Date.now());
         try {
             const remote = await fetchRemoteVersion();
-            if (!remote || !isNewerVersion(remote, SELF_VERSION)) return;
-            if (updateStoreGet(UPDATE_SEEN_KEY) === remote) return; // уже отложили эту версию
+            // Нет данных или версия уже не новее — обновляться нечего.
+            // Висящий баннер в этом случае снимаем: он мог остаться от прошлой
+            // проверки, когда версия была новее, а потом её установили.
+            if (!remote || !isNewerVersion(remote, SELF_VERSION)) {
+                updateBannerRemove();
+                return;
+            }
+            // Эту версию уже отложили («Позже»/«Обновить») — баннер не нужен
+            if (updateStoreGet(UPDATE_SEEN_KEY) === remote) {
+                updateBannerRemove();
+                return;
+            }
             updateBannerMount(remote);
         } catch (e) { /* нет сети, файл недоступен — не мешаем работе */ }
     }
