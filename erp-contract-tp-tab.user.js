@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.20
+// @version      0.71.21
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.20';
+    const SELF_VERSION = '0.71.21';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1322,31 +1322,68 @@
                 all.push({ id, title, preferred: PREFERRED.test(title) });
             });
 
-            // Отбрасываем устройства без категории IP-ресурсов: именно из-за них
-            // биллинг отвечает «Категория IP-ресурса не найдена».
-            //
-            // Ошибку сессии (fetchText бросает на странице входа) НЕ глотаем:
-            // иначе все устройства разом «теряли категорию» и оператор видел
-            // «нет доступных устройств» вместо «войдите заново».
+            /*
+             * Проверка «у устройства настроена категория IP-ресурсов».
+             *
+             * Устройства без категории биллинг отбивает ошибкой 500 «Категория
+             * IP-ресурса не найдена». Браузер печатает такие ответы в консоль
+             * сам, и подавить это со стороны скрипта нельзя — остаётся не
+             * создавать их лишний раз.
+             *
+             * Раньше проверялись ВСЕ устройства при каждой отрисовке панели
+             * (а панель перерисовывается при каждом возврате на вкладку), и
+             * консоль заполнялась десятком 500-х. Теперь:
+             *   • результат проверки запоминается на время сеанса страницы —
+             *     и удачный, и неудачный: устройство не «исправится» само;
+             *   • предпочтительное (BRAS-004) проверяется первым, и как только
+             *     оно подошло, остальные не трогаем вовсе.
+             *
+             * Ошибку сессии (fetchText бросает на странице входа) НЕ глотаем:
+             * иначе все устройства разом «теряли категорию» и оператор видел
+             * «нет доступных устройств» вместо «войдите заново».
+             */
+            if (!ERP._devicesProbe) ERP._devicesProbe = new Map();
+            const probe = ERP._devicesProbe;
+
+            // BRAS-004 вперёд: обычно нужен именно он, и тогда хватит одного запроса
+            const ordered = all.slice().sort((a, b) => (b.preferred ? 1 : 0) - (a.preferred ? 1 : 0));
+
             let sessionLost = null;
-            const checks = await Promise.all(all.map(async (d) => {
-                const u = `/user/plugin/inetip/inetip.do?method=freeIpList`
-                    + `&billingId=bill&moduleId=1&typeId=2&deviceId=${encodeURIComponent(d.id)}`
-                    + `&ifaceId=0&dateFrom=${encodeURIComponent(todayRu())}&dateTo=`;
-                try {
-                    const t = await fetchText(u);
-                    if (/BGException|не найдена|Exception/i.test(t)) return null;
-                    return /class="inetipIp"/.test(t) ? d : null;
-                } catch (e) {
-                    // Истёкшая сессия — не «нет категории», а повод перелогиниться
-                    if (/Сессия ERP истекла/.test(e.message || '')) sessionLost = e;
-                    return null;
+            const ok = [];
+            for (let i = 0; i < ordered.length; i += 1) {
+                const d = ordered[i];
+                let good = probe.get(d.id);
+
+                if (good === undefined) {
+                    const u = `/user/plugin/inetip/inetip.do?method=freeIpList`
+                        + `&billingId=bill&moduleId=1&typeId=2&deviceId=${encodeURIComponent(d.id)}`
+                        + `&ifaceId=0&dateFrom=${encodeURIComponent(todayRu())}&dateTo=`;
+                    try {
+                        const t = await fetchText(u);
+                        good = !/BGException|не найдена|Exception/i.test(t) && /class="inetipIp"/.test(t);
+                        probe.set(d.id, good);
+                    } catch (e) {
+                        // Истёкшая сессия — не «нет категории», а повод перелогиниться
+                        if (/Сессия ERP истекла/.test(e.message || '')) { sessionLost = e; break; }
+                        probe.set(d.id, false);
+                        good = false;
+                    }
                 }
-            }));
+
+                if (good) {
+                    ok.push(d);
+                    // BRAS-004 с категорией найден — остальные для работы не нужны.
+                    // Проверяем это ДО перехода к следующему устройству и
+                    // независимо от того, взято ли значение из кэша: иначе
+                    // закэшированный BRAS-004 не останавливал перебор, и при
+                    // каждой перерисовке панели шёл опрос всех остальных
+                    // устройств — те самые 500-е в консоли.
+                    if (d.preferred) break;
+                }
+            }
             if (sessionLost) throw sessionLost;
 
             // Предпочтительное устройство — первым
-            const ok = checks.filter(Boolean);
             ok.sort((a, b) => (b.preferred ? 1 : 0) - (a.preferred ? 1 : 0));
             return ok;
         },
