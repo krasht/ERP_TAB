@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.9
+// @version      0.71.10
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.9';
+    const SELF_VERSION = '0.71.10';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4106,13 +4106,21 @@
 
         // Адрес — автоматически первый свободный, выбор не нужен
         const autoAddr = (free || [])[0] || '';
+        // Серый адрес, который получит абонент при снятии белого IP.
+        // Показываем заранее: оператор должен видеть, куда вернётся абонент,
+        // и что адрес вообще есть — иначе снятие упадёт с «нет свободных».
+        const greyAddr = (state && state.greyFree && state.greyFree[0]) || '';
         html += `<div class="tp-whiteip-addr-auto">
                 <span class="tp-whiteip-dev-label">Адрес (первый свободный)</span>
                 <span class="tp-whiteip-dev-name">${autoAddr ? esc(autoAddr) : 'нет свободных'}</span>
                 <input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
             </div>
+            <div class="tp-whiteip-addr-auto tp-whiteip-grey-addr">
+                <span class="tp-whiteip-dev-label">Серый при снятии</span>
+                <span class="tp-whiteip-dev-name">${greyAddr ? esc(greyAddr) : 'нет свободных'}</span>
+            </div>
             <button type="button" class="tp-btn tp-whiteip-apply"${autoAddr ? '' : ' disabled'}>Навесить белый IP</button>
-            <button type="button" class="tp-btn is-ghost tp-whiteip-remove"${ipKind === 'white' || hasService ? '' : ' disabled'}>Убрать белый IP</button>
+            <button type="button" class="tp-btn is-ghost tp-whiteip-remove"${(ipKind === 'white' || hasService) && greyAddr ? '' : ' disabled'}>Убрать белый IP</button>
             <span class="tp-msg tp-whiteip-msg"></span>
         </div>`;
 
@@ -4188,6 +4196,14 @@
         const whiteCats = (free || []).filter((c) => c.isWhite);
         const ips = whiteCats.flatMap((c) => c.ips);
 
+        // Свободные серые адреса: нужны, чтобы вернуть абонента на серый IP
+        // конкретным адресом. Пустой addrFrom биллинг принимает, но адрес
+        // не выдаёт — сервис остаётся с 0.0.0.0 и заглушкой [IpAddress:null].
+        const greyIps = (free || [])
+            .filter((c) => !c.isWhite)
+            .flatMap((c) => c.ips)
+            .filter((ip) => !isPublicIp(ip));
+
         // Есть ли услуга «Публичный IP-адрес» в абонплате.
         // Это отдельный модуль (npay), в составе тарифа её не видно,
         // поэтому проверяем запросом, а не по данным «Стоимости».
@@ -4260,6 +4276,8 @@
         // и биллинг ответит «Подходящий ip ресурс не найден».
         const state = {
             current, free: ips, personType, devices, deviceId, svcType, creds,
+            // Свободные серые адреса — для возврата на серый IP конкретным адресом
+            greyFree: greyIps,
             ipoeDeviceId: (ipoeDev && ipoeDev.id) || '',
             pppoeDeviceId: pppoeDevId || '',
             // Для индикаторов в блоке: белый или серый адрес и есть ли услуга
@@ -4744,13 +4762,32 @@
                         return;
                     }
 
-                    // 2) Новый сервис БЕЗ адреса — биллинг выдаст серый динамически.
-                    // addr пустой: если передать адрес из «серых» пулов, он станет
-                    // статическим и зафиксируется за абонентом навсегда.
+                    // 2) Новый сервис с конкретным свободным адресом из серого пула.
                     //
-                    // Пароль — из поля формы: при возврате на серый IP абонент
-                    // должен остаться с тем же паролем, что и в роутере, поэтому
-                    // правка оператора учитывается и здесь.
+                    // Пустой addrFrom биллинг принимает, но адрес не выдаёт:
+                    // сервис остаётся с 0.0.0.0, и в дереве висит заглушка
+                    // шаблона «[IpAddress:null]» — то есть абонент сидит без
+                    // адреса вовсе. Проверено на живом биллинге: создать с
+                    // addrFrom='' → 200 ok, но addrFrom остаётся 0.0.0.0;
+                    // с addrFrom=10.100.31.30 → адрес применяется сразу.
+                    //
+                    // Поэтому берём первый свободный из «серых» категорий
+                    // того же пула, что и тип подключения (PPPoE / IPoE):
+                    // пулы у типов разные, и адрес из чужого не применится.
+                    const greyCats = await ERP.freeIpList(cid, isIpoe ? 2 : 1)
+                        .catch(() => []);
+                    const greyIps = (greyCats || [])
+                        .filter((c) => !c.isWhite)
+                        .flatMap((c) => c.ips)
+                        .filter((ip) => !isPublicIp(ip));
+                    const greyAddr = greyIps[0] || '';
+                    if (!greyAddr) {
+                        say('is-bad', 'В сером пуле нет свободных адресов — белый IP не снят. '
+                            + 'Освободите адрес в биллинге и повторите.');
+                        removeBtn.disabled = false;
+                        return;
+                    }
+
                     const creds = state.creds || {};
                     const pwdEl = panel.querySelector('.tp-whiteip-password');
                     const password = pwdEl ? pwdEl.value.trim() : (creds.password || '');
@@ -4759,7 +4796,7 @@
                         login: creds.login || '',
                         password,
                         mac,
-                        addr: '',
+                        addr: greyAddr,
                         deviceId,
                         comment: 'Возврат на серый IP',
                     });
