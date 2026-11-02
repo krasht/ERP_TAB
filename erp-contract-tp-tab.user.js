@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.6
+// @version      0.71.7
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.6';
+    const SELF_VERSION = '0.71.7';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3616,11 +3616,9 @@
             const typeChip = r.connType ? `<span class="tp-chip" style="padding:1px 7px">${esc(r.connType)}</span>` : '';
             // ERP кладёт в «Сервис» номер договора и IP, которые уже показаны ниже
             // строкой «IP … · устройство». Оставляем только имя сервиса.
-            const serviceName = String(r.service || '')
-                .replace(/\b[A-Z]{2,}\d{4,}\b/gi, '')
-                .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            // Заглушку [IpAddress:null] тоже выкидываем: она приходит из шаблона
+            // имени биллинга, пока сервису не выдан адрес.
+            const serviceName = cleanBillServiceName(r.service, { dropIds: true });
 
             html += `<div class="tp-sess-row ${isNew ? 'tp-fresh' : ''}">
                 <div class="tp-sess-main">
@@ -5329,11 +5327,7 @@
                 : /отключ/i.test(s.state) ? 'отключён' : '';
             // В названии сервиса ERP повторяет номер договора и IP — они уже
             // в шапке карточки и в списке сессий. Оставляем тип и имя.
-            const cleanName = String(s.name || '')
-                .replace(/\b[A-Z]{2,}\d{4,}\b/gi, '')
-                .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const cleanName = cleanBillServiceName(s.name, { dropIds: true });
             const label = [s.type, cleanName].filter(Boolean).join(' ') || 'Интернет';
             rows.push({ name: label, state, value: s.password });
         });
@@ -6260,6 +6254,50 @@
     }
 
     /**
+     * Имя сервиса для показа оператору.
+     *
+     * Биллинг формирует имя по шаблону: `<логин> <addrFrom> <addrTo>`.
+     * Пока адрес не выдан, в него подставляется буквальный текст
+     * `[IpAddress:null]` — это не наш баг, так ERP отдаёт строку в дереве
+     * сервисов (проверено на живой карточке: в <td> приходит ровно
+     * «AV0000001  [IpAddress:null] [IpAddress:null]»). В интерфейсе это
+     * выглядит как поломка, поэтому:
+     *   • выкидываем такие заглушки;
+     *   • схлопываем повтор адреса — при выдаче статического адреса шаблон
+     *     подставляет его дважды («AV0000001 45.157.214.112 45.157.214.112»),
+     *     второй экземпляр ничего не добавляет;
+     *   • пустой остаток заменяем на логин из договора.
+     *
+     * Сами данные не трогаем: поиск текущего публичного адреса в loadWhiteIp
+     * читает исходное s.name, а не результат этой функции.
+     */
+    function cleanBillServiceName(raw, opts) {
+        const dropIds = !!(opts && opts.dropIds);
+        const src = String(raw == null ? '' : raw);
+        let text = src.replace(/\[IpAddress:[^\]]*\]/gi, ' ');
+
+        // В сессиях и «Доступах» номер договора и адрес уже показаны рядом,
+        // в имени они только дублируются.
+        if (dropIds) {
+            text = text
+                .replace(/\b[A-Z]{2,}\d{4,}\b/gi, ' ')
+                .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, ' ');
+        }
+
+        const parts = text.split(/\s+/).filter(Boolean);
+
+        // Убираем повторы подряд: шаблон биллинга ставит адрес и в addrFrom,
+        // и в addrTo, из-за чего он приходит дважды.
+        const out = [];
+        parts.forEach((p) => {
+            if (out.length && out[out.length - 1] === p) return;
+            out.push(p);
+        });
+
+        return out.join(' ').trim();
+    }
+
+    /**
      * Список сервисов договора в биллинге.
      *
      * Показываем тип подключения, период и состояние. «Удалён» подсвечиваем:
@@ -6278,10 +6316,10 @@
                 ? '<span class="tp-chip is-bad">удалён</span>'
                 : closed ? '<span class="tp-chip is-warn">закрыт</span>'
                     : '<span class="tp-chip is-good">открыт</span>';
-            // В названии ERP повторяет номер договора и IP — оставляем как есть:
-            // здесь это единственный идентификатор сервиса в списке.
+            // Имя чистим от заглушек шаблона биллинга ([IpAddress:null] и
+            // задвоенного адреса) — см. cleanServiceName.
             html += `<div class="tp-pay-row">
-                    <span class="tp-pay-name">${esc(s.name || '—')} ${stateChip}
+                    <span class="tp-pay-name">${esc(cleanBillServiceName(s.name) || 'Сервис')} ${stateChip}
                         <span class="tp-chip" style="padding:1px 7px">${esc(s.type || '')}</span>
                     </span>
                     <span class="tp-pay-sum">${esc(s.period || '')}</span>
