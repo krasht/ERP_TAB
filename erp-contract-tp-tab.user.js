@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.2
+// @version      0.71.3
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.2';
+    const SELF_VERSION = '0.71.3';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -8541,7 +8541,15 @@
     const SELF_URL = 'https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.user.js';
     const SELF_META_URL = 'https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.meta.js';
     const UPDATE_CHECK_KEY = 'erpTpUpdateCheckedAt';
-    const UPDATE_CHECK_EVERY_MS = 6 * 60 * 60 * 1000; // раз в 6 часов
+    // Tampermonkey сам опрашивает сервер не чаще раза в 6 часов (это его минимум),
+    // поэтому свежесть релиза держим своей проверкой. 15 минут — компромисс:
+    // .meta.js весит меньше 1 КБ, а релизы выходят несколько раз в день, так что
+    // оператор узнаёт о новой версии почти сразу, но сервер не дёргается зря.
+    const UPDATE_CHECK_EVERY_MS = 15 * 60 * 1000;
+    // У GitHub raw кэш CDN 5 минут: если проверить сразу после релиза, сервер
+    // отдаст ещё старую шапку, и «нет обновлений» будет ложным. Не долбим сервер
+    // чаще этого — толку ноль, ответ тот же.
+    const UPDATE_CDN_MIN_MS = 5 * 60 * 1000;
     const UPDATE_SEEN_KEY = 'erpTpUpdateSeenVersion';
 
     /** Версия из строки «// @version 1.2.3» (ведущие нули и суффиксы не важны). */
@@ -8672,17 +8680,19 @@
     }
 
     /**
-     * Проверка версии: не чаще UPDATE_CHECK_EVERY_MS и не на каждой странице.
+     * Проверка версии: не чаще UPDATE_CHECK_EVERY_MS.
      * Ошибки сети молча игнорируем — проверка обновлений не должна мешать работе.
+     *
+     * force — ручной запуск (__tpInfoTab.update.check(true)): ждёт только кэш CDN.
      */
     async function updateCheck(force) {
-        if (!force) {
-            const last = Number(updateStoreGet(UPDATE_CHECK_KEY)) || 0;
-            // Проверяли недавно — молчим. Показывать баннер повторно между
-            // проверками нельзя: оператор уже нажал «Позже», и всплывающее
-            // окно на каждой странице выглядело бы как навязчивая реклама.
-            if (Date.now() - last < UPDATE_CHECK_EVERY_MS) return;
-        }
+        const last = Number(updateStoreGet(UPDATE_CHECK_KEY)) || 0;
+        const age = Date.now() - last;
+        const minGap = force ? UPDATE_CDN_MIN_MS : UPDATE_CHECK_EVERY_MS;
+        // Проверяли недавно — молчим. Показывать баннер повторно между
+        // проверками нельзя: оператор уже нажал «Позже», и всплывающее
+        // окно на каждой странице выглядело бы как навязчивая реклама.
+        if (age < minGap) return;
         updateStoreSet(UPDATE_CHECK_KEY, Date.now());
         try {
             const remote = await fetchRemoteVersion();
@@ -8696,6 +8706,13 @@
         watch();
         // Проверку обновлений не ставим в очередь с отрисовкой: она сетевая
         setTimeout(() => { updateCheck(false); }, 3000);
+
+        // Оператор может не перезагружать ERP часами, а релиз выходит днём.
+        // Вернулся на вкладку — это самый вероятный момент, когда он готов
+        // увидеть баннер; сама проверка всё равно не чаще UPDATE_CHECK_EVERY_MS.
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) updateCheck(false);
+        });
     }
 
     contentBuilder = buildContent;
