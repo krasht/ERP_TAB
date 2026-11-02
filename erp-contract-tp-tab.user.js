@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.17
+// @version      0.71.18
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.17';
+    const SELF_VERSION = '0.71.18';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -2931,6 +2931,14 @@
         .tp-mail-hint { font-size: 11px; line-height: 1.4; color: var(--tp-fg3); }
         .tp-mail-hint.is-bad { color: var(--tp-red); }
         .tp-mail .tp-msg:empty { display: none; }
+        /* Произвольный текст: моноширинный не нужен — это обычное письмо,
+           но переносы строк значимы, поэтому textarea, а не input. */
+        .tp-mail-custom-wrap textarea {
+            font: inherit; font-size: 13px; line-height: 1.45;
+            resize: vertical; min-height: 96px;
+        }
+        .tp-mail-custom-wrap[hidden] { display: none; }
+        .tp-mail-preview[hidden] { display: none; }
 
         /* ---- примечания */
         .tp-memo-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
@@ -5104,8 +5112,13 @@
      * Только сами доступы, без подписей и пояснений: абоненту нужно скопировать
      * логин и пароль, а «Договор: …» и фраза про сотрудника поддержки только
      * удлиняли письмо. Номер договора и так есть в теме письма.
+     *
+     * kind = 'custom' — произвольный текст оператора: в этом режиме тело письма
+     * берётся из поля ввода как есть, ничего не подставляется.
      */
-    function buildMailBody(kind, data) {
+    function buildMailBody(kind, data, customText) {
+        if (kind === 'custom') return String(customText == null ? '' : customText);
+
         const d = data || {};
         const login = d.login || '—';
 
@@ -5144,10 +5157,14 @@
         const to = s.to || '';
         const sender = s.sender || MAIL_DEFAULT_SENDER;
         const kind = s.kind || 'pppoe';
+        const customText = s.customText || '';
         const d = s.data || {};
         const noTo = !to;
-        const noPwd = (kind === 'pppoe' || kind === 'both') ? !d.pwdPppoe
-            : !d.pwdStat;
+        const isCustom = kind === 'custom';
+        // Пароль нужен только для готовых наборов: в произвольном письме
+        // оператор сам решает, что писать, и требовать пароль нельзя.
+        const noPwd = !isCustom && ((kind === 'pppoe' || kind === 'both') ? !d.pwdPppoe : !d.pwdStat);
+        const noBody = isCustom && !customText.trim();
 
         const senderOpts = MAIL_SENDERS.map((m) =>
             `<option value="${esc(m.id)}"${String(m.id) === String(sender) ? ' selected' : ''}>${esc(m.email)}</option>`
@@ -5169,16 +5186,23 @@
                     <option value="pppoe"${kind === 'pppoe' ? ' selected' : ''}>Логин и пароль PPPoE</option>
                     <option value="stats"${kind === 'stats' ? ' selected' : ''}>Логин и пароль личного кабинета</option>
                     <option value="both"${kind === 'both' ? ' selected' : ''}>Оба доступа</option>
+                    <option value="custom"${isCustom ? ' selected' : ''}>Произвольный текст</option>
                 </select>
             </label>
-            <div class="tp-mail-preview">
+            <label class="tp-field tp-mail-custom-wrap"${isCustom ? '' : ' hidden'}>
+                <span>Текст письма</span>
+                <textarea class="tp-mail-custom" rows="5"
+                          placeholder="Впишите, что нужно отправить абоненту">${esc(customText)}</textarea>
+            </label>
+            <div class="tp-mail-preview"${isCustom ? ' hidden' : ''}>
                 <div class="tp-mail-preview-title">Письмо</div>
                 <div class="tp-mail-preview-subject">${esc(buildMailSubject(s.contractNo))}</div>
-                <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d))}</pre>
+                <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d, customText))}</pre>
             </div>
-            <button type="button" class="tp-btn tp-mail-send"${(noTo || noPwd) ? ' disabled' : ''}>Отправить</button>
+            <button type="button" class="tp-btn tp-mail-send"${(noTo || noPwd || noBody) ? ' disabled' : ''}>Отправить</button>
             ${noTo ? '<span class="tp-mail-hint is-bad">В договоре не заполнен E-mail — впишите адрес вручную.</span>' : ''}
             ${!noTo && noPwd ? '<span class="tp-mail-hint is-bad">Нет пароля для выбранного доступа — отправка невозможна.</span>' : ''}
+            ${!noTo && noBody ? '<span class="tp-mail-hint is-bad">Впишите текст письма.</span>' : ''}
             <span class="tp-msg tp-mail-msg"></span>
         </div>`;
     }
@@ -5237,21 +5261,44 @@
         const kindEl = card.querySelector('.tp-mail-kind');
         const preview = card.querySelector('.tp-mail-preview-text');
         const subjectEl = card.querySelector('.tp-mail-preview-subject');
+        const previewBox = card.querySelector('.tp-mail-preview');
+        const customWrap = card.querySelector('.tp-mail-custom-wrap');
+        const customEl = card.querySelector('.tp-mail-custom');
 
-        // Перерисовка предпросмотра при смене набора доступов
+        // Перерисовка формы при смене набора: у «Произвольного текста» вместо
+        // предпросмотра показываем поле ввода, а пароль не требуется.
         const refreshPreview = () => {
             const state = panel._tpMail || {};
             const kind = kindEl ? kindEl.value : 'pppoe';
+            const isCustom = kind === 'custom';
+            const customText = customEl ? customEl.value : (state.customText || '');
             panel._tpMailKind = kind;
-            if (preview) preview.textContent = buildMailBody(kind, state.data);
+            panel._tpMail = Object.assign({}, state, { kind, customText });
+
+            if (customWrap) customWrap.hidden = !isCustom;
+            if (previewBox) previewBox.hidden = isCustom;
+            if (preview) preview.textContent = buildMailBody(kind, state.data, customText);
             if (subjectEl) subjectEl.textContent = buildMailSubject(state.contractNo);
-            // Кнопка активна, только если для выбранного набора есть пароль
+
+            // Кнопка активна, только если есть пароль (для готовых наборов)
+            // и непустое тело письма (для произвольного текста)
             const d = state.data || {};
-            const hasPwd = (kind === 'pppoe' || kind === 'both') ? !!d.pwdPppoe : !!d.pwdStat;
-            if (btn) btn.disabled = !hasPwd || !(toEl && toEl.value.trim());
+            const hasPwd = isCustom ? true
+                : ((kind === 'pppoe' || kind === 'both') ? !!d.pwdPppoe : !!d.pwdStat);
+            const hasBody = isCustom ? !!String(customText || '').trim() : true;
+            if (btn) btn.disabled = !hasPwd || !hasBody || !(toEl && toEl.value.trim());
         };
 
-        if (kindEl) kindEl.addEventListener('change', refreshPreview);
+        if (kindEl) {
+            kindEl.addEventListener('change', () => {
+                refreshPreview();
+                // Поставили «Произвольный текст» — сразу в поле, чтобы печатать
+                if (kindEl.value === 'custom' && customEl) customEl.focus();
+            });
+        }
+        if (customEl) {
+            customEl.addEventListener('input', refreshPreview);
+        }
         if (toEl) {
             toEl.addEventListener('input', () => {
                 panel._tpMail = Object.assign({}, panel._tpMail, { to: toEl.value.trim() });
@@ -5272,10 +5319,15 @@
             const to = toEl ? toEl.value.trim() : state.to;
             const sender = fromEl ? fromEl.value : state.sender;
             const kind = kindEl ? kindEl.value : 'pppoe';
+            const customText = customEl ? customEl.value : (state.customText || '');
 
             if (!to) { say('is-bad', 'Укажите почту получателя'); return; }
             if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
                 say('is-bad', 'Похоже, адрес указан с ошибкой: ' + to);
+                return;
+            }
+            if (kind === 'custom' && !String(customText).trim()) {
+                say('is-bad', 'Впишите текст письма');
                 return;
             }
 
@@ -5300,7 +5352,7 @@
                     typeId: sender,
                     to,
                     subject: buildMailSubject(state.contractNo),
-                    text: buildMailBody(kind, state.data),
+                    text: buildMailBody(kind, state.data, customText),
                 });
                 if (!sent.ok) {
                     say('is-bad', 'Письмо не отправлено: ' + (sent.message || 'причина неизвестна')
@@ -9578,16 +9630,18 @@
         // внедряем его. Новая копия в начале выполнения снимает старую
         // (window.__erpTpTab.destroy) — вместе с ней уходит и этот баннер.
         //
-        // Раньше кнопка только открывала .user.js в новой вкладке, а окно
-        // оставалось висеть: оператор ставил версию и продолжал видеть то же
-        // приглашение, пока не перезагрузит страницу. Повторное нажатие уже
-        // ничего не давало — менеджер считал скрипт установленным.
+        // ВАЖНО: версию здесь НЕ запоминаем. Раньше записывали, и получалась
+        // ловушка: «Обновить» ставило отметку «эту версию видел», а сам апдейт
+        // не срабатывал (CSP, старая копия в кэше, CDN отдал прежний файл).
+        // Дальше баннер молчал уже навсегда — проверка видела «версию отложили»
+        // и не показывала окно, хотя оператор продолжал работать на старом коде.
+        // Теперь отметка ставится только по «Позже» (осознанный отказ), а после
+        // успешного применения версия и так стала текущей.
         const ok = document.createElement('button');
         ok.type = 'button';
         ok.className = 'tp-upd-ok';
         ok.textContent = 'Обновить';
         ok.addEventListener('click', async () => {
-            updateStoreSet(UPDATE_SEEN_KEY, remoteVersion);
             ok.disabled = true;
             ok.textContent = 'Обновляю…';
 
@@ -9601,6 +9655,8 @@
 
             // Применить в странице не вышло (CSP, сеть, устаревший файл в CDN):
             // откатываемся на прежний путь — открываем файл менеджеру скриптов.
+            // Баннер убираем, но отметку НЕ ставим: если установка не удалась,
+            // при следующей проверке окно появится снова.
             ok.textContent = 'Открываю установку…';
             window.open(SELF_URL, '_blank', 'noopener');
             box.remove();
