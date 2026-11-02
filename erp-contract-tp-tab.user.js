@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.3
+// @version      0.71.4
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.3';
+    const SELF_VERSION = '0.71.4';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -521,6 +521,52 @@
         const hex = String(raw || '').toLowerCase().replace(/[^0-9a-f]/g, '');
         if (hex.length !== 12) return '';
         return `${hex.slice(0, 4)}.${hex.slice(4, 8)}.${hex.slice(8, 12)}`;
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    /**
+     * Публичный ли адрес.
+     *
+     * Серые сети (10/8, 172.16/12, 192.168/16, CGNAT 100.64/10) для белого IP
+     * не годятся: адрес из них выдаётся динамически и абоненту не принадлежит.
+     * Раньше эта проверка жила внутри loadWhiteIp, но нужна и при обновлении
+     * после выдачи/снятия — поэтому вынесена на уровень модуля.
+     */
+    function isPublicIp(ip) {
+        if (!ip) return false;
+        const a = String(ip).split('.').map(Number);
+        if (a.length !== 4 || a.some((n) => !Number.isFinite(n))) return false;
+        if (a[0] === 10) return false;                       // 10.0.0.0/8
+        if (a[0] === 127) return false;                      // loopback
+        if (a[0] === 0) return false;                        // 0.0.0.0
+        if (a[0] === 172 && a[1] >= 16 && a[1] <= 31) return false; // 172.16/12
+        if (a[0] === 192 && a[1] === 168) return false;      // 192.168/16
+        if (a[0] === 100 && a[1] >= 64 && a[1] <= 127) return false; // CGNAT
+        if (a[0] === 169 && a[1] === 254) return false;      // link-local
+        return true;
+    }
+
+    /**
+     * Опрос с паузами: ждёт, пока fn() не вернёт истину.
+     *
+     * Биллинг применяет сервис не мгновенно — между ответом на serviceCreate
+     * и появлением адреса в дереве проходит от долей секунды до нескольких.
+     * Задержки нарастающие: первые секунды опрашиваем часто, дальше реже,
+     * чтобы не заваливать ERP запросами.
+     */
+    async function waitUntil(fn, delays) {
+        const steps = (delays && delays.length) ? delays : [0, 800, 1800, 3200, 5000];
+        let prev = 0;
+        for (let i = 0; i < steps.length; i += 1) {
+            const wait = steps[i] - prev;
+            if (wait > 0) await sleep(wait);
+            prev = steps[i];
+            try {
+                if (await fn()) return true;
+            } catch (e) { /* сеть моргнула — попробуем ещё раз */ }
+        }
+        return false;
     }
 
     /* --------------------------------------------------------- ERP data layer */
@@ -1327,6 +1373,11 @@
                 credentials: 'same-origin',
             });
             const text = await res.text();
+            // Сервис создан — прежние ответы ERP устарели. Без сброса панель
+            // после выдачи белого IP ещё минуту показывала старое дерево
+            // сервисов и прежний список свободных адресов (в нём висел только
+            // что выданный адрес), потому что этот POST идёт мимо postForm().
+            netDrop();
             return { ok: res.ok, text };
         },
 
@@ -1404,6 +1455,9 @@
                 credentials: 'same-origin',
             });
             const text = await res.text();
+            // Сервис закрыт — адрес вернулся в пул, дерево сервисов изменилось.
+            // Запрос идёт мимо postForm(), поэтому кэш сбрасываем здесь.
+            netDrop();
             return { ok: res.ok, text };
         },
 
@@ -1610,6 +1664,10 @@
 
             const res = await fetch(url, { method: 'POST', credentials: 'same-origin' });
             const resp = await res.text();
+            // Сессию закрыли — список активных устарел. Раньше кэш чистился
+            // только на следующем тике автообновления, и «Активные» ещё
+            // несколько секунд показывали уже сброшенное соединение.
+            netDrop(/sessionAliveContractList|sessionLogContractList|radius\.do/i);
             const plain = String(resp || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
             // Сессия уже закрыта — не ошибка
@@ -4088,19 +4146,8 @@
         // висели закрытые сервисы с серыми адресами (10.100.x). Теперь только:
         //  - сервис не закрыт и не удалён (иначе это история, а не текущее);
         //  - адрес публичный: 10.0.0.0/8 — серая сеть, для белого IP не годится.
-        const isPublicIp = (ip) => {
-            if (!ip) return false;
-            const a = ip.split('.').map(Number);
-            if (a.length !== 4 || a.some((n) => !Number.isFinite(n))) return false;
-            if (a[0] === 10) return false;                       // 10.0.0.0/8
-            if (a[0] === 127) return false;                      // loopback
-            if (a[0] === 0) return false;                        // 0.0.0.0
-            if (a[0] === 172 && a[1] >= 16 && a[1] <= 31) return false; // 172.16/12
-            if (a[0] === 192 && a[1] === 168) return false;      // 192.168/16
-            if (a[0] === 100 && a[1] >= 64 && a[1] <= 127) return false; // CGNAT
-            if (a[0] === 169 && a[1] === 254) return false;      // link-local
-            return true;
-        };
+        // Сама проверка — isPublicIp() на уровне модуля: её же использует
+        // обновление после выдачи/снятия адреса.
 
         const current = (svc.list || [])
             .filter((s) => /IPoE|PPPoE/i.test(s.type || ''))
@@ -4213,6 +4260,154 @@
 
         mountWhiteIp(panel);
         return state;
+    }
+
+    /**
+     * Пометка вкладок ERP как устаревших + перезагрузка открытой «Интернета».
+     *
+     * Зачем: после выдачи или снятия белого IP меняется дерево сервисов,
+     * а его показывает вкладка «Интернет» (она вложена в «Карточки»).
+     * Без этого оператор видел противоречие: в «Для ТП» белый IP, а в
+     * «Интернете» — прежний сервис с серым адресом.
+     *
+     * Почему не перезагружаем всё сразу, как кнопка-«вертушка» ERP:
+     * у виджета tabs ОДИН слот this.xhr, и load() в начале делает
+     * this.xhr.abort(). Цикл по вкладкам обрывал все запросы, кроме
+     * последнего: панели оставались пустыми, а вложенные в «Карточки»
+     * вкладки (в том числе «Интернет») исчезали вместе с их разметкой.
+     *
+     * Поэтому:
+     *  • загруженным вкладкам сбрасываем флаг loaded — jQuery UI сам
+     *    перезапросит их при следующем показе (проверено: beforeLoad
+     *    читает именно data('loaded') у <li>);
+     *  • «Интернет» перезагружаем сразу, но только если она открыта —
+     *    оператор как раз смотрит на неё после смены адреса. Один вызов
+     *    load(), без наложения запросов.
+     */
+    function refreshErpTabs(panel) {
+        if (!panel || !window.jQuery) return;
+        const $ = window.jQuery;
+        const $root = $(panel).closest('.ui-tabs');
+        if (!$root.length) return;
+
+        // Все вкладки ERP в этой карточке, включая вложенные («Интернет»
+        // живёт внутри «Карточек»), поэтому ищем по всему документу карточки.
+        const host = $(panel).closest('#content > div[id^="contract_bill-"]');
+        const $scope = host.length ? host : $root;
+        const targets = [];
+
+        $scope.find('.ui-tabs-nav > li').each(function () {
+            const $li = $(this);
+            const a = $li.find('> a').get(0);
+            const href = a ? (a.getAttribute('href') || '') : '';
+            // Наша панель (#…) и незагруженные вкладки — не трогаем:
+            // незагруженная и так запросит сервер при первом открытии.
+            if (!href || href.charAt(0) === '#') return;
+            if (!$li.data('loaded')) return;
+            targets.push({ $li, href });
+        });
+
+        targets.forEach(({ $li }) => {
+            try { $li.data('loaded', false); } catch (e) { /* вкладка без AJAX */ }
+        });
+
+        // «Интернет» открыта — перезагружаем её саму, иначе оператор увидит
+        // старый сервис до переключения вкладок.
+        const inet = targets.find((t) => /inet\.do/i.test(t.href) && /moduleId=1/i.test(t.href));
+        if (!inet) return;
+        const $li = inet.$li;
+        if (!$li.hasClass('ui-tabs-active') && !$li.hasClass('ui-state-active')) return;
+
+        const $widget = $li.closest('.ui-tabs');
+        const instance = $widget.data('ui-tabs') || $widget.data('tabs');
+        if (!instance || typeof instance.load !== 'function') return;
+
+        const index = $widget.find('> .ui-tabs-nav > li').index($li);
+        if (index < 0) return;
+        try { instance.load(index); } catch (e) { /* виджет без AJAX-загрузки */ }
+    }
+
+    /**
+     * Полное обновление после выдачи или снятия белого IP.
+     *
+     * Раньше здесь стоял один setTimeout на 1.5 секунды и applyContent().
+     * Этого мало по двум причинам:
+     *
+     *  1) биллинг применяет сервис не мгновенно — если ответить быстрее,
+     *     дерево сервисов ещё отдаёт прежнее состояние, и панель показывала
+     *     старый адрес, хотя операция уже прошла;
+     *  2) обновлялась только наша панель. Вкладка «Интернет» оставалась
+     *     с прежним сервисом, и оператор видел противоречие: в «Для ТП»
+     *     белый IP, в «Интернете» — старый.
+     *
+     * Поэтому: сбрасываем кэш, ждём, пока в дереве сервисов появится
+     * ожидаемое состояние, и только потом перерисовываем панель и
+     * помечаем вкладки ERP устаревшими.
+     *
+     * expect: 'white' — ждём активный сервис с публичным адресом;
+     *         'grey'  — ждём, что публичного адреса не осталось.
+     *         null    — просто дождаться смены состояния, без условия.
+     */
+    async function refreshAfterIpChange(panel, expect) {
+        if (!panel || !document.contains(panel)) return;
+
+        const cid = panel.dataset.contractId;
+        if (!cid) return;
+
+        const generation = genOf(panel);
+        // Сбрасываем весь кэш: менялись и дерево сервисов, и свободные адреса,
+        // и абонплата (услуга «Публичный IP»), и карточки договора.
+        netDrop();
+        // Однократные кэши панели живут до перерисовки, но перерисовка будет
+        // только после ожидания — сбрасываем сразу, чтобы проверка ниже
+        // читала свежие данные, а не запомненные до операции.
+        panel._tpOnce = null;
+        panel._tpPwdCache = null;
+
+        // Ждём применения в биллинге. Условие читает то же дерево сервисов,
+        // что и блок «Белый IP», поэтому «данные пришли» означает именно то,
+        // что увидит оператор.
+        await waitUntil(async () => {
+            const svc = await ERP.services(cid).catch(() => ({ list: [] }));
+            const active = (svc.list || []).filter((s) =>
+                /IPoE|PPPoE/i.test(s.type || '')
+                && !/закрыт|удален|удалён/i.test(s.status || '')
+                && !/удален|удалён/i.test(s.state || ''));
+
+            if (expect === 'white') {
+                // Публичный адрес может быть и в имени сервиса, и в его карточке
+                const byName = active.some((s) => isPublicIp(
+                    (String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/) || [])[1]));
+                if (byName) return true;
+                const inet = await ERP.activeInetService(cid).catch(() => null);
+                return !!(inet && isPublicIp(inet.addr));
+            }
+
+            if (expect === 'grey') {
+                // Публичного адреса быть не должно ни в имени, ни в карточке
+                const byName = active.some((s) => isPublicIp(
+                    (String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/) || [])[1]));
+                if (byName) return false;
+                const inet = await ERP.activeInetService(cid).catch(() => null);
+                return !(inet && isPublicIp(inet.addr));
+            }
+
+            return true;
+        });
+
+        // Панель перерисовали, пока ждали (кнопка «Обновить», возврат на
+        // вкладку) — новая отрисовка сама прочитает свежие данные, и трогать
+        // её нельзя: перетрём сообщение оператору и затрём его форму.
+        if (genOf(panel) !== generation || !document.contains(panel)) return;
+
+        // Кэш сбрасываем ещё раз: за время ожидания автообновление успело
+        // набрать ответов, а часть из них могла прийти до применения сервиса.
+        netDrop();
+        await applyContent(panel, contentBuilder);
+
+        // Вкладки ERP помечаем устаревшими после перерисовки: иначе их
+        // загрузка начнётся раньше, чем биллинг отдаст новое состояние.
+        refreshErpTabs(panel);
     }
 
     /** Обработчик кнопки «Навесить белый IP». */
@@ -4431,10 +4626,13 @@
                 // Пароль мог быть изменён в поле, а блок «Доступы» берёт его
                 // из кэша — без сброса он показывал бы старое значение.
                 if (panel._tpPwdCache) panel._tpPwdCache.delete(cid);
-                // Перерисовываем через минуту: биллингу нужно время применить сервис
-                setTimeout(() => {
-                    applyContent(panel, contentBuilder);
-                }, 1500);
+                // Ждём, пока биллинг применит сервис, и обновляем всё: панель,
+                // вкладки ERP («Интернет» показывает то же дерево сервисов).
+                // Раньше здесь был setTimeout(1500) — он срабатывал раньше,
+                // чем биллинг успевал применить адрес, и в панели оставался
+                // прежний серый IP, хотя белый уже был выдан.
+                refreshAfterIpChange(panel, 'white').catch(() => {});
+                btn.disabled = false;
             } catch (e) {
                 say('is-bad', 'Ошибка: ' + (e.message || e));
                 btn.disabled = false;
@@ -4559,9 +4757,10 @@
                     // Новый сервис мог получить другой пароль — сбрасываем кэш,
                     // иначе «Доступы» покажут прежний.
                     if (panel._tpPwdCache) panel._tpPwdCache.delete(cid);
-                    setTimeout(() => {
-                        applyContent(panel, contentBuilder);
-                    }, 1500);
+                    // Ждём, пока публичный адрес уйдёт из дерева сервисов:
+                    // без этого панель показывала белый IP ещё минуту после снятия.
+                    refreshAfterIpChange(panel, 'grey').catch(() => {});
+                    removeBtn.disabled = false;
                 } catch (e) {
                     say('is-bad', 'Ошибка: ' + (e.message || e));
                     removeBtn.disabled = false;
