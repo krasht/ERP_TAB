@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.11
+// @version      0.71.12
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.11';
+    const SELF_VERSION = '0.71.12';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5336,7 +5336,19 @@
         (pwdData.accounts || []).forEach((a) => {
             if (!a.password) return;
             const state = /отключ|заблок/i.test(a.state) ? 'отключён' : '';
-            rows.push({ name: `ТВ ${a.name}`, state, value: a.password });
+            // ERP уже отдаёт имя аккаунта с префиксом «ТВ» («ТВ bg3»),
+            // поэтому добавляем свой только если его там нет — иначе
+            // получалось «ТВ ТВ bg3».
+            //
+            // Проверяем именно пробел после «ТВ», а не \b: в JavaScript
+            // граница слова считается по \w (латиница, цифры, «_»),
+            // и кириллица в него не входит — /^ТВ\b/ не срабатывает никогда.
+            const nm = String(a.name || '').trim();
+            rows.push({
+                name: /^ТВ(\s|$)/i.test(nm) ? nm : `ТВ ${nm}`,
+                state,
+                value: a.password,
+            });
         });
         (pwdData.services || []).forEach((s) => {
             if (!s.password) return;
@@ -5351,18 +5363,28 @@
 
         // Один и тот же пароль часто выдан и на статистику, и на PPPoE:
         // показываем его один раз, склеивая подписи.
+        //
+        // Подписи склеиваем БЕЗ повторов. В биллинге на договоре копятся
+        // закрытые сервисы с тем же паролем: у одного договора их было
+        // тринадцать, и строка превращалась в «Статистика · PPPoE · PPPoE ·
+        // PPPoE …» — один и тот же тип повторялся десяток раз, вытесняя
+        // полезную подпись за край экрана.
         const byValue = new Map();
         rows.forEach((r) => {
             const key = String(r.value);
             const prev = byValue.get(key);
             if (!prev) {
-                byValue.set(key, { ...r });
+                byValue.set(key, { ...r, labels: [r.name] });
                 return;
             }
-            prev.name = `${prev.name} · ${r.name}`;
+            if (r.name && prev.labels.indexOf(r.name) < 0) prev.labels.push(r.name);
             if (r.state && !prev.state) prev.state = r.state;
         });
-        const uniq = Array.from(byValue.values());
+        const uniq = Array.from(byValue.values()).map((r) => ({
+            name: (r.labels || [r.name]).filter(Boolean).join(' · '),
+            state: r.state,
+            value: r.value,
+        }));
 
         if (!uniq.length) {
             panel._tpAccessHtml = '';
