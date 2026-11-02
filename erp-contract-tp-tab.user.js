@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.10
+// @version      0.71.11
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.10';
+    const SELF_VERSION = '0.71.11';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -2680,8 +2680,6 @@
         /* устройство для IPoE фиксировано — показываем текстом, не селектом */
         .tp-whiteip-dev-fixed { display: flex; flex-direction: column; gap: 4px; }
         .tp-whiteip-dev-fixed[hidden] { display: none; }
-        /* адрес автоматический — показываем текстом */
-        .tp-whiteip-addr-auto { display: flex; flex-direction: column; gap: 4px; }
         .tp-whiteip-creds { display: flex; flex-direction: column; gap: 8px; }
         .tp-whiteip-creds[hidden] { display: none; }
         /* Логин и пароль в строку: логин — текстом (номер договора не меняется),
@@ -4104,21 +4102,14 @@
                     : 'Пароля в договоре нет: впишите свой или оставьте пустым — биллинг сгенерирует.'}</span>
             </div>`;
 
-        // Адрес — автоматически первый свободный, выбор не нужен
+        // Адрес не показываем: оператору он не нужен, скрипт берёт первый
+        // свободный из пула своего типа. Значение держим в скрытом поле,
+        // чтобы обработчик кнопки не ходил за ним повторно.
         const autoAddr = (free || [])[0] || '';
-        // Серый адрес, который получит абонент при снятии белого IP.
-        // Показываем заранее: оператор должен видеть, куда вернётся абонент,
-        // и что адрес вообще есть — иначе снятие упадёт с «нет свободных».
+        // Свободные серые нужны только для «Убрать белый IP»: там адрес тоже
+        // подставляется автоматически. В форме его не показываем.
         const greyAddr = (state && state.greyFree && state.greyFree[0]) || '';
-        html += `<div class="tp-whiteip-addr-auto">
-                <span class="tp-whiteip-dev-label">Адрес (первый свободный)</span>
-                <span class="tp-whiteip-dev-name">${autoAddr ? esc(autoAddr) : 'нет свободных'}</span>
-                <input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
-            </div>
-            <div class="tp-whiteip-addr-auto tp-whiteip-grey-addr">
-                <span class="tp-whiteip-dev-label">Серый при снятии</span>
-                <span class="tp-whiteip-dev-name">${greyAddr ? esc(greyAddr) : 'нет свободных'}</span>
-            </div>
+        html += `<input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
             <button type="button" class="tp-btn tp-whiteip-apply"${autoAddr ? '' : ' disabled'}>Навесить белый IP</button>
             <button type="button" class="tp-btn is-ghost tp-whiteip-remove"${(ipKind === 'white' || hasService) && greyAddr ? '' : ' disabled'}>Убрать белый IP</button>
             <span class="tp-msg tp-whiteip-msg"></span>
@@ -4486,9 +4477,7 @@
                 }
 
                 const msg = panel.querySelector('.tp-whiteip-msg');
-                const addrName = panel.querySelector('.tp-whiteip-addr-auto .tp-whiteip-dev-name');
                 const addrInput = panel.querySelector('.tp-whiteip-addr');
-                if (addrName) addrName.textContent = 'загрузка…';
 
                 const cid = panel.dataset.contractId;
                 const cats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
@@ -4496,7 +4485,6 @@
                 const auto = ips[0] || '';
 
                 // Адрес всегда автоматический — первый свободный из пула типа
-                if (addrName) addrName.textContent = auto || 'нет свободных';
                 if (addrInput) addrInput.value = auto;
                 if (btn) btn.disabled = !auto;
                 if (msg) { msg.className = 'tp-msg tp-whiteip-msg'; msg.textContent = ''; }
@@ -4507,12 +4495,10 @@
             const state = panel._tpWhiteIp || {};
             const cid = panel.dataset.contractId;
             const kindEl = panel.querySelector('.tp-whiteip-kind');
-            const addrEl = panel.querySelector('.tp-whiteip-addr');
             const devEl = panel.querySelector('.tp-whiteip-device');
             const svcEl = panel.querySelector('.tp-whiteip-svc');
             const msg = panel.querySelector('.tp-whiteip-msg');
             const kind = kindEl ? kindEl.value : 'regular';
-            const addr = addrEl ? addrEl.value : '';
             const svcType = svcEl ? svcEl.value : (state.svcType || 'pppoe');
             const isIpoe = svcType === 'ipoe';
             // Устройство своё у каждого типа: IPoE > BRAS-004 (MAC-авторизация),
@@ -4527,26 +4513,20 @@
                 msg.textContent = text;
             };
 
-            if (!addr) { say('is-bad', 'Нет свободного адреса'); return; }
+            // Адрес берём заново, прямо перед созданием: список в форме мог
+            // устареть, пока оператор заполнял поля, а биллинг на занятый
+            // адрес отвечает невнятным «Подходящий ip ресурс не найден».
+            // Это же снимает нужду показывать адрес в форме — он всегда
+            // актуальный первый свободный из пула нужного типа.
+            const freshCats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
+            const freeNow = (freshCats || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
+            const addr = freeNow[0] || '';
+            const addrInput = panel.querySelector('.tp-whiteip-addr');
+            if (addrInput) addrInput.value = addr;
+
+            if (!addr) { say('is-bad', 'В белом пуле нет свободных адресов'); btn.disabled = true; return; }
             if (isIpoe && !deviceId) { say('is-bad', 'Не найдено устройство BRAS-004'); return; }
             if (!isIpoe && !deviceId) { say('is-bad', 'Не найдена папка PPPoE'); return; }
-
-            // Проверяем, что адрес ещё свободен: список в форме мог устареть,
-            // пока оператор заполнял поля, а биллинг на занятый адрес отвечает
-            // невнятным «Подходящий ip ресурс не найден».
-            const stillFree = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
-            const freeNow = (stillFree || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
-            if (freeNow.length && freeNow.indexOf(addr) < 0) {
-                // Адрес заняли — подставляем новый свободный и просим нажать снова
-                const next = freeNow[0] || '';
-                const addrInput = panel.querySelector('.tp-whiteip-addr');
-                const addrName = panel.querySelector('.tp-whiteip-addr-auto .tp-whiteip-dev-name');
-                if (addrInput) addrInput.value = next;
-                if (addrName) addrName.textContent = next || 'нет свободных';
-                say('is-bad', `Адрес ${addr} уже занят — подставил ${next || 'другой'}, нажмите ещё раз`);
-                btn.disabled = !next;
-                return;
-            }
 
             // MAC обязателен для IPoE: там авторизация по MAC, без него
             // сервис создастся, но роутер не подключится.
