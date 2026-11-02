@@ -1,5 +1,5 @@
 ﻿<#
-    Релиз userscript'а: поднять версию, обновить .meta.js, выложить файлы.
+    Релиз userscript'а: поднять версию, обновить .meta.js, закоммитить и запушить.
 
     Зачем скрипт, а не правка руками: версия живёт в трёх местах —
       * @version в шапке (.user.js)  — по нему Tampermonkey решает, обновляться ли;
@@ -9,17 +9,17 @@
     Tampermonkey видит «та же версия» и ничего не скачивает.
 
     Использование:
-        .\release.ps1                 # 0.71.1 -> 0.71.2
+        .\release.ps1                 # 0.71.1 -> 0.71.2, коммит и push
         .\release.ps1 -Version 0.72.0 # явная версия
-        .\release.ps1 -DeployTo \\fileserver\web\userscript
+        .\release.ps1 -NoPush         # только локально, без отправки на GitHub
 
-    -DeployTo копирует оба файла в сетевую папку веб-сервера, если сайт
-    раздаётся оттуда. Без него файлы просто обновляются локально.
+    После push файлы доступны по адресам из шапки скрипта, и Tampermonkey
+    подхватывает новую версию сам (опрос раз в сутки + баннер в открытой вкладке).
 #>
 [CmdletBinding()]
 param(
     [string]$Version,
-    [string]$DeployTo
+    [switch]$NoPush
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,8 +31,8 @@ if (-not (Test-Path -LiteralPath $scriptPath)) {
     throw "Не найден $scriptPath"
 }
 
-# UTF8 без BOM: с BOM Tampermonkey считает первую строку шапки не «// ==UserScript==»
-# и может отказаться ставить скрипт.
+# UTF8 без BOM: с BOM Tampermonkey может не распознать первую строку шапки
+# «// ==UserScript==» и отказаться ставить скрипт.
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $text = [System.IO.File]::ReadAllText($scriptPath, $utf8)
 
@@ -76,17 +76,38 @@ $meta = (($lines[0..$end]) -join "`r`n") + "`r`n"
 Write-Host "Обновлено: $scriptPath"
 Write-Host "Обновлено: $metaPath"
 
-# 4) Выкладка на веб-сервер
-if ($DeployTo) {
-    if (-not (Test-Path -LiteralPath $DeployTo)) {
-        throw "Папка выкладки не найдена: $DeployTo"
-    }
-    Copy-Item -LiteralPath $scriptPath -Destination $DeployTo -Force
-    Copy-Item -LiteralPath $metaPath -Destination $DeployTo -Force
-    Write-Host "Скопировано в $DeployTo"
+if ($NoPush) {
+    Write-Host ''
+    Write-Host 'Готово локально (-NoPush). Отправьте на GitHub вручную, иначе'
+    Write-Host 'автообновление у сотрудников не увидит новую версию.'
+    return
+}
+
+# 4) Коммит и push. Без push правки остаются только на этой машине:
+#    raw-ссылка продолжает отдавать старую версию, и обновления не приходят.
+$git = Join-Path $env:LOCALAPPDATA 'Programs\Git\cmd\git.exe'
+if (-not (Test-Path -LiteralPath $git)) {
+    $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+}
+if (-not $git) { throw 'git не найден. Установите git или используйте -NoPush' }
+
+Push-Location $root
+try {
+    & $git add -- erp-contract-tp-tab.user.js erp-contract-tp-tab.meta.js
+    & $git -c user.name="Vladimir Chugunov" -c user.email="krasht@users.noreply.github.com" `
+        commit -m "release v$Version" --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать коммит' }
+
+    & $git push origin main
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось отправить на GitHub' }
+} finally {
+    Pop-Location
 }
 
 Write-Host ''
-Write-Host 'Дальше: у сотрудников Tampermonkey подхватит новую версию сам'
-Write-Host '(опрос раз в сутки), а открытая вкладка ERP покажет баннер'
-Write-Host '"Доступна новая версия" в течение 3 секунд после загрузки страницы.'
+Write-Host "Готово: версия $Version на GitHub."
+Write-Host 'Tampermonkey подхватит её сам, а открытая вкладка ERP покажет'
+Write-Host 'баннер «Доступна новая версия» в течение 3 секунд после загрузки.'
+Write-Host ''
+Write-Host 'Проверка raw-файлов (должно быть HTTP 200 и новая версия):'
+Write-Host '  https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.meta.js'
