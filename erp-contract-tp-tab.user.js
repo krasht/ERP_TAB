@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.8
+// @version      0.71.9
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.8';
+    const SELF_VERSION = '0.71.9';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3618,7 +3618,7 @@
             // строкой «IP … · устройство». Оставляем только имя сервиса.
             // Заглушку [IpAddress:null] тоже выкидываем: она приходит из шаблона
             // имени биллинга, пока сервису не выдан адрес.
-            const serviceName = cleanBillServiceName(r.service, { dropIds: true });
+            const serviceName = cleanBillServiceName(r.service, { dropLogin: true, dropAddr: true });
 
             html += `<div class="tp-sess-row ${isNew ? 'tp-fresh' : ''}">
                 <div class="tp-sess-main">
@@ -5327,7 +5327,7 @@
                 : /отключ/i.test(s.state) ? 'отключён' : '';
             // В названии сервиса ERP повторяет номер договора и IP — они уже
             // в шапке карточки и в списке сессий. Оставляем тип и имя.
-            const cleanName = cleanBillServiceName(s.name, { dropIds: true });
+            const cleanName = cleanBillServiceName(s.name, { dropLogin: true, dropAddr: true });
             const label = [s.type, cleanName].filter(Boolean).join(' ') || 'Интернет';
             rows.push({ name: label, state, value: s.password });
         });
@@ -6257,44 +6257,55 @@
      * Имя сервиса для показа оператору.
      *
      * Биллинг формирует имя по шаблону: `<логин> <addrFrom> <addrTo>`.
-     * Пока адрес не выдан, в него подставляется буквальный текст
-     * `[IpAddress:null]` — это не наш баг, так ERP отдаёт строку в дереве
-     * сервисов (проверено на живой карточке: в <td> приходит ровно
-     * «AV0000001  [IpAddress:null] [IpAddress:null]»). В интерфейсе это
-     * выглядит как поломка, поэтому:
-     *   • выкидываем такие заглушки;
-     *   • схлопываем повтор адреса — при выдаче статического адреса шаблон
-     *     подставляет его дважды («AV0000001 45.157.214.112 45.157.214.112»),
-     *     второй экземпляр ничего не добавляет;
-     *   • пустой остаток заменяем на логин из договора.
+     * По этому имени видно, выдан ли сервису адрес:
+     *   «AV0000001 10.100.31.30 10.100.31.30» — адрес есть (серый или белый);
+     *   «AV0000001 [IpAddress:null] [IpAddress:null]» — адреса нет.
+     * Второй вариант — не поломка и не «наш баг»: так биллинг печатает
+     * заглушку шаблона, пока addrFrom/addrTo пустые. Оператор по этой
+     * разнице и определяет, навесился адрес или нет, поэтому признак
+     * НЕ выкидываем, а приводим к человеческому виду.
      *
-     * Сами данные не трогаем: поиск текущего публичного адреса в loadWhiteIp
-     * читает исходное s.name, а не результат этой функции.
+     * Заодно схлопываем повтор адреса: шаблон подставляет его и в addrFrom,
+     * и в addrTo, из-за чего адрес приходит дважды и строка становится
+     * вдвое длиннее без пользы.
+     *
+     * dropLogin / dropAddr — для мест, где логин и адрес уже показаны рядом
+     * (сессии, «Доступы»): там имя нужно только чтобы отличать сервисы.
      */
     function cleanBillServiceName(raw, opts) {
-        const dropIds = !!(opts && opts.dropIds);
+        const o = opts || {};
+        const dropLogin = !!o.dropLogin;
+        const dropAddr = !!o.dropAddr;
         const src = String(raw == null ? '' : raw);
-        let text = src.replace(/\[IpAddress:[^\]]*\]/gi, ' ');
 
-        // В сессиях и «Доступах» номер договора и адрес уже показаны рядом,
-        // в имени они только дублируются.
-        if (dropIds) {
-            text = text
-                .replace(/\b[A-Z]{2,}\d{4,}\b/gi, ' ')
-                .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, ' ');
+        // Адрес из шаблона: берём первый и запоминаем, был ли он вообще.
+        // Пустой addrFrom и addrTo приходят как «[IpAddress:null]» — это
+        // маркер «адреса нет», а не мусор.
+        const addrMatch = src.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+        const addr = addrMatch ? addrMatch[1] : '';
+
+        let text = src.replace(/\[IpAddress:[^\]]*\]/gi, ' ');
+        if (dropLogin) text = text.replace(/\b[A-Z]{2,}\d{4,}\b/gi, ' ');
+        if (dropAddr) {
+            text = text.replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, ' ');
+        } else if (addr) {
+            // Оставляем адрес один раз: второй экземпляр — тот же addrTo
+            text = text.replace(new RegExp(`(\\s*${addr.replace(/\./g, '\\.')}\\s*)+`, 'g'), ` ${addr} `);
         }
 
         const parts = text.split(/\s+/).filter(Boolean);
-
-        // Убираем повторы подряд: шаблон биллинга ставит адрес и в addrFrom,
-        // и в addrTo, из-за чего он приходит дважды.
         const out = [];
         parts.forEach((p) => {
             if (out.length && out[out.length - 1] === p) return;
             out.push(p);
         });
 
-        return out.join(' ').trim();
+        const name = out.join(' ').trim();
+        // Адреса нет и его не убрали — говорим об этом явно. Пустое место
+        // оператор читает как «не догрузилось», а «без адреса» — как факт.
+        if (!name) return '';
+        if (!addr && !dropAddr) return `${name} · без адреса`;
+        return name;
     }
 
     /**
@@ -6316,11 +6327,21 @@
                 ? '<span class="tp-chip is-bad">удалён</span>'
                 : closed ? '<span class="tp-chip is-warn">закрыт</span>'
                     : '<span class="tp-chip is-good">открыт</span>';
-            // Имя чистим от заглушек шаблона биллинга ([IpAddress:null] и
-            // задвоенного адреса) — см. cleanServiceName.
+            // Имя сервиса и признак адреса.
+            //
+            // Шаблон биллинга: `<логин> <addrFrom> <addrTo>`. По нему видно,
+            // выдан ли адрес: «AV0000001 10.100.31.30» — выдан (серый это или
+            // белый — показывает сам адрес), «[IpAddress:null]» — не выдан.
+            // Поэтому адрес оставляем, заглушку заменяем на явное «без адреса»,
+            // а повтор адреса схлопываем (см. cleanBillServiceName).
+            const addrMatch = String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+            const addr = addrMatch ? addrMatch[1] : '';
+            const ipChip = addr
+                ? `<span class="tp-chip tp-svc-ip" style="padding:1px 7px">${esc(addr)}</span>`
+                : '<span class="tp-chip is-warn tp-svc-noip" style="padding:1px 7px" title="Сервису не выдан адрес: в имени стоит заглушка шаблона [IpAddress:null]">без адреса</span>';
             html += `<div class="tp-pay-row">
-                    <span class="tp-pay-name">${esc(cleanBillServiceName(s.name) || 'Сервис')} ${stateChip}
-                        <span class="tp-chip" style="padding:1px 7px">${esc(s.type || '')}</span>
+                    <span class="tp-pay-name">${esc(cleanBillServiceName(s.name, { dropAddr: true }) || 'Сервис')} ${stateChip}
+                        <span class="tp-chip" style="padding:1px 7px">${esc(s.type || '')}</span> ${ipChip}
                     </span>
                     <span class="tp-pay-sum">${esc(s.period || '')}</span>
                 </div>`;
