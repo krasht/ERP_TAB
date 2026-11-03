@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.23
+// @version      0.71.24
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.23';
+    const SELF_VERSION = '0.71.24';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -656,10 +656,52 @@
             return numeric.length ? numeric[numeric.length - 1] : '';
         },
 
+        /**
+         * Заголовок карточки договора («BILL0900078 (ФИО)»).
+         *
+         * Устройство разметки ERP (проверено на живой карточке): договор
+         * представлен ДВУМЯ узлами с одинаковым id — `contract_bill-N`:
+         *   • в блоке `#title` — шапка с заголовком h1.title и кнопкой закрытия;
+         *   • в блоке `#content` — сама карточка с вкладками и таблицей.
+         * Заголовок с номером и ФИО живёт в ПЕРВОМ, а данные (treeTable,
+         * параметры) — во втором. Поэтому искать h1 внутри карточки из
+         * #content бессмысленно: там его нет, и номер договора получался пустым.
+         *
+         * Раньше здесь был запасной `document.querySelector('#content h1, h1')`,
+         * то есть при неудаче запрос уходил на всю страницу и брал первый <h1>.
+         * При нескольких открытых договорах это давало ФИО чужого абонента —
+         * отсюда «информация отличается от того договора, на который захожу».
+         *
+         * Теперь ищем заголовок строго своей карточки: сначала в шапке #title
+         * по тому же id, затем (на случай другой вёрстки) внутри переданного узла.
+         */
         contractTitle(root) {
-            const scope = root || document;
-            const h1 = scope.querySelector('#content h1, h1') || document.querySelector('#content h1, h1');
-            return h1 ? h1.innerText.trim() : '';
+            const fromNode = (el) => {
+                if (!el) return '';
+                const h1 = el.querySelector('h1.title, h1, .title');
+                return h1 ? h1.innerText.trim() : '';
+            };
+
+            const scope = root || null;
+            const cid = scope && scope.id ? (String(scope.id).match(/(\d+)$/) || [])[1] : '';
+
+            // 1) Шапка договора в блоке #title — там лежит настоящий h1
+            if (cid) {
+                const head = document.getElementById('title');
+                const headCard = head ? head.querySelector(`div#contract_bill-${cid}`) : null;
+                const title = fromNode(headCard);
+                if (title) return title;
+            }
+
+            // 2) Заголовок внутри переданного узла (иная вёрстка / отдельная страница)
+            const own = fromNode(scope);
+            if (own) return own;
+
+            // 3) Фолбэк только когда карточка на странице одна: при нескольких
+            //    договорах любой общий поиск вернёт чужой заголовок.
+            const cards = document.querySelectorAll('#content > div[id^="contract_bill-"]');
+            if (cards.length === 1) return fromNode(document.getElementById('title'));
+            return '';
         },
 
         /**
@@ -690,12 +732,15 @@
                     const num = fromUrl(links[i].getAttribute('href'));
                     if (num) return num;
                 }
+                // Тот же номер есть в любой ссылке внутри СВОЕЙ карточки
+                // (GetOLT, Документы, Процессы). Раньше поиск шёл по всему
+                // документу, и при нескольких открытых договорах возвращался
+                // номер первого из них — панель показывала чужой договор.
+                const ownLink = Array.from(host.querySelectorAll('a[href*="contractNumber="]'))
+                    .map((a) => fromUrl(a.getAttribute('href')))
+                    .filter(Boolean);
+                if (ownLink.length) return ownLink[0];
             }
-            // Тот же номер есть в любом месте страницы — например в ссылке GetOLT
-            const anyLink = Array.from(document.querySelectorAll('a[href*="contractNumber="]'))
-                .map((a) => fromUrl(a.getAttribute('href')))
-                .filter(Boolean);
-            if (anyLink.length) return anyLink[0];
 
             // Запасной путь — текст заголовка карточки, без script/style и без UIID…
             const cleanText = (el) => {
@@ -724,8 +769,24 @@
         async params(cid) {
             const result = { fields: {}, status: '', limit: '', balanceOut: '', balanceMonth: '', objects: '', mode: '', person: '' };
 
-            // Читаем карточку, к которой относится панель, — иначе можно взять данные соседнего договора
-            const scope = cid ? (document.querySelector(`#content > div#contract_bill-${cid}`) || document) : document;
+            /*
+             * Читаем ТОЛЬКО карточку своего договора.
+             *
+             * Раньше при ненайденной карточке здесь стоял запасной `document`,
+             * и запрос `#treeTable` уходил на всю страницу — то есть брал
+             * таблицу первого открытого договора. В ERP можно держать открытыми
+             * несколько карточек (div#contract_bill-N), поэтому панель нового
+             * договора показывала статус, лимит и остаток чужого.
+             *
+             * Теперь при отсутствии карточки возвращаем пустые значения:
+             * блоки честно покажут «нет данных», а не чужие числа. Данные,
+             * которых не хватает, всё равно догрузятся отдельными ручками
+             * (баланс, лимит, параметры) уже по своему contractId.
+             */
+            const scope = cid
+                ? document.querySelector(`#content > div#contract_bill-${cid}`)
+                : document.querySelector('#content > div[id^="contract_bill-"]:not([style*="display: none"])');
+            if (!scope) return result;
 
             scope.querySelectorAll('#treeTable tr').forEach((tr) => {
                 const cells = tr.querySelectorAll('td');
@@ -2308,7 +2369,11 @@
             const m = html.match(/td#limit'\)\.text\(\s*'([^']+)'/);
             if (m) limit = m[1];
             if (limit == null) {
-                const cell = document.querySelector('#treeTable td#limit');
+                // Запасной путь — только своя карточка. Раньше запрос шёл по
+                // всему документу и при нескольких открытых договорах брал
+                // лимит первого из них.
+                const card = document.querySelector(`#content > div#contract_bill-${id}`);
+                const cell = card ? card.querySelector('#treeTable td#limit') : null;
                 limit = cell ? cell.innerText.trim() : null;
             }
 
