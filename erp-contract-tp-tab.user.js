@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.26
+// @version      0.71.27
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.26';
+    const SELF_VERSION = '0.71.27';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1153,6 +1153,70 @@
                 return { ok: false, message: direct.message || work.message || 'переход запрещён' };
             }
             return setStatus(PROCESS_STATUS_DONE);
+        },
+
+        /**
+         * Процессы договора — те же, что на вкладке «Процессы» карточки.
+         *
+         * ERP: /user/process/link.do, method=linkedProcessList. Привязка задаётся
+         * парой objectType=contract:bill + id (numeric), плюс objectTitle — номер
+         * договора; без него список пустой.
+         *
+         * Параметр `open` — это и есть фильтр «Открытые»:
+         *   1 — только открытые (закрытых нет, у них пусто в колонке «Закрыт»);
+         *   0 — только закрытые;
+         *   пусто — все.
+         * Раньше его не передавали и получали общий список, в котором открытые
+         * и завершённые шли вперемешку: оператор не мог понять, есть ли у
+         * абонента незакрытое обращение.
+         *
+         * Колонки таблицы: Процесс | Тип | Создан | Статус | Закрыт | Роль.
+         * В первой ячейке — ссылка вида «#16503 Смена ПД», из неё берём id и
+         * заголовок. Возвращает { rows, total }, где total — «Записей: N»
+         * из ответа (сам список ERP режет по pageSize).
+         */
+        async processes(cid, open) {
+            const id = cid || this.contractId();
+            if (!id) return { rows: [], total: 0 };
+
+            const title = this.contractNumber(id);
+            const params = new URLSearchParams({
+                method: 'linkedProcessList',
+                objectType: 'contract:bill',
+                id: String(id),
+                objectTitle: title || '',
+                open: open == null ? '' : String(open),
+                typeId: '',
+                pageIndex: '1',
+                pageSize: '25',
+            });
+
+            const html = await fetchText('/user/process/link.do?' + params.toString());
+            const body = parseHtml(html);
+
+            const rows = [];
+            Array.from(body.querySelectorAll('table.data tr')).forEach((tr) => {
+                const tds = Array.from(tr.querySelectorAll('td'));
+                if (tds.length < 4) return; // заголовок и пустые строки
+                const cells = tds.map((td) => td.innerText.replace(/\s+/g, ' ').trim());
+                if (/^Процесс$/i.test(cells[0])) return;
+
+                // «#16503 Смена ПД» → id 16503, заголовок «Смена ПД»
+                const pid = (cells[0].match(/#(\d+)/) || [])[1] || '';
+                const name = cells[0].replace(/^#?\d+\s*/, '').trim();
+
+                rows.push({
+                    id: pid,
+                    name,
+                    type: cells[1] || '',
+                    created: cells[2] || '',
+                    status: cells[3] || '',
+                    closed: cells[4] || '',
+                });
+            });
+
+            const totalMatch = html.match(/Записей:\s*<b>(\d+)<\/b>/);
+            return { rows, total: totalMatch ? Number(totalMatch[1]) : rows.length };
         },
 
         /**
@@ -3045,6 +3109,38 @@
         .tp-whiteip-dev-name { font-size: 12.5px; font-weight: 550; color: var(--tp-fg2); }
         .tp-whiteip-dev-name.is-bad { color: var(--tp-red); }
 
+        /* ---- процессы */
+        .tp-proc-state {
+            font-size: 11px; font-weight: 600; color: var(--tp-fg3);
+            background: rgba(127,127,127,.14); border-radius: 999px; padding: 1px 8px;
+        }
+        .tp-proc-state:empty { display: none; }
+        /* Вкладки внутри карточки — те же, что у «Сессии»: оператор уже знает,
+           как они выглядят и что счётчик справа от подписи. */
+        .tp-proc-tabs { margin-bottom: 10px; }
+        .tp-proc-list { display: flex; flex-direction: column; gap: 8px; }
+        .tp-proc-row {
+            display: flex; align-items: flex-start; justify-content: space-between;
+            gap: 10px; padding-bottom: 8px;
+            border-bottom: 1px solid var(--tp-border);
+        }
+        .tp-proc-row:last-child { border-bottom: 0; padding-bottom: 0; }
+        .tp-proc-main { min-width: 0; flex: 1 1 auto; }
+        .tp-proc-name {
+            font-size: 13px; font-weight: 550; color: var(--tp-fg);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        /* Номер процесса — моноширинным и приглушённым: он нужен для ссылки
+           в разговоре («посмотрите #16503»), но не должен перетягивать глаз. */
+        .tp-proc-num {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px; font-weight: 600; color: var(--tp-fg3);
+        }
+        .tp-proc-meta {
+            font-size: 11.5px; color: var(--tp-fg3); margin-top: 2px;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+
         /* ---- отправка доступа на почту */
         .tp-mail-form { display: flex; flex-direction: column; gap: 10px; }
         .tp-mail-to {
@@ -3889,6 +3985,26 @@
         </div>`;
 
         /*
+         * «Процессы» — обращения и заявки, привязанные к договору.
+         *
+         * Раньше за ними нужно было уходить на вкладку «Процессы» карточки и
+         * терять контекст разговора с абонентом. Здесь видно главное: есть ли
+         * незакрытое обращение (его ещё кто-то ведёт) и что было закрыто.
+         *
+         * Две вкладки — «Активные» и «Закрытые». Это родные фильтры ERP
+         * (параметр open=1/0 в linkedProcessList), поэтому содержимое совпадает
+         * с вкладкой «Процессы» один в один, без собственной фильтрации по
+         * тексту статуса — та ломалась бы на любом новом статусе в биллинге.
+         */
+        const processesCard = `<div class="tp-card tp-processes tp-lazy" data-lazy="processes" data-contract="${esc(id)}">
+            <div class="tp-card-title">
+                <span class="tp-dot"></span>Процессы
+                <span class="tp-proc-state" data-role="proc-state"></span>
+            </div>
+            <div class="tp-lazy-body">${skeleton(2)}</div>
+        </div>`;
+
+        /*
          * «Сервисы» — техническая карточка договора в биллинге.
          *
          * Скрипт запрашивал дерево сервисов (inet.do?method=serviceTree) сразу
@@ -3930,6 +4046,7 @@
                     ${sessionsCard}
                     ${servicesCard}
                     ${eqCard}
+                    ${processesCard}
                     ${mailCard}
                 </div>
             </div>
@@ -5207,6 +5324,126 @@
         }
     }
 
+
+    /* ------------------------------------------------------------- процессы */
+
+    /**
+     * Блок «Процессы»: обращения договора, активные и закрытые.
+     *
+     * Вкладки — это родные фильтры ERP (open=1 / open=0), а не разбор статуса
+     * по тексту: в биллинге статусов десятки («Новый», «В работе», «Согласовано»,
+     * «Завершено», «Отклонено»…), и любой самодельный список рано или поздно
+     * разошёлся бы с тем, что видит оператор на вкладке «Процессы».
+     *
+     * Счётчики на вкладках показываем из ответа ERP («Записей: N»), а не по
+     * числу отрисованных строк: список режется по pageSize, и цифра должна
+     * отражать реальное количество.
+     */
+    function renderProcesses(data, kind) {
+        const d = data || {};
+        const isOpen = kind === 'open';
+        // Списки лежат в разных полях состояния, а дальше код работает с одним
+        // набором строк. Раньше здесь читалось d.rows напрямую, но в состоянии
+        // его нет — и блок показывал «Активных процессов нет» при 20 записях
+        // в ответе ERP.
+        const rows = (isOpen ? d.open : d.closed) || [];
+
+        const tabs = `<div class="tp-tabs-mini tp-proc-tabs">
+            <button type="button" class="${isOpen ? 'is-on' : ''}" data-kind="open">
+                Активные <span class="tp-count ${d.openTotal ? 'is-on' : ''}" data-role="proc-open-count">${d.openTotal || 0}</span>
+            </button>
+            <button type="button" class="${isOpen ? '' : 'is-on'}" data-kind="closed">
+                Закрытые <span class="tp-count ${d.closedTotal ? 'is-on' : ''}" data-role="proc-closed-count">${d.closedTotal || 0}</span>
+            </button>
+        </div>`;
+
+        if (!rows.length) {
+            return tabs + `<div class="tp-sess-empty">${isOpen
+                ? 'Активных процессов нет.'
+                : 'Закрытых процессов нет.'}</div>`;
+        }
+
+        let html = '<div class="tp-proc-list">';
+        rows.forEach((p) => {
+            // Статус — плашкой: «Новый» и «В работе» оператор различает сразу
+            const isDone = /заверш|закрыт|отклон|отмен/i.test(p.status || '');
+            const chip = isDone ? 'is-good' : 'is-warn';
+            const num = p.id ? `#${esc(p.id)}` : '';
+            const title = p.name || p.type || 'Процесс';
+
+            html += `<div class="tp-proc-row">
+                <div class="tp-proc-main">
+                    <div class="tp-proc-name">${num ? `<span class="tp-proc-num">${num}</span> ` : ''}${esc(title)}</div>
+                    <div class="tp-proc-meta">${esc(p.type || '')}${p.created ? ' · создан ' + esc(p.created) : ''}</div>
+                </div>
+                <span class="tp-chip ${chip}" style="padding:1px 7px">${esc(p.status || '—')}</span>
+            </div>`;
+        });
+        html += '</div>';
+
+        if (d.total > rows.length) {
+            html += `<div class="tp-hint">Показаны ${rows.length} из ${esc(d.total)}.</div>`;
+        }
+
+        return tabs + html;
+    }
+
+    /** Загрузка обеих вкладок процессов: счётчики нужны сразу, не после клика. */
+    async function loadProcesses(panel, cid) {
+        const generation = genOf(panel);
+        const id = cid || panel.dataset.contractId;
+        if (!id) return null;
+
+        // Оба списка параллельно: иначе цифра на второй вкладке появится только
+        // после переключения, и оператор не поймёт, есть ли там что-то.
+        const [open, closed] = await Promise.all([
+            ERP.processes(id, 1).catch(() => ({ rows: [], total: 0 })),
+            ERP.processes(id, 0).catch(() => ({ rows: [], total: 0 })),
+        ]);
+
+        if (genOf(panel) !== generation) return null;
+        if (!document.contains(panel)) return null;
+
+        const state = {
+            open: open.rows,
+            closed: closed.rows,
+            openTotal: open.total,
+            closedTotal: closed.total,
+            kind: panel._tpProcKind || 'open',
+        };
+        panel._tpProcesses = state;
+
+        fillLazy(panel, 'processes', renderProcesses(state, state.kind));
+
+        const badge = panel.querySelector('[data-role="proc-state"]');
+        if (badge) {
+            badge.textContent = state.openTotal ? String(state.openTotal) : '';
+            badge.hidden = !state.openTotal;
+        }
+
+        mountProcesses(panel);
+        return state;
+    }
+
+    /** Переключение «Активные / Закрытые». */
+    function mountProcesses(panel) {
+        const card = panel.querySelector('.tp-processes');
+        if (!card) return;
+        if (card.dataset.bound === '1') return;
+        card.dataset.bound = '1';
+
+        card.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('.tp-proc-tabs button');
+            if (!btn) return;
+            const kind = btn.dataset.kind || 'open';
+            const state = panel._tpProcesses || {};
+            panel._tpProcKind = kind;
+
+            // Списки уже загружены — перерисовываем без сети
+            const body = card.querySelector('.tp-lazy-body');
+            if (body) setHtmlIfChanged(body, renderProcesses(Object.assign({}, state, { kind }), kind));
+        });
+    }
 
     /* ------------------------------------------------ отправка доступа на почту */
 
@@ -6816,6 +7053,15 @@
 
         alive('balance', balanceOnce(), (bal) => {
             fillLazy(panel, 'balance', buildBalanceHtml(bal));
+        });
+
+        // Процессы договора: активные и закрытые. Два независимых запроса,
+        // оба нужны сразу — цифры на вкладках не должны ждать клика.
+        loadProcesses(panel, id).catch((e) => {
+            const lost = /Сессия ERP истекла/.test(e && e.message || '');
+            fillLazy(panel, 'processes', lost
+                ? `<div class="tp-err">${esc(e.message)}</div>`
+                : '<div class="tp-hint">Не удалось загрузить процессы.</div>');
         });
 
         // Тарифный блок: состав тарифа + разовые. Абонплата (feePromise) нужна,
