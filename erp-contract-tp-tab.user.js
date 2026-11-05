@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.0
+// @version      0.72.1
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.0';
+    const SELF_VERSION = '0.72.1';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3545,8 +3545,26 @@
            style="padding:1px 7px" в шести местах — такой стиль нельзя
            переопределить темой. */
         .tp-chip.is-xs { padding: 1px 7px; }
-        /* Свёрнутая строка «ещё N закрытых» в списке сервисов */
-        .tp-svc-folded { opacity: .62; font-style: italic; }
+        /* ---- раскрытие истории сервисов
+           Действующие сервисы видны сразу, закрытые и удалённые — под
+           <details>. Раньше их не было видно вовсе, и оператор не мог
+           посмотреть, когда и с каким адресом сервис закрыли. */
+        .tp-svc-more { margin-top: 2px; }
+        .tp-svc-more > summary {
+            display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+            padding: 7px 0; cursor: pointer; list-style: none;
+            font-size: 12.5px; color: var(--tp-fg3);
+            border-top: 1px solid var(--tp-border);
+        }
+        .tp-svc-more > summary::-webkit-details-marker { display: none; }
+        .tp-svc-more > summary:hover { color: var(--tp-fg2); }
+        .tp-svc-more > summary:focus-visible { outline: 2px solid var(--tp-blue); outline-offset: 2px; }
+        .tp-svc-more-label { font-style: italic; }
+        .tp-svc-more-hint { font-size: 11px; white-space: nowrap; }
+        /* Подпись «показать / скрыть» переключается по состоянию details. */
+        .tp-svc-more-hint::after { content: 'показать'; }
+        .tp-svc-more[open] .tp-svc-more-hint::after { content: 'скрыть'; }
+        .tp-svc-more-body { padding-top: 2px; }
 
         /* ---- скелетон загрузки */
         .tp-skeleton { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
@@ -7463,6 +7481,15 @@
         // Сервисы в биллинге: тип, период, статус и устройство.
         alive('services', servicesOnce(), (data) => {
             fillLazy(panel, 'services', renderServices((data && data.list) || []));
+            // Раскрытие истории сервисов переживает перерисовку: автообновление
+            // перерисовывает блок каждые 42 секунды, и без восстановления
+            // открытый оператором список закрывался бы сам.
+            const box = panel.querySelector('.tp-lazy[data-lazy="services"]');
+            const more = box && box.querySelector('[data-svc-more]');
+            if (more) {
+                if (panel._tpSvcMoreOpen) more.open = true;
+                more.addEventListener('toggle', () => { panel._tpSvcMoreOpen = more.open; });
+            }
         });
 
         // Примечания — тот же узел, что в дереве карточки BGBilling.
@@ -7685,30 +7712,16 @@
         const arr = (list || []).slice();
         if (!arr.length) return '<div class="tp-hint">Сервисов нет.</div>';
 
-        // Действующие показываем всегда, удалённые — одной свёрнутой строкой.
-        // На AV0000001 в дереве 28 записей, из них 27 удалённых: список
-        // из двадцати семи одинаковых «удалён» оператор прочитать не может,
-        // а действующий сервис в нём теряется.
+        // Действующие показываем всегда, закрытые и удалённые — под раскрытием.
+        // На AV0000001 в дереве 28 записей, из них 27 удалённых: если рисовать
+        // их подряд, действующий сервис тонет в списке одинаковых «удалён».
+        // Но и прятать их совсем нельзя — оператору нужно уметь посмотреть
+        // историю (когда закрыт, с каким адресом), поэтому это <details>,
+        // а не отброшенные данные.
         const alive = arr.filter((s) => svcRank(s) === 0);
         const dead = arr.filter((s) => svcRank(s) !== 0);
-        const ordered = alive.concat(dead);
-        const deadFrom = alive.length;
 
-        let html = '<div class="tp-pay">';
-        ordered.forEach((s, i) => {
-            // Действующие — всегда. Из удалённых показываем только одну строку
-            // «ещё N закрытых», без подробностей: на AV0000001 их 27, и все
-            // с одинаковым именем — оператор в них всё равно ничего не найдёт.
-            if (i === deadFrom) {
-                if (!dead.length) return;
-                html += `<div class="tp-pay-row tp-svc-folded">
-                    <span class="tp-pay-name">${dead.length === 1 ? 'закрытый сервис' : `ещё ${dead.length} закрытых и удалённых`}</span>
-                    <span class="tp-pay-sum"></span>
-                </div>`;
-                return;
-            }
-            if (i > deadFrom) return;
-
+        const rowHtml = (s) => {
             const rank = svcRank(s);
             const stateChip = rank === 2
                 ? '<span class="tp-chip is-bad">удалён</span>'
@@ -7726,13 +7739,35 @@
             const ipChip = addr
                 ? `<span class="tp-chip tp-svc-ip is-xs">${esc(addr)}</span>`
                 : '<span class="tp-chip is-warn tp-svc-noip is-xs" title="Сервису не выдан адрес: в имени стоит заглушка шаблона [IpAddress:null]">без адреса</span>';
-            html += `<div class="tp-pay-row">
+            return `<div class="tp-pay-row">
                     <span class="tp-pay-name">${esc(cleanBillServiceName(s.name, { dropAddr: true }) || 'Сервис')} ${stateChip}
                         <span class="tp-chip is-xs">${esc(s.type || '')}</span> ${ipChip}
                     </span>
                     <span class="tp-pay-sum">${esc(s.period || '')}</span>
                 </div>`;
-        });
+        };
+
+        let html = '<div class="tp-pay">';
+        if (alive.length) {
+            alive.forEach((s) => { html += rowHtml(s); });
+        } else {
+            // Все записи в дереве закрыты: без этой строки блок выглядит пустым
+            // и оператор ищет, куда пропал сервис.
+            html += '<div class="tp-hint">Действующих сервисов нет — все записи закрыты.</div>';
+        }
+
+        if (dead.length) {
+            // Раскрытие помнит состояние: автообновление перерисовывает блок
+            // каждые 42 секунды, и без этого список схлопывался бы под руками.
+            html += `<details class="tp-svc-more" data-svc-more>
+                <summary>
+                    <span class="tp-svc-more-label">${dead.length === 1 ? 'закрытый сервис' : `ещё ${dead.length} закрытых и удалённых`}</span>
+                    <span class="tp-svc-more-hint"></span>
+                </summary>
+                <div class="tp-svc-more-body">${dead.map(rowHtml).join('')}</div>
+            </details>`;
+        }
+
         html += '</div>';
         return html;
     }
@@ -8426,6 +8461,9 @@
         // Разбор #treeTable тоже обнуляем: договор мог смениться, а кэш
         // от прошлой отрисовки содержал бы прежние статус и баланс.
         panel._tpParams = null;
+        // Раскрытие истории сервисов — тоже: у нового договора свой список,
+        // и открывать его за оператора незачем.
+        panel._tpSvcMoreOpen = false;
 
         panel.innerHTML = '<div class="tp-loading">Загрузка данных договора…</div>'
             + '<div class="tp-body"></div>';
