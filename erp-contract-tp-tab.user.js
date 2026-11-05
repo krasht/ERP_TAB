@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.31
+// @version      0.71.32
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.31';
+    const SELF_VERSION = '0.71.32';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4581,6 +4581,10 @@
         // Тип по умолчанию — «Тестовый»: белый IP выдают на пробу, а с услугой
         // в абонплате оформляют уже после согласия абонента. Раньше первым
         // стоял «Обычный», и оператор по инерции вешал платный адрес.
+        //
+        // Сохранённый выбор оператора важнее умолчания: без этого после каждой
+        // перерисовки панели селект прыгал обратно на «Тестовый», и человек
+        // терял то, что выбрал. Значение живёт на панели до её пересборки.
         const kind = (state && state.kind) || 'test';
 
         let html = '';
@@ -4620,12 +4624,20 @@
         // PPPoE — логин и пароль из договора (их видит абонент в роутере).
         // IPoE — устройство и адрес автоматически, MAC вводится вручную,
         //        потому что авторизация там по MAC роутера.
+        // Селект «Тип» — это выбор действия, а не только вида адреса.
+        //
+        // Раньше рядом стояли четыре кнопки, и две из них делали одно и то же:
+        // «Навесить серый IP» и «Убрать белый IP» обе закрывали белый сервис и
+        // создавали серый, разница была только в позиции абонплаты. Оператор
+        // выбирал между ними наугад. Теперь услуга при снятии белого IP всегда
+        // удаляется, и два действия слились в одно — «Серый».
         html += `<div class="tp-whiteip-form">
             <label class="tp-field">
                 <span>Тип</span>
                 <select class="tp-whiteip-kind">
-                    <option value="test"${kind === 'regular' ? '' : ' selected'}>Тестовый</option>
+                    <option value="test"${kind === 'regular' || kind === 'grey' ? '' : ' selected'}>Тестовый</option>
                     <option value="regular"${kind === 'regular' ? ' selected' : ''}>С услугой${isLegal ? ' (юрлица)' : ''}</option>
+                    <option value="grey"${kind === 'grey' ? ' selected' : ''}>Серый</option>
                 </select>
             </label>
             <label class="tp-field">
@@ -4686,26 +4698,20 @@
         // свободный из пула своего типа. Значение держим в скрытом поле,
         // чтобы обработчик кнопки не ходил за ним повторно.
         const autoAddr = (free || [])[0] || '';
-        // Свободные серые нужны и для «Убрать белый IP», и для «Навесить серый IP»:
-        // там адрес тоже подставляется автоматически. В форме его не показываем.
+        // Свободный серый нужен для действия «Серый» — там адрес тоже
+        // подставляется автоматически. В форме его не показываем.
         const greyAddr = (state && state.greyFree && state.greyFree[0]) || '';
 
-        // «Подключить услугу» — только когда белый IP уже навешен, а позиции
-        // в абонплате ещё нет. Ровно тот случай, ради которого блок существует:
-        // адрес выдали тестом, абонент согласился платить, и оператору нужно
-        // добавить «Публичный IP» в абонплату, не пересоздавая сервис.
-        // Если услуга уже подключена или белого адреса нет — кнопки не показываем
-        // вовсе: она была бы либо бесполезна, либо опасна (второй раз добавит).
-        const canAddService = ipKind === 'white' && !hasService;
+        // Одна кнопка вместо четырёх. Подпись и доступность зависят от того,
+        // что выбрано в «Типе»: белый пул и серый пул — разные ресурсы, и
+        // «Применить» не должно быть активным, когда нужного адреса нет.
+        const isGreyKind = kind === 'grey';
+        const canApply = isGreyKind ? !!greyAddr : !!autoAddr;
+        const applyLabel = isGreyKind ? 'Навесить серый IP' : 'Навесить белый IP';
 
         html += `<input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
-            <button type="button" class="tp-btn tp-whiteip-apply"${autoAddr ? '' : ' disabled'}>Навесить белый IP</button>
-            <button type="button" class="tp-btn is-ghost tp-whiteip-grey"${greyAddr ? '' : ' disabled'}
-                    title="Выдать первый свободный серый адрес из пула">Навесить серый IP</button>
-            ${canAddService
-                ? `<button type="button" class="tp-btn tp-whiteip-service">Подключить услугу</button>`
-                : ''}
-            <button type="button" class="tp-btn is-ghost tp-whiteip-remove"${(ipKind === 'white' || hasService) && greyAddr ? '' : ' disabled'}>Убрать белый IP</button>
+            <button type="button" class="tp-btn tp-whiteip-apply"${canApply ? '' : ' disabled'}
+                    data-grey="${esc(greyAddr)}">${esc(applyLabel)}</button>
             <span class="tp-msg tp-whiteip-msg"></span>
         </div>`;
 
@@ -4863,6 +4869,9 @@
             current, free: ips, personType, devices, deviceId, svcType, creds,
             // Свободные серые адреса — для возврата на серый IP конкретным адресом
             greyFree: greyIps,
+            // Выбор оператора в «Типе» переживает перерисовку: без этого
+            // селект каждый раз прыгал на «Тестовый».
+            kind: panel._tpWhiteIpKind || 'test',
             ipoeDeviceId: (ipoeDev && ipoeDev.id) || '',
             pppoeDeviceId: pppoeDevId || '',
             // Для индикаторов в блоке: белый или серый адрес и есть ли услуга
@@ -5035,15 +5044,66 @@
         refreshErpTabs(panel);
     }
 
-    /** Обработчик кнопки «Навесить белый IP». */
+    /**
+     * Обработчик единственной кнопки блока «Белый IP».
+     *
+     * Раньше здесь было четыре независимых обработчика: «Навесить белый IP»,
+     * «Подключить услугу», «Навесить серый IP» и «Убрать белый IP». Две
+     * последние делали одно и то же — закрывали белый сервис и создавали
+     * серый, отличаясь только позицией в абонплате, — и оператор выбирал
+     * между ними наугад. Теперь действие выбирается в селекте «Тип»,
+     * кнопка одна, а она разводит поток по веткам.
+     */
     function mountWhiteIp(panel) {
         const btn = panel.querySelector('.tp-whiteip-apply');
         if (!btn || btn.dataset.bound === '1') return;
         btn.dataset.bound = '1';
 
+        const msg = panel.querySelector('.tp-whiteip-msg');
+        const say = (cls, text) => {
+            if (!msg) return;
+            msg.className = 'tp-msg tp-whiteip-msg ' + cls;
+            msg.textContent = text;
+        };
+
+        const kindEl = panel.querySelector('.tp-whiteip-kind');
+        const svcSel = panel.querySelector('.tp-whiteip-svc');
+        const addrInput = panel.querySelector('.tp-whiteip-addr');
+
+        /**
+         * Пересчёт подписи и доступности кнопки под выбранный тип.
+         *
+         * Пул белых и пул серых — разные ресурсы: «Применить» должно гаснуть,
+         * когда в нужном пуле нет свободного адреса. Иначе оператор нажимает
+         * и получает отказ биллинга вместо понятного «адресов нет».
+         */
+        const refreshButton = () => {
+            const st = panel._tpWhiteIp || {};
+            const kind = kindEl ? kindEl.value : 'test';
+            const isGrey = kind === 'grey';
+            // Выбор запоминаем на панели: без этого после перерисовки селект
+            // сбрасывался на «Тестовый», и оператор терял свой выбор.
+            panel._tpWhiteIpKind = kind;
+            btn.textContent = isGrey ? 'Навесить серый IP' : 'Навесить белый IP';
+
+            if (isGrey) {
+                btn.disabled = !((st.greyFree && st.greyFree[0]) || '');
+                return;
+            }
+            const white = (st.free && st.free[0]) || '';
+            if (addrInput) addrInput.value = white;
+            btn.disabled = !white;
+        };
+
+        if (kindEl) {
+            kindEl.addEventListener('change', () => {
+                refreshButton();
+                if (msg) { msg.className = 'tp-msg tp-whiteip-msg'; msg.textContent = ''; }
+            });
+        }
+
         // Переключение PPPoE/IPoE: у типов разные категории IP-ресурсов
         // («PPPoE белые» и «IPoE белые»), поэтому список адресов перезагружаем.
-        const svcSel = panel.querySelector('.tp-whiteip-svc');
         if (svcSel) {
             svcSel.addEventListener('change', async () => {
                 const isIpoe = svcSel.value === 'ipoe';
@@ -5070,30 +5130,44 @@
                         : (isIpoe ? 'BRAS Microtik: BRAS-004 [100.64.5.24]' : 'Папка: PPPoE');
                 }
 
-                const msg = panel.querySelector('.tp-whiteip-msg');
-                const addrInput = panel.querySelector('.tp-whiteip-addr');
-
                 const cid = panel.dataset.contractId;
                 const cats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
-                const ips = (cats || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
-                const auto = ips[0] || '';
+                // Обновляем оба пула: у нового типа подключения свои адреса,
+                // и кнопка должна считать доступность по ним, а не по прежним.
+                const fresh = panel._tpWhiteIp || (panel._tpWhiteIp = {});
+                fresh.free = (cats || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
+                fresh.greyFree = (cats || [])
+                    .filter((c) => !c.isWhite)
+                    .flatMap((c) => c.ips)
+                    .filter((ip) => !isPublicIp(ip));
 
-                // Адрес всегда автоматический — первый свободный из пула типа
-                if (addrInput) addrInput.value = auto;
-                if (btn) btn.disabled = !auto;
+                refreshButton();
                 if (msg) { msg.className = 'tp-msg tp-whiteip-msg'; msg.textContent = ''; }
             });
         }
 
+        /**
+         * Единое действие блока. Что именно произойдёт, решает селект «Тип»:
+         *
+         *   Тестовый   — публичный адрес без позиции в абонплате (выдача на пробу);
+         *   С услугой  — публичный адрес + «Публичный IP» в абонплате;
+         *   Серый      — возврат на серый адрес, услуга снимается.
+         *
+         * Особый случай: белый адрес уже навешен, услуги нет, выбран
+         * «С услугой». Тогда сервис НЕ пересоздаётся — адрес уже работает,
+         * рвать сессию абонента незачем. Достаточно добавить позицию в
+         * абонплату. Раньше для этого была отдельная кнопка «Подключить услугу».
+         */
         btn.addEventListener('click', async () => {
             const state = panel._tpWhiteIp || {};
             const cid = panel.dataset.contractId;
-            const kindEl = panel.querySelector('.tp-whiteip-kind');
             const devEl = panel.querySelector('.tp-whiteip-device');
-            const svcEl = panel.querySelector('.tp-whiteip-svc');
-            const msg = panel.querySelector('.tp-whiteip-msg');
-            const kind = kindEl ? kindEl.value : 'regular';
-            const svcType = svcEl ? svcEl.value : (state.svcType || 'pppoe');
+            const kind = kindEl ? kindEl.value : 'test';
+            const isGrey = kind === 'grey';
+            const isLegal = state.personType === 'legal';
+            const label = 'Публичный IP' + (isLegal ? ' (юрлица)' : '');
+
+            const svcType = svcSel ? svcSel.value : (state.svcType || 'pppoe');
             const isIpoe = svcType === 'ipoe';
             // Устройство своё у каждого типа: IPoE > BRAS-004 (MAC-авторизация),
             // PPPoE > папка PPPoE (иначе не найдётся IP-ресурс из «PPPoE белые»).
@@ -5101,56 +5175,81 @@
                 ? (devEl ? devEl.value : (state.ipoeDeviceId || ''))
                 : (state.pppoeDeviceId || (devEl ? devEl.value : ''));
 
-            const say = (cls, text) => {
-                if (!msg) return;
-                msg.className = 'tp-msg tp-whiteip-msg ' + cls;
-                msg.textContent = text;
-            };
+            // ---- услуга без пересоздания сервиса
+            //
+            // Белый адрес уже навешен, услуги нет, выбрано «С услугой»:
+            // добавляем только позицию в абонплате. Это самый частый путь —
+            // адрес выдали тестом, абонент согласился платить.
+            if (kind === 'regular' && state.ipKind === 'white' && !state.npay) {
+                btn.disabled = true;
+                say('', 'Подключаю услугу…');
+                try {
+                    const added = await addPublicIpService(cid, isLegal);
+                    if (!added.ok) {
+                        say('is-bad', 'Услугу «' + label + '» подключить не удалось: '
+                            + (added.message || 'причина неизвестна'));
+                        btn.disabled = false;
+                        return;
+                    }
+                    say('is-ok', 'Услуга «' + label + '» ' + (added.message || 'подключена')
+                        + ' — обновляю список');
+                    refreshAfterIpChange(panel, null).catch(() => {});
+                } catch (e) {
+                    say('is-bad', 'Ошибка: ' + (e.message || e));
+                    btn.disabled = false;
+                }
+                return;
+            }
 
-            // Адрес берём заново, прямо перед созданием: список в форме мог
-            // устареть, пока оператор заполнял поля, а биллинг на занятый
-            // адрес отвечает невнятным «Подходящий ip ресурс не найден».
-            // Это же снимает нужду показывать адрес в форме — он всегда
-            // актуальный первый свободный из пула нужного типа.
-            const freshCats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
-            const freeNow = (freshCats || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
-            const addr = freeNow[0] || '';
-            const addrInput = panel.querySelector('.tp-whiteip-addr');
-            if (addrInput) addrInput.value = addr;
+            if (!deviceId) {
+                say('is-bad', isIpoe ? 'Не найдено устройство BRAS-004' : 'Не найдена папка PPPoE');
+                return;
+            }
 
-            if (!addr) { say('is-bad', 'В белом пуле нет свободных адресов'); btn.disabled = true; return; }
-            if (isIpoe && !deviceId) { say('is-bad', 'Не найдено устройство BRAS-004'); return; }
-            if (!isIpoe && !deviceId) { say('is-bad', 'Не найдена папка PPPoE'); return; }
-
-            // MAC обязателен для IPoE: там авторизация по MAC, без него
-            // сервис создастся, но роутер не подключится.
+            // MAC: сначала из поля (оператор мог поправить), иначе из
+            // действующего сервиса — при смене адреса MAC должен остаться тем же.
             const macEl = panel.querySelector('.tp-whiteip-mac');
             const macRaw = isIpoe ? ((macEl && macEl.value) || '').trim() : '';
-            const mac = normalizeMac(macRaw);
-            if (isIpoe && !macRaw) { say('is-bad', 'Укажите MAC роутера'); return; }
+            const macFromField = normalizeMac(macRaw);
+            const macFromService = normalizeMac((state.activeInet && state.activeInet.mac) || '');
+            const mac = macFromField || macFromService;
+            if (isIpoe && !macRaw && !mac) { say('is-bad', 'Укажите MAC роутера'); return; }
             if (isIpoe && !mac) {
                 say('is-bad', 'MAC должен содержать 12 hex-символов, например a4ba.7002.8a61');
                 return;
             }
 
-            const isTest = kind === 'test';
-            const isLegal = state.personType === 'legal';
-            const comment = isTest ? 'Тестовый белый IP'
-                : (isLegal ? 'Белый IP (юрлица)' : 'Белый IP');
-
-            // Подтверждение не спрашиваем: кнопка «Навесить белый IP» и есть
-            // действие, лишний диалог только тормозит работу оператора.
             btn.disabled = true;
-            say('', 'Выполняется…');
+            say('', isGrey ? 'Навешиваю серый IP…' : 'Выполняется…');
+
             try {
-                // Логин из договора уже занят текущим сервисом — биллинг ответит
-                // «Логин уже используется». Поэтому старый сервис закрываем
-                // вчерашним числом в ЛЮБОМ варианте, не только в тестовом:
-                // иначе с тем же логином новый сервис не создать.
+                // ---- адрес берём заново, прямо перед созданием
                 //
-                // Сервисы с состоянием «удален» пропускаем: в дереве они значатся
-                // открытыми, но в биллинге их уже нет, и serviceUpdate по ним
-                // отвечает «Сервис не найден» — это ломало всю операцию.
+                // Список в форме мог устареть, пока оператор заполнял поля,
+                // а биллинг на занятый адрес отвечает невнятным «Подходящий
+                // ip ресурс не найден». Это же снимает нужду показывать адрес
+                // в форме — он всегда актуальный первый свободный.
+                const cats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
+                const pool = isGrey
+                    ? (cats || []).filter((c) => !c.isWhite).flatMap((c) => c.ips)
+                        .filter((ip) => !isPublicIp(ip))
+                    : (cats || []).filter((c) => c.isWhite).flatMap((c) => c.ips);
+                const addr = pool[0] || '';
+                if (!addr) {
+                    say('is-bad', isGrey
+                        ? 'В сером пуле нет свободных адресов — освободите адрес в биллинге'
+                        : 'В белом пуле нет свободных адресов');
+                    btn.disabled = true;
+                    return;
+                }
+                if (!isGrey && addrInput) addrInput.value = addr;
+
+                // ---- закрываем активные сервисы вчерашним числом
+                //
+                // Логин занят ими же, поэтому без закрытия новый сервис с тем же
+                // логином не создать. Сервисы с состоянием «удален» пропускаем:
+                // в дереве они значатся открытыми, но в биллинге их уже нет,
+                // и serviceUpdate по ним отвечает «Сервис не найден».
                 const alive = (await ERP.services(cid)).list
                     .filter((s) => /^(PPPoE|IPoE)$/i.test(s.type || '')
                         && !/закрыт/i.test(s.status || '')
@@ -5172,36 +5271,34 @@
                     }
                 }
                 if (closeFailed.length && closeFailed.length === alive.filter((s) => s.id).length) {
-                    say('is-bad', 'Не удалось закрыть текущий сервис — белый IP не навешен. '
+                    say('is-bad', 'Не удалось закрыть текущий сервис — адрес не навешен. '
                         + 'Проверьте сервис в биллинге вручную.');
                     btn.disabled = false;
                     return;
                 }
 
-                // Логин и пароль — из договора, и для обычного, и для теста.
-                // Тестовый отличается только тем, что услуга «Публичный IP» в тариф
-                // не добавляется: адрес выдаётся временно.
+                // ---- новый сервис
                 //
                 // Пароль берём из поля, а не из состояния: оператор мог его
                 // поправить. Пустое поле — тоже валидный выбор, тогда биллинг
                 // сгенерирует пароль сам (generatePassword=1 в createService).
                 const creds = state.creds || {};
-                const login = creds.login || '';
                 const pwdEl = panel.querySelector('.tp-whiteip-password');
                 const password = pwdEl ? pwdEl.value.trim() : (creds.password || '');
 
                 const res = await ERP.createService(cid, {
                     typeId: isIpoe ? 2 : 1,   // 1 = PPPoE, 2 = IPoE
-                    login,
+                    login: creds.login || '',
                     password,
                     mac,
-                    // Адрес передаём для обоих типов: PPPoE тоже умеет
-                    // статический адрес из «PPPoE белые», но только когда
-                    // указано устройство (папка PPPoE). С пустым адресом
-                    // биллинг выдаёт 0.0.0.0 и белый IP не применяется.
+                    // Адрес передаём и для белого, и для серого: пустой addrFrom
+                    // биллинг принимает, но адрес не выдаёт — сервис остаётся
+                    // с 0.0.0.0 и заглушкой «[IpAddress:null]» в дереве.
                     addr,
                     deviceId,
-                    comment,
+                    comment: isGrey ? 'Серый IP'
+                        : (kind === 'test' ? 'Тестовый белый IP'
+                            : (isLegal ? 'Белый IP (юрлица)' : 'Белый IP')),
                 });
                 if (!res.ok) {
                     // Ошибку биллинга показываем человеческим языком: стектрейс
@@ -5221,345 +5318,43 @@
                     return;
                 }
 
-                // ---- услуга «Публичный IP-адрес» в абонплате
+                // ---- позиция «Публичный IP» в абонплате
                 //
                 // Белый IP — это два действия в биллинге: сервис Inet с адресом
-                // и позиция «Публичный IP-адрес» в «Абонентской плате» (npay).
-                // Без второй адрес работает, но не тарифицируется.
-                // Тестовый вариант услугу НЕ добавляет — выдача временная.
-                let serviceNote = '';
-                if (!isTest) {
+                // и позиция в «Абонентской плате» (npay). Без второй адрес
+                // работает, но не тарифицируется. При снятии белого услугу
+                // всегда убираем: если абонент отказался от адреса, он не должен
+                // за него платить.
+                let note = '';
+                if (isGrey || kind === 'test') {
+                    const removed = await removePublicIpService(cid, isLegal);
+                    if (!removed.ok) {
+                        note = ' · услугу «' + label + '» отключить не удалось: '
+                            + (removed.message || 'причина неизвестна');
+                    } else if (state.npay) {
+                        note = ' · услуга «' + label + '» отключена';
+                    }
+                } else {
                     const added = await addPublicIpService(cid, isLegal);
-                    const label = 'Публичный IP' + (isLegal ? ' (юрлица)' : '');
-                    serviceNote = added.ok
+                    note = added.ok
                         ? ' · услуга «' + label + '» ' + (added.message || 'подключена')
-                        : ' · услугу «' + label + '» подключить не удалось: ' + (added.message || 'причина неизвестна');
+                        : ' · услугу «' + label + '» подключить не удалось: '
+                            + (added.message || 'причина неизвестна');
                 }
 
-                say('is-ok', 'Готово' + serviceNote + ' — обновляю список');
+                say('is-ok', 'Готово: ' + (isGrey ? 'серый IP ' + addr : 'белый IP ' + addr)
+                    + note + ' — обновляю список');
                 // Пароль мог быть изменён в поле, а блок «Доступы» берёт его
                 // из кэша — без сброса он показывал бы старое значение.
                 if (panel._tpPwdCache) panel._tpPwdCache.delete(cid);
                 // Ждём, пока биллинг применит сервис, и обновляем всё: панель,
                 // вкладки ERP («Интернет» показывает то же дерево сервисов).
-                // Раньше здесь был setTimeout(1500) — он срабатывал раньше,
-                // чем биллинг успевал применить адрес, и в панели оставался
-                // прежний серый IP, хотя белый уже был выдан.
-                refreshAfterIpChange(panel, 'white').catch(() => {});
-                btn.disabled = false;
+                refreshAfterIpChange(panel, isGrey ? 'grey' : 'white').catch(() => {});
             } catch (e) {
                 say('is-bad', 'Ошибка: ' + (e.message || e));
                 btn.disabled = false;
             }
         });
-
-        // ---- «Подключить услугу»
-        //
-        // Добавляет «Публичный IP» в абонплату, когда белый адрес уже навешен,
-        // но позиции в тарифе нет. Ровно этот случай и есть «тестовый» тип:
-        // адрес выдали, абонент согласился платить — остаётся включить услугу.
-        //
-        // Сервис при этом НЕ пересоздаётся: адрес уже работает, трогать его
-        // незачем. Достаточно добавить позицию в абонплату (npay), поэтому
-        // операция быстрая и не рвёт сессию абонента.
-        const serviceBtn = panel.querySelector('.tp-whiteip-service');
-        if (serviceBtn && serviceBtn.dataset.bound !== '1') {
-            serviceBtn.dataset.bound = '1';
-
-            serviceBtn.addEventListener('click', async () => {
-                const state = panel._tpWhiteIp || {};
-                const cid = panel.dataset.contractId;
-                const msg = panel.querySelector('.tp-whiteip-msg');
-                const say = (cls, text) => {
-                    if (!msg) return;
-                    msg.className = 'tp-msg tp-whiteip-msg ' + cls;
-                    msg.textContent = text;
-                };
-
-                const isLegal = state.personType === 'legal';
-                serviceBtn.disabled = true;
-                say('', 'Подключаю услугу…');
-
-                try {
-                    const added = await addPublicIpService(cid, isLegal);
-                    const label = 'Публичный IP' + (isLegal ? ' (юрлица)' : '');
-                    if (!added.ok) {
-                        say('is-bad', 'Услугу «' + label + '» подключить не удалось: '
-                            + (added.message || 'причина неизвестна'));
-                        serviceBtn.disabled = false;
-                        return;
-                    }
-                    say('is-ok', 'Услуга «' + label + '» ' + (added.message || 'подключена')
-                        + ' — обновляю список');
-                    // Перерисовываем: услуга подключена, кнопка больше не нужна,
-                    // а в статусе сверху появится «Услуга подключена».
-                    refreshAfterIpChange(panel, null).catch(() => {});
-                } catch (e) {
-                    say('is-bad', 'Ошибка: ' + (e.message || e));
-                    serviceBtn.disabled = false;
-                }
-            });
-        }
-
-        // ---- «Навесить серый IP»
-        //
-        // Обратное действие для случая, когда белый адрес больше не нужен,
-        // но абоненту нужен статический серый: оператору не приходится
-        // пересоздавать сервис через «Убрать белый IP» и ждать.
-        //
-        // В отличие от «Убрать белый IP», здесь услуга «Публичный IP» НЕ
-        // удаляется — это осознанный выбор: серый адрес без услуги ничем не
-        // отличается от возврата на серый, а лишний вызов npay только удлинит
-        // операцию. Если услугу надо снять, для этого есть «Убрать белый IP».
-        const greyBtn = panel.querySelector('.tp-whiteip-grey');
-        if (greyBtn && greyBtn.dataset.bound !== '1') {
-            greyBtn.dataset.bound = '1';
-
-            greyBtn.addEventListener('click', async () => {
-                const state = panel._tpWhiteIp || {};
-                const cid = panel.dataset.contractId;
-                const msg = panel.querySelector('.tp-whiteip-msg');
-                const say = (cls, text) => {
-                    if (!msg) return;
-                    msg.className = 'tp-msg tp-whiteip-msg ' + cls;
-                    msg.textContent = text;
-                };
-
-                const svcEl = panel.querySelector('.tp-whiteip-svc');
-                const svcType = (svcEl && svcEl.value) || state.svcType || 'pppoe';
-                const isIpoe = svcType === 'ipoe';
-                const deviceId = isIpoe ? (state.ipoeDeviceId || '') : (state.pppoeDeviceId || '');
-                if (!deviceId) {
-                    say('is-bad', isIpoe ? 'Не найдено устройство BRAS-004' : 'Не найдена папка PPPoE');
-                    return;
-                }
-
-                const macEl = panel.querySelector('.tp-whiteip-mac');
-                const mac = isIpoe ? normalizeMac((macEl && macEl.value) || '') : '';
-                if (isIpoe && !mac) {
-                    say('is-bad', 'Укажите MAC роутера — по нему авторизуется IPoE');
-                    return;
-                }
-
-                greyBtn.disabled = true;
-                say('', 'Навешиваю серый IP…');
-
-                try {
-                    // Адрес берём заново: список в форме мог устареть, а биллинг
-                    // на занятый отвечает невнятным «Подходящий ip ресурс не найден».
-                    const cats = await ERP.freeIpList(cid, isIpoe ? 2 : 1).catch(() => []);
-                    const greyIps = (cats || [])
-                        .filter((c) => !c.isWhite)
-                        .flatMap((c) => c.ips)
-                        .filter((ip) => !isPublicIp(ip));
-                    const greyAddr = greyIps[0] || '';
-                    if (!greyAddr) {
-                        say('is-bad', 'В сером пуле нет свободных адресов');
-                        greyBtn.disabled = false;
-                        return;
-                    }
-
-                    // Старые сервисы закрываем вчерашним числом — иначе логин занят
-                    // и новый сервис с тем же логином не создать.
-                    const alive = (await ERP.services(cid)).list
-                        .filter((s) => /^(PPPoE|IPoE)$/i.test(s.type || '')
-                            && !/закрыт/i.test(s.status || '')
-                            && !/удален|удалён/i.test(s.state || ''));
-                    const failed = [];
-                    for (let i = 0; i < alive.length; i++) {
-                        const sid = alive[i].id;
-                        if (!sid) continue;
-                        try {
-                            const closed = await ERP.closeService(cid, sid, yesterdayRu());
-                            if (!closed.ok || /BGException|Подходящий ip ресурс|не найден/i.test(String(closed.text || ''))) {
-                                failed.push(sid);
-                            }
-                        } catch (e) {
-                            failed.push(sid);
-                        }
-                    }
-                    if (failed.length && failed.length === alive.filter((s) => s.id).length) {
-                        say('is-bad', 'Не удалось закрыть текущий сервис — серый IP не навешен. '
-                            + 'Проверьте сервис в биллинге вручную.');
-                        greyBtn.disabled = false;
-                        return;
-                    }
-
-                    const creds = state.creds || {};
-                    const pwdEl = panel.querySelector('.tp-whiteip-password');
-                    const password = pwdEl ? pwdEl.value.trim() : (creds.password || '');
-                    const res = await ERP.createService(cid, {
-                        typeId: isIpoe ? 2 : 1,
-                        login: creds.login || '',
-                        password,
-                        mac,
-                        addr: greyAddr,
-                        deviceId,
-                        comment: 'Серый IP',
-                    });
-                    if (!res.ok) {
-                        say('is-bad', 'Биллинг отказал: ' + String(res.text).slice(0, 120));
-                        greyBtn.disabled = false;
-                        return;
-                    }
-
-                    if (panel._tpPwdCache) panel._tpPwdCache.delete(cid);
-                    say('is-ok', 'Готово: серый IP ' + greyAddr + ' — обновляю список');
-                    refreshAfterIpChange(panel, 'grey').catch(() => {});
-                } catch (e) {
-                    say('is-bad', 'Ошибка: ' + (e.message || e));
-                    greyBtn.disabled = false;
-                }
-            });
-        }
-
-        // ---- «Убрать белый IP»
-        //
-        // Действие обратное навешиванию: абонент должен вернуться на серый адрес,
-        // поэтому старый сервис с публичным адресом закрывается вчерашним числом,
-        // создаётся новый БЕЗ статического адреса (биллинг выдаёт адрес
-        // динамически из серой сети), а услуга «Публичный IP-адрес» удаляется
-        // из абонплаты — иначе она продолжила бы тарифицироваться.
-        const removeBtn = panel.querySelector('.tp-whiteip-remove');
-        if (removeBtn && removeBtn.dataset.bound !== '1') {
-            removeBtn.dataset.bound = '1';
-
-            removeBtn.addEventListener('click', async () => {
-                const state = panel._tpWhiteIp || {};
-                const cid = panel.dataset.contractId;
-                const msg = panel.querySelector('.tp-whiteip-msg');
-                const svcEl = panel.querySelector('.tp-whiteip-svc');
-                const svcType = (svcEl && svcEl.value) || state.svcType || 'pppoe';
-                const isIpoe = svcType === 'ipoe';
-                const isLegal = state.personType === 'legal';
-                const macEl = panel.querySelector('.tp-whiteip-mac');
-                // MAC: сначала из поля (оператор мог поправить), иначе из
-                // действующего сервиса — при возврате на серый IP MAC должен
-                // остаться тем же, что был на белом.
-                const macFromField = normalizeMac((macEl && macEl.value) || '');
-                const macFromService = normalizeMac((state.activeInet && state.activeInet.mac) || '');
-                const mac = macFromField || macFromService;
-
-                const say = (cls, text) => {
-                    if (!msg) return;
-                    msg.className = 'tp-msg tp-whiteip-msg ' + cls;
-                    msg.textContent = text;
-                };
-
-                // Устройство: IPoE > BRAS-004, PPPoE > папка PPPoE.
-                // Для серого адреса то же требование, что и для белого:
-                // без устройства биллинг не поймёт, откуда выдавать адрес.
-                const deviceId = isIpoe
-                    ? (state.ipoeDeviceId || '')
-                    : (state.pppoeDeviceId || '');
-                if (!deviceId) {
-                    say('is-bad', isIpoe ? 'Не найдено устройство BRAS-004' : 'Не найдена папка PPPoE');
-                    return;
-                }
-                // MAC нужен для IPoE: без него сервис создастся, но роутер не подключится
-                if (isIpoe && !mac) {
-                    say('is-bad', 'Укажите MAC роутера — по нему авторизуется IPoE');
-                    return;
-                }
-
-                removeBtn.disabled = true;
-                say('', 'Убираю белый IP…');
-                try {
-                    // 1) Закрываем активные сервисы вчерашним числом.
-                    // Логин занят ими же, поэтому без закрытия новый сервис не создать.
-                    // «удален» пропускаем — таких в биллинге уже нет (см. комментарий
-                    // в обработчике «Навесить белый IP»).
-                    const alive = (await ERP.services(cid)).list
-                        .filter((s) => /^(PPPoE|IPoE)$/i.test(s.type || '')
-                            && !/закрыт/i.test(s.status || '')
-                            && !/удален|удалён/i.test(s.state || ''));
-                    const failed = [];
-                    for (let i = 0; i < alive.length; i++) {
-                        const sid = alive[i].id;
-                        if (!sid) continue;
-                        try {
-                            const closed = await ERP.closeService(cid, sid, yesterdayRu());
-                            // Биллинг мог вернуть 200 с ошибкой внутри тела —
-                            // раньше это молча проглатывалось, и старый сервис
-                            // оставался открытым, а новый не создавался.
-                            if (!closed.ok || /BGException|Подходящий ip ресурс|не найден/i.test(String(closed.text || ''))) {
-                                failed.push(sid);
-                            }
-                        } catch (e) {
-                            failed.push(sid);
-                        }
-                    }
-                    if (failed.length && failed.length === alive.filter((s) => s.id).length) {
-                        say('is-bad', 'Не удалось закрыть текущий сервис — белый IP не снят. '
-                            + 'Проверьте сервис в биллинге вручную.');
-                        removeBtn.disabled = false;
-                        return;
-                    }
-
-                    // 2) Новый сервис с конкретным свободным адресом из серого пула.
-                    //
-                    // Пустой addrFrom биллинг принимает, но адрес не выдаёт:
-                    // сервис остаётся с 0.0.0.0, и в дереве висит заглушка
-                    // шаблона «[IpAddress:null]» — то есть абонент сидит без
-                    // адреса вовсе. Проверено на живом биллинге: создать с
-                    // addrFrom='' → 200 ok, но addrFrom остаётся 0.0.0.0;
-                    // с addrFrom=10.100.31.30 → адрес применяется сразу.
-                    //
-                    // Поэтому берём первый свободный из «серых» категорий
-                    // того же пула, что и тип подключения (PPPoE / IPoE):
-                    // пулы у типов разные, и адрес из чужого не применится.
-                    const greyCats = await ERP.freeIpList(cid, isIpoe ? 2 : 1)
-                        .catch(() => []);
-                    const greyIps = (greyCats || [])
-                        .filter((c) => !c.isWhite)
-                        .flatMap((c) => c.ips)
-                        .filter((ip) => !isPublicIp(ip));
-                    const greyAddr = greyIps[0] || '';
-                    if (!greyAddr) {
-                        say('is-bad', 'В сером пуле нет свободных адресов — белый IP не снят. '
-                            + 'Освободите адрес в биллинге и повторите.');
-                        removeBtn.disabled = false;
-                        return;
-                    }
-
-                    const creds = state.creds || {};
-                    const pwdEl = panel.querySelector('.tp-whiteip-password');
-                    const password = pwdEl ? pwdEl.value.trim() : (creds.password || '');
-                    const res = await ERP.createService(cid, {
-                        typeId: isIpoe ? 2 : 1,
-                        login: creds.login || '',
-                        password,
-                        mac,
-                        addr: greyAddr,
-                        deviceId,
-                        comment: 'Возврат на серый IP',
-                    });
-                    if (!res.ok) {
-                        say('is-bad', 'Биллинг отказал: ' + String(res.text).slice(0, 120));
-                        removeBtn.disabled = false;
-                        return;
-                    }
-
-                    // 3) Услугу «Публичный IP-адрес» убираем из абонплаты
-                    const removed = await removePublicIpService(cid, isLegal);
-                    const note = removed.ok
-                        ? ' · услуга отключена'
-                        : ' · услугу отключить не удалось: ' + (removed.message || 'причина неизвестна');
-
-                    say('is-ok', 'Готово: серый IP' + note + ' — обновляю список');
-                    // Новый сервис мог получить другой пароль — сбрасываем кэш,
-                    // иначе «Доступы» покажут прежний.
-                    if (panel._tpPwdCache) panel._tpPwdCache.delete(cid);
-                    // Ждём, пока публичный адрес уйдёт из дерева сервисов:
-                    // без этого панель показывала белый IP ещё минуту после снятия.
-                    refreshAfterIpChange(panel, 'grey').catch(() => {});
-                    removeBtn.disabled = false;
-                } catch (e) {
-                    say('is-bad', 'Ошибка: ' + (e.message || e));
-                    removeBtn.disabled = false;
-                }
-            });
-        }
     }
 
 
@@ -6369,10 +6164,17 @@
     /**
      * Отключение услуги «Публичный IP-адрес» из абонплаты.
      *
-     * ERP удаляет её через npay.do?method=serviceDelete&...&id=<id услуги>.
-     * Именно удаление, а не закрытие периодом: закрытая позиция продолжала бы
-     * висеть в списке и тарифицироваться до конца расчётного периода, а при
-     * снятии белого IP услуга должна уйти сразу.
+     * Закрываем позицию СЕГОДНЯШНИМ числом, а не удаляем.
+     *
+     * Раньше здесь стоял npay.do?method=serviceDelete — позиция исчезала из
+     * списка бесследно. Оператор не мог ответить абоненту «когда услугу сняли»
+     * и не видел её в истории: в биллинге не оставалось никаких следов.
+     * Договор же ведут годами, и такие следы нужны — при разборе жалобы,
+     * при сверке начислений, при повторном подключении.
+     *
+     * Поэтому идём тем же путём, что и оператор вручную: открываем форму
+     * услуги (serviceGet) и сохраняем её с dateTo = сегодня. Позиция остаётся
+     * в списке закрытой, тарификация прекращается с текущей даты.
      *
      * Возвращает { ok, message }.
      */
@@ -6384,26 +6186,61 @@
         if (!existing) return { ok: true, message: 'услуги не было' };
 
         try {
-            const res = await fetch(
-                '/user/plugin/bgbilling/proto/npay.do?method=serviceDelete'
-                + `&contractId=${encodeURIComponent(id)}&billingId=bill&moduleId=2`
-                + `&id=${encodeURIComponent(existing.id)}`,
-                { method: 'POST', credentials: 'same-origin' }
-            );
+            // Читаем позицию: serviceUpdate требует все поля, иначе биллинг
+            // потеряет количество и объект. Форма отдаёт их готовыми.
+            const readUrl = '/user/plugin/bgbilling/proto/npay.do'
+                + `?id=${encodeURIComponent(existing.id)}&method=serviceGet`
+                + `&contractId=${encodeURIComponent(id)}&billingId=bill&moduleId=2`;
+            const html = await fetchText(readUrl);
+            const form = parseHtml(html).querySelector('form');
+            if (!form) return { ok: false, message: 'услуга не найдена в абонплате' };
+
+            const val = (n) => {
+                const el = form.elements[n];
+                return el ? String(el.value || '') : '';
+            };
+
+            const body = new URLSearchParams({
+                method: 'update',
+                contractId: String(id),
+                billingId: 'bill',
+                moduleId: '2',
+                id: String(existing.id),
+                serviceId: val('serviceId') || existing.serviceId,
+                data: val('data'),
+                count: val('count') || '1',
+                dateFrom: val('dateFrom'),
+                // Сегодняшним числом: тарификация прекращается с текущей даты,
+                // а запись остаётся в списке закрытой.
+                dateTo: todayRu(),
+                objectId: val('objectId') || '0',
+                comment: 'Снятие белого IP',
+            });
+
+            const res = await fetch('/user/plugin/dogovor/npay.do', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            });
             const text = await res.text();
-            // Успех ERP отдаёт как {"status":"ok",...}
-            if (/^\s*\{/.test(text)) {
-                let json = null;
-                try { json = JSON.parse(text); } catch (e) { /* не JSON — проверим ниже */ }
-                if (json && json.status && json.status !== 'ok') {
+
+            // Ответ — JSON {"status":"ok"|"error","message":"…"}
+            let json = null;
+            try { json = JSON.parse(text); } catch (e) { /* не JSON — разберём текстом */ }
+            if (json) {
+                if (json.status && json.status !== 'ok') {
                     return { ok: false, message: String(json.message || json.status).slice(0, 110) };
                 }
-                return { ok: true, message: 'услуга отключена' };
+                return { ok: true, message: 'услуга закрыта сегодняшним числом' };
             }
+
             const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-            const err = plain.match(/(Ошибка|Exception|не найден)[^.]{0,90}/i);
-            if (err) return { ok: false, message: err[0].slice(0, 110) };
-            return { ok: true, message: 'услуга отключена' };
+            const err = plain.match(/(Ошибка|Exception|не найден|Выберите)[^.]{0,90}/i);
+            if (!res.ok || err) {
+                return { ok: false, message: (err ? err[0] : plain).slice(0, 110) };
+            }
+            return { ok: true, message: 'услуга закрыта сегодняшним числом' };
         } catch (e) {
             return { ok: false, message: e.message || String(e) };
         }
