@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.35
+// @version      0.72.0
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.35';
+    const SELF_VERSION = '0.72.0';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -392,9 +392,17 @@
         const key = String(url);
         const now = Date.now();
 
-        // Свежий ответ из кэша — без обращения к сети
+        // Свежий ответ из кэша — без обращения к сети.
+        // Попадание ПЕРЕНОСИТ запись в конец: Map хранит порядок вставки,
+        // и без переноса вытеснялась самая старая по вставке запись, а не
+        // самая давно использованная. Справочник устройств с TTL 5 минут
+        // мог быть выброшен ради случайного ответа, который больше не нужен.
         const hit = NET.cache.get(key);
-        if (hit && hit.until > now) return Promise.resolve(hit.text);
+        if (hit && hit.until > now) {
+            NET.cache.delete(key);
+            NET.cache.set(key, hit);
+            return Promise.resolve(hit.text);
+        }
         if (hit) NET.cache.delete(key);
 
         // Такой же запрос уже в пути — ждём его, а не дублируем
@@ -415,10 +423,16 @@
                 // Страницу входа и ошибки не кэшируем: сессия могла восстановиться
                 if (ttl > 0 && t.length < 4000000) {
                     NET.cache.set(key, { text: t, until: Date.now() + ttl });
-                    // Верхняя граница: у карточки за смену набираются сотни ответов
-                    if (NET.cache.size > NET.maxEntries) {
+                    NET.bytes += t.length;
+                    // Верхние границы: у карточки за смену набираются сотни
+                    // ответов. Считаем и количество, и суммарный размер —
+                    // 240 ответов «Стоимости» могут занять сотни мегабайт.
+                    while (NET.cache.size > NET.maxEntries || NET.bytes > NET.maxBytes) {
                         const oldest = NET.cache.keys().next();
-                        if (!oldest.done) NET.cache.delete(oldest.value);
+                        if (oldest.done) break;
+                        const drop = NET.cache.get(oldest.value);
+                        if (drop) NET.bytes -= (drop.text || '').length;
+                        NET.cache.delete(oldest.value);
                     }
                 }
                 return t;
@@ -471,8 +485,12 @@
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body,
         }).then((r) => r.text()).then((t) => {
-            // Любой POST меняет данные договора — старый кэш сразу недействителен
-            netDrop();
+            // POST меняет данные договора, но не справочники. Раньше здесь
+            // сбрасывался ВЕСЬ кэш: после каждой заметки, лимита или письма
+            // панель заново запрашивала дерево устройств (TTL 5 минут),
+            // параметры (2 минуты) и «Стоимость» (1.5 минуты) — хотя они
+            // не изменились. Сбрасываем только то, что POST мог затронуть.
+            netDrop(/contract|session|balance|serviceTree|method=serviceGet|memo|limit|npay|paymentList|contractCards|stoimost/i);
             return t;
         });
     };
@@ -508,7 +526,20 @@
         active: 0,
         queue: [],
         maxEntries: 240,
+        /** Суммарный размер кэша в символах: 240 ответов «Стоимости» — это сотни МБ. */
+        maxBytes: 32 * 1024 * 1024,
+        bytes: 0,
     };
+
+    /**
+     * Сколько ждёт один запрос, прежде чем освободить слот, мс.
+     *
+     * Без ограничения шесть зависших ответов ERP останавливали очередь
+     * НАВСЕГДА: NET.active не уменьшался, новые задачи не запускались,
+     * и панель «умирала» до перезагрузки страницы. Запрос при этом не
+     * обрывается — мы лишь перестаём держать на нём слот и отдаём ошибку.
+     */
+    const NET_TIMEOUT_MS = 30000;
 
     /** Сколько живёт ответ конкретной ручки, мс. */
     const NET_TTL = [
@@ -540,23 +571,50 @@
 
     /** Сброс кэша: без аргумента — весь, с шаблоном — только подходящие адреса. */
     function netDrop(pattern) {
-        if (!pattern) { NET.cache.clear(); return; }
+        if (!pattern) {
+            NET.cache.clear();
+            NET.bytes = 0;
+            return;
+        }
         const re = pattern instanceof RegExp ? pattern : new RegExp(pattern);
-        Array.from(NET.cache.keys()).forEach((k) => { if (re.test(k)) NET.cache.delete(k); });
+        Array.from(NET.cache.keys()).forEach((k) => {
+            if (!re.test(k)) return;
+            const drop = NET.cache.get(k);
+            if (drop) NET.bytes -= (drop.text || '').length;
+            NET.cache.delete(k);
+        });
     }
 
-    /** Запуск задачи с ограничением числа одновременных запросов. */
+    /**
+     * Запуск задачи с ограничением числа одновременных запросов.
+     *
+     * Таймаут освобождает слот, даже если сам fetch не завершился: иначе
+     * несколько зависших ответов ERP блокировали очередь навсегда.
+     */
     function netRun(task) {
         return new Promise((resolve, reject) => {
             const run = () => {
                 NET.active += 1;
-                let p;
-                try { p = task(); } catch (e) { p = Promise.reject(e); }
-                p.then(resolve, reject).then(() => {
+                let done = false;
+
+                const release = () => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
                     NET.active -= 1;
                     const next = NET.queue.shift();
                     if (next) next();
-                });
+                };
+
+                const timer = setTimeout(() => {
+                    if (done) return;
+                    release();
+                    reject(new Error('ERP не ответила за ' + Math.round(NET_TIMEOUT_MS / 1000) + ' с'));
+                }, NET_TIMEOUT_MS);
+
+                let p;
+                try { p = task(); } catch (e) { p = Promise.reject(e); }
+                p.then((v) => { release(); resolve(v); }, (e) => { release(); reject(e); });
             };
             if (NET.active < NET.maxParallel) run();
             else NET.queue.push(run);
@@ -841,11 +899,16 @@
 
             scope.querySelectorAll('#treeTable tr').forEach((tr) => {
                 const cells = tr.querySelectorAll('td');
-                const text = tr.innerText.replace(/\s+/g, ' ').trim();
+                // textContent, а не innerText: innerText заставляет браузер
+                // пересчитывать вёрстку на КАЖДОЕ чтение, а этот цикл идёт
+                // по всем строкам живой таблицы и вызывается дважды за
+                // отрисовку панели. В ячейках #treeTable нет <br> и скрытых
+                // узлов, поэтому текст совпадает.
+                const text = tr.textContent.replace(/\s+/g, ' ').trim();
 
                 if (cells.length >= 2) {
-                    const key = cells[0].innerText.replace(/\s+/g, ' ').trim();
-                    let val = cells[1].innerText.replace(/\s+/g, ' ').trim();
+                    const key = cells[0].textContent.replace(/\s+/g, ' ').trim();
+                    let val = cells[1].textContent.replace(/\s+/g, ' ').trim();
                     if (key === 'Статус') result.status = val;
                     else if (key === 'Лимит') result.limit = val;
                     else if (key === 'Исходящий остаток') result.balanceOut = val;
@@ -889,9 +952,12 @@
             root.querySelectorAll('tr').forEach((tr) => {
                 const tds = tr.querySelectorAll('td');
                 if (tds.length < 3) return;
-                const id = tds[0].innerText.trim();
-                const name = tds[1].innerText.replace(/\s+/g, ' ').trim();
-                const value = tds[2].innerText.replace(/\s+/g, ' ').trim();
+                // textContent вместо innerText: этот цикл идёт по всем строкам
+                // живой карточки, а innerText на каждой ячейке — принудительный
+                // пересчёт вёрстки.
+                const id = tds[0].textContent.trim();
+                const name = tds[1].textContent.replace(/\s+/g, ' ').trim();
+                const value = tds[2].textContent.replace(/\s+/g, ' ').trim();
                 if (!/^\d+$/.test(id)) return;
                 if (!name || !value) return;
                 if (name === 'Параметр' || name === 'Значение') return;
@@ -919,7 +985,10 @@
             let section = '';
 
             rows.forEach((tr) => {
-                const text = tr.innerText.replace(/\s+/g, ' ').trim();
+                // Одно чтение на строку: раньше innerText брался трижды
+                // (заголовок раздела, текст строки, повтор для плана), а каждое
+                // чтение innerText — это пересчёт вёрстки.
+                const text = tr.textContent.replace(/\s+/g, ' ').trim();
                 if (!text) return;
                 if (/^Тарифные планы/i.test(text)) { section = 'tariff'; return; }
                 if (/^Модули/i.test(text)) { section = 'modules'; return; }
@@ -927,12 +996,11 @@
 
                 const cells = tr.querySelectorAll('td');
                 if (section === 'tariff' && cells.length) {
-                    const t = tr.innerText.replace(/\s+/g, ' ').trim();
-                    if (t && !/^Тарифные планы$/i.test(t)) out.plans.push(t);
+                    if (!/^Тарифные планы$/i.test(text)) out.plans.push(text);
                 }
                 if (section === 'modules' && cells.length >= 2) {
-                    const name = cells[0].innerText.replace(/\s+/g, ' ').trim();
-                    const cnt = cells[cells.length - 1].innerText.replace(/\s+/g, ' ').trim();
+                    const name = cells[0].textContent.replace(/\s+/g, ' ').trim();
+                    const cnt = cells[cells.length - 1].textContent.replace(/\s+/g, ' ').trim();
                     if (name) out.modules.push({ name, count: cnt });
                 }
             });
@@ -1777,7 +1845,7 @@
             // после выдачи белого IP ещё минуту показывала старое дерево
             // сервисов и прежний список свободных адресов (в нём висел только
             // что выданный адрес), потому что этот POST идёт мимо postForm().
-            netDrop();
+            netDrop(/serviceTree|method=serviceGet|freeIpList|contractCards|sessionAliveContractList/i);
             return { ok: res.ok, text };
         },
 
@@ -1857,7 +1925,7 @@
             const text = await res.text();
             // Сервис закрыт — адрес вернулся в пул, дерево сервисов изменилось.
             // Запрос идёт мимо postForm(), поэтому кэш сбрасываем здесь.
-            netDrop();
+            netDrop(/serviceTree|method=serviceGet|freeIpList|contractCards|sessionAliveContractList/i);
             return { ok: res.ok, text };
         },
 
@@ -2294,9 +2362,19 @@
             );
             const body = parseHtml(html);
 
-            // Пароль доступа к статистике
-            const statsMatch = html.match(/Пароль доступа к статистике[\s\S]{0,120}?>([^\s<>]+)</i);
-            const stats = statsMatch ? statsMatch[1].trim() : '';
+            // Пароль доступа к статистике.
+            //
+            // Регулярка привязана к ЯЧЕЙКЕ, а не к «первому тексту после
+            // подписи». Раньше она ловила любую подпись в пределах 120
+            // символов, и при ПУСТОМ пароле захватывала следующую ячейку —
+            // возвращала «Лимит:» вместо пустой строки, и этот мусор уходил
+            // в письмо абоненту как «пароль личного кабинета».
+            const statsMatch = html.match(
+                /Пароль доступа к статистике:?\s*<\/b>\s*<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/i
+            );
+            const stats = statsMatch
+                ? statsMatch[1].replace(/&nbsp;/g, ' ').replace(/<[^>]*>/g, '').trim()
+                : '';
 
             /** Возвращает строки таблицы как объекты по именам колонок. */
             const readTable = (table) => {
@@ -2432,13 +2510,14 @@
 
             const data = await this.services(id).catch(() => ({ list: [] }));
             const active = (data.list || []).filter((s) =>
-                /IPoE|PPPoE/i.test(s.type || '')
-                && !/закрыт/i.test(s.status || '')
-                && !/удален|удалён/i.test(s.state || ''));
+                /IPoE|PPPoE/i.test(s.type || '') && isAliveService(s));
             if (!active.length) return null;
 
-            // Самый свежий сервис — последний в дереве
-            const svc = active[active.length - 1];
+            // Самый свежий сервис: в дереве порядок не гарантирован, поэтому
+            // выбираем по периоду, а не по позиции. От этого зависят MAC
+            // и адрес при возврате абонента с белого IP на серый.
+            active.sort((a, b) => toTsSafe(b.period) - toTsSafe(a.period));
+            const svc = active[0];
             if (!svc || !svc.id) return null;
 
             try {
@@ -2582,7 +2661,7 @@
         .tp-wrap {
             --tp-fg: #1d1d1f;
             --tp-fg2: rgba(29,29,31,.62);
-            --tp-fg3: rgba(29,29,31,.42);
+            --tp-fg3: rgba(29,29,31,.58);
             --tp-card: rgba(255,255,255,.72);
             --tp-border: rgba(0,0,0,.07);
             --tp-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px -12px rgba(0,0,0,.18);
@@ -2590,6 +2669,31 @@
             --tp-red: #ff3b30;
             --tp-orange: #ff9500;
             --tp-blue: #007aff;
+
+            /* Смысловые цвета состояний. Раньше каждый оттенок успеха был
+               прописан отдельно (#1f8f42, #1f8f3d, #5fe07f, #6ee7a0), и они
+               уже расходились между блоками. Теперь одна пара на состояние:
+               фон плашки и цвет текста на ней. */
+            --tp-ok: #1f8f42;
+            --tp-ok-bg: rgba(31,143,66,.12);
+            --tp-warn: #9a6400;
+            --tp-warn-bg: rgba(255,149,0,.14);
+            --tp-bad: #c0392b;
+            --tp-bad-bg: rgba(255,59,48,.12);
+
+            /* Три уровня нейтральной заливки вместо десяти разных альф. */
+            --tp-fill-1: rgba(0,0,0,.04);
+            --tp-fill-2: rgba(0,0,0,.07);
+            --tp-fill-3: rgba(0,0,0,.10);
+
+            /* Шкала радиусов: было восемь значений от 5 до 18 px. */
+            --tp-radius-sm: 8px;
+            --tp-radius-md: 12px;
+            --tp-radius-lg: 16px;
+            --tp-radius-pill: 999px;
+
+            --tp-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
             font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, system-ui, sans-serif;
             font-size: 14px;
             line-height: 1.45;
@@ -2609,13 +2713,27 @@
                 radial-gradient(900px 260px at 100% 0%, rgba(0,122,255,.035), transparent 55%);
             border-radius: 18px;
         }
-        html[data-theme="dark"] .tp-wrap {
+        /* Тёмная палитра общая для dark и modern-dark.
+           В ERP четыре темы, и modern-dark раньше не покрывалась: панель
+           получала светлые карточки (rgba(255,255,255,.72)) и чёрный текст
+           поверх тёмного фона ERP — «светлый остров» посреди тёмного экрана. */
+        html[data-theme="dark"] .tp-wrap,
+        html[data-theme="modern-dark"] .tp-wrap {
             --tp-fg: #f5f5f7;
             --tp-fg2: rgba(245,245,247,.62);
-            --tp-fg3: rgba(245,245,247,.4);
+            --tp-fg3: rgba(245,245,247,.52);
             --tp-card: rgba(28,28,30,.62);
             --tp-border: rgba(255,255,255,.09);
             --tp-shadow: 0 1px 2px rgba(0,0,0,.5), 0 12px 32px -16px rgba(0,0,0,.8);
+            --tp-ok: #5fe07f;
+            --tp-ok-bg: rgba(95,224,127,.14);
+            --tp-warn: #ffb340;
+            --tp-warn-bg: rgba(255,179,64,.14);
+            --tp-bad: #ff6961;
+            --tp-bad-bg: rgba(255,105,97,.14);
+            --tp-fill-1: rgba(255,255,255,.05);
+            --tp-fill-2: rgba(255,255,255,.08);
+            --tp-fill-3: rgba(255,255,255,.12);
         }
 
         .tp-wrap * { box-sizing: border-box; }
@@ -2745,22 +2863,20 @@
         }
         .tp-balance-row.is-empty { color: var(--tp-fg3); font-size: 11.5px; border-top: 0; padding-top: 0; }
 
-        /* ---- статус-плашка */
         /* ---- статус: минимализм — состояние + две цифры */
-        .tp-status-card { padding: 15px 18px 16px; }
-        .tp-status { display: flex; flex-direction: column; gap: 12px; }
         /* денежный блок внутри карточки действий */
         .tp-money { display: flex; flex-direction: column; gap: 12px; }
         /* статус онлайна в шапке «Сессии» — данные самой сессии, а не отдельный блок */
         .tp-sess-state {
-            font-size: 10.5px; font-weight: 650; letter-spacing: .02em;
-            padding: 2px 8px; border-radius: 999px; margin-left: 2px;
-            background: rgba(127,127,127,.14); color: var(--tp-fg2);
+            font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+            padding: 2px 8px; border-radius: var(--tp-radius-pill); margin-left: 2px;
+            background: var(--tp-fill-2); color: var(--tp-fg2);
         }
-        .tp-sess-state.is-on { background: rgba(52,199,89,.16); color: #1f8f42; }
-        .tp-sess-state.is-off { background: rgba(255,149,0,.16); color: #b26a00; }
-        html[data-theme="dark"] .tp-sess-state.is-on { color: #6ee7a0; }
-        html[data-theme="dark"] .tp-sess-state.is-off { color: #ffc46b; }
+        /* До прихода сессий плашка пустая — иначе в шапке висит серый
+           прямоугольник ~16px. У соседних счётчиков это правило уже было. */
+        .tp-sess-state:empty { display: none; }
+        .tp-sess-state.is-on { background: var(--tp-ok-bg); color: var(--tp-ok); }
+        .tp-sess-state.is-off { background: var(--tp-warn-bg); color: var(--tp-warn); }
         /* доступы внутри карточки «Сессия» */
         .tp-access { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--tp-border); }
         .tp-access-title {
@@ -2773,29 +2889,20 @@
             white-space: nowrap;
         }
 
-        .tp-status-line { display: flex; align-items: center; gap: 9px; min-width: 0; }
-        .tp-status-title { font-size: 17px; font-weight: 680; letter-spacing: -.015em; }
-        .tp-status-sub {
-            font-size: 12.5px; color: var(--tp-fg3);
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
-        }
-
         /* ---- вердикт по балансу: крупная сумма + факты */
         .tp-verdict-head { display: flex; align-items: center; gap: 8px; padding-top: 2px; }
         .tp-verdict-label { font-size: 12.5px; font-weight: 600; }
-        .tp-verdict-head.is-ok  .tp-verdict-label { color: #1f8f42; }
-        .tp-verdict-head.is-bad .tp-verdict-label { color: var(--tp-red); }
-        .tp-verdict-head.is-warn .tp-verdict-label { color: #b26a00; }
-        html[data-theme="dark"] .tp-verdict-head.is-ok  .tp-verdict-label { color: #6ee7a0; }
-        html[data-theme="dark"] .tp-verdict-head.is-warn .tp-verdict-label { color: #ffc46b; }
+        .tp-verdict-head.is-ok  .tp-verdict-label { color: var(--tp-ok); }
+        .tp-verdict-head.is-bad .tp-verdict-label { color: var(--tp-bad); }
+        .tp-verdict-head.is-warn .tp-verdict-label { color: var(--tp-warn); }
 
         .tp-verdict { display: flex; flex-direction: column; gap: 2px; padding: 6px 0 12px; }
         .tp-verdict-value {
             font-size: 30px; line-height: 34px; font-weight: 650; letter-spacing: -.02em;
             font-variant-numeric: tabular-nums;
         }
-        .tp-verdict-value.is-ok { color: #1f8f42; }
-        .tp-verdict-value.is-bad { color: var(--tp-red); }
+        .tp-verdict-value.is-ok { color: var(--tp-ok); }
+        .tp-verdict-value.is-bad { color: var(--tp-bad); }
         .tp-verdict-value.is-warn { color: var(--tp-fg3); }
         .tp-verdict-caption { font-size: 12px; color: var(--tp-fg3); }
         .tp-verdict-skel {
@@ -2804,8 +2911,6 @@
             background-size: 200% 100%;
             animation: tpShimmer 1.4s ease-in-out infinite;
         }
-        html[data-theme="dark"] .tp-verdict-value.is-ok { color: #6ee7a0; }
-        html[data-theme="dark"] .tp-verdict-value.is-bad { color: #ff8a80; }
 
         .tp-facts {
             display: grid; grid-template-columns: 1fr auto; gap: 6px 12px;
@@ -2813,17 +2918,16 @@
             font-size: 12.5px;
         }
         .tp-facts dt { color: var(--tp-fg3); }
-        .tp-facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; font-weight: 550; }
-        .tp-facts dd.is-neg { color: var(--tp-red); }
-        html[data-theme="dark"] .tp-facts dd.is-neg { color: #ff8a80; }
+        .tp-facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+        .tp-facts dd.is-neg { color: var(--tp-bad); }
 
         .tp-forecast {
             margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--tp-border);
             font-size: 12px; color: var(--tp-fg2);
         }
         .tp-forecast b { color: var(--tp-fg); font-weight: 600; }
-        .tp-forecast.is-warn { color: var(--tp-orange); }
-        .tp-forecast.is-warn b { color: var(--tp-orange); }
+        .tp-forecast.is-warn { color: var(--tp-warn); }
+        .tp-forecast.is-warn b { color: var(--tp-warn); }
 
         /* Пустая панель «Для ТП» (только что создана, контент ещё не вставлен)
            не должна показываться при открытии договора — иначе мелькает
@@ -2884,12 +2988,9 @@
             font-size: 11px; font-weight: 600; letter-spacing: .02em;
             padding: 3px 9px; border-radius: 999px; white-space: nowrap;
         }
-        .tp-badge.is-ok  { background: rgba(52,199,89,.16);  color: #1f8f42; }
-        .tp-badge.is-bad { background: rgba(255,59,48,.15);  color: #d32b21; }
-        .tp-badge.is-warn{ background: rgba(255,149,0,.16);  color: #b26a00; }
-        html[data-theme="dark"] .tp-badge.is-ok  { color: #6ee7a0; }
-        html[data-theme="dark"] .tp-badge.is-bad { color: #ff8a80; }
-        html[data-theme="dark"] .tp-badge.is-warn{ color: #ffc46b; }
+        .tp-badge.is-ok  { background: var(--tp-ok-bg);   color: var(--tp-ok); }
+        .tp-badge.is-bad { background: var(--tp-bad-bg);  color: var(--tp-bad); }
+        .tp-badge.is-warn{ background: var(--tp-warn-bg); color: var(--tp-warn); }
         .tp-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
         /* ---- строки ключ/значение */
@@ -2901,18 +3002,8 @@
 
         /* ---- таблицы */
         .tp-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-        .tp-table th {
-            text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
-            color: var(--tp-fg3); padding: 0 10px 8px 0; border-bottom: 1px solid var(--tp-border);
-        }
         .tp-table td { padding: 8px 10px 8px 0; border-bottom: 1px solid var(--tp-border); vertical-align: top; }
         .tp-table tr:last-child td { border-bottom: 0; }
-        .tp-table .r { text-align: right; white-space: nowrap; padding-right: 0; }
-        .tp-table .tp-group td {
-            padding-top: 12px; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
-            color: var(--tp-fg3); border-bottom: 0;
-        }
-        .tp-table .tp-total td { font-weight: 650; border-top: 1px solid var(--tp-border); }
 
         /* ---- тариф-чипы */
         .tp-plan { font-size: 16px; font-weight: 650; letter-spacing: -.01em; margin-bottom: 2px; }
@@ -2921,8 +3012,6 @@
             font-size: 12px; font-weight: 500; padding: 4px 10px; border-radius: 999px;
             background: rgba(127,127,127,.12); color: var(--tp-fg2); white-space: nowrap;
         }
-        .tp-chip.is-accent { background: rgba(0,122,255,.13); color: #0066d6; }
-        html[data-theme="dark"] .tp-chip.is-accent { color: #6cb6ff; }
         .tp-price { display: flex; align-items: baseline; gap: 8px; margin-top: 12px; }
         .tp-price .tp-main { font-size: 22px; font-weight: 650; letter-spacing: -.02em; }
         .tp-price .tp-old { font-size: 13px; color: var(--tp-fg3); text-decoration: line-through; }
@@ -2973,12 +3062,9 @@
         .tp-eq-group:first-child { padding-top: 0; }
         .tp-eq-chips { margin: 7px 0 0; gap: 5px; }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
-        .tp-chip.is-good { background: rgba(52,199,89,.15); color: #1f8f3d; }
-        .tp-chip.is-warn { background: rgba(255,149,0,.16); color: #a86200; }
-        .tp-chip.is-bad { background: rgba(255,59,48,.14); color: #c9251b; }
-        html[data-theme="dark"] .tp-chip.is-good { color: #5fe07f; }
-        html[data-theme="dark"] .tp-chip.is-warn { color: #ffb340; }
-        html[data-theme="dark"] .tp-chip.is-bad { color: #ff6b61; }
+        .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
+        .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
+        .tp-chip.is-bad  { background: var(--tp-bad-bg);  color: var(--tp-bad); }
 
         /* ---- ошибки Radius Logs */
         .tp-err-row {
@@ -3033,17 +3119,16 @@
             display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
             padding: 3px 0; font-size: 12px; color: var(--tp-fg2);
         }
-        .tp-radlog-row b { font-weight: 650; color: var(--tp-fg); font-variant-numeric: tabular-nums; }
-        .tp-radlog-row.is-ok b { color: #1f8f42; }
-        .tp-radlog-row.is-bad b { color: var(--tp-red); }
-        html[data-theme="dark"] .tp-radlog-row.is-ok b { color: #6ee7a0; }
+        .tp-radlog-row b { font-weight: 600; color: var(--tp-fg); font-variant-numeric: tabular-nums; }
+        .tp-radlog-row.is-ok b { color: var(--tp-ok); }
+        .tp-radlog-row.is-bad b { color: var(--tp-bad); }
+
         .tp-radlog-hint {
             margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--tp-border);
             font-size: 11.5px; line-height: 1.45; color: var(--tp-fg2);
         }
-        .tp-radlog-hint.is-ok { color: #1f8f42; }
-        .tp-radlog-hint.is-bad { color: var(--tp-red); }
-        html[data-theme="dark"] .tp-radlog-hint.is-ok { color: #6ee7a0; }
+        .tp-radlog-hint.is-ok { color: var(--tp-ok); }
+        .tp-radlog-hint.is-bad { color: var(--tp-bad); }
 
         /* ---- белый IP */
         .tp-whiteip-current {
@@ -3066,13 +3151,11 @@
             background: var(--tp-fg3);
         }
         .tp-whiteip-state.is-white::before { background: #2b8dff; }
-        .tp-whiteip-state.is-grey::before { background: #b08000; }
+        .tp-whiteip-state.is-grey::before { background: var(--tp-warn); }
         .tp-whiteip-state.is-none::before { background: var(--tp-fg3); }
-        .tp-whiteip-state.is-ok::before { background: #1f8f42; }
-        .tp-whiteip-state.is-off::before { background: var(--tp-red); }
+        .tp-whiteip-state.is-ok::before { background: var(--tp-ok); }
+        .tp-whiteip-state.is-off::before { background: var(--tp-bad); }
         .tp-whiteip-state.is-off { color: var(--tp-fg2); font-weight: 500; }
-        html[data-theme="dark"] .tp-whiteip-state.is-ok::before { background: #6ee7a0; }
-        html[data-theme="dark"] .tp-whiteip-state.is-grey::before { background: #e0b341; }
         .tp-whiteip-list { display: flex; flex-direction: column; margin-bottom: 12px; }
         .tp-whiteip-row {
             display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
@@ -3192,19 +3275,48 @@
             overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
 
+        /* ---- общие стили контролов
+           В ERP поля и селекты приходят с нативным видом. Раньше стилизован
+           был только .tp-whiteip-form select, а textarea письма и селекты
+           «Отправитель»/«Что отправить» оставались системными — посреди
+           оформленной карточки они читались как чужая вставка. */
+        .tp-wrap input[type="text"],
+        .tp-wrap input[type="password"],
+        .tp-wrap input[type="number"],
+        .tp-wrap select,
+        .tp-wrap textarea {
+            font: inherit; font-size: 13px; color: var(--tp-fg);
+            background: var(--tp-fill-1);
+            border: 1px solid var(--tp-border);
+            border-radius: var(--tp-radius-sm);
+            padding: 6px 9px; width: 100%; box-sizing: border-box;
+        }
+        .tp-wrap textarea { min-height: 74px; resize: vertical; line-height: 1.45; }
+        .tp-wrap input[type="text"]:focus,
+        .tp-wrap input[type="password"]:focus,
+        .tp-wrap input[type="number"]:focus,
+        .tp-wrap select:focus,
+        .tp-wrap textarea:focus {
+            outline: none; border-color: var(--tp-blue);
+            box-shadow: 0 0 0 3px rgba(0,122,255,.14);
+        }
+        .tp-wrap input:disabled, .tp-wrap select:disabled, .tp-wrap textarea:disabled {
+            opacity: .6; cursor: default;
+        }
+
         /* ---- отправка доступа на почту */
         .tp-mail-form { display: flex; flex-direction: column; gap: 10px; }
         .tp-mail-to {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-family: var(--tp-font-mono);
             font-size: 13px;
         }
-        .tp-mail-to[data-empty] { border-color: var(--tp-red); }
+        .tp-mail-to[data-empty] { border-color: var(--tp-bad); }
         /* Предпросмотр письма: оператор видит, что уйдёт абоненту, до отправки.
            Моноширинный шрифт и переносы — потому что это готовый текст письма,
            и перенос строки в нём значим. */
         .tp-mail-preview {
-            border: 1px solid var(--tp-border); border-radius: 10px;
-            padding: 8px 10px; background: rgba(127,127,127,.06);
+            border: 1px solid var(--tp-border); border-radius: var(--tp-radius-md);
+            padding: 8px 10px; background: var(--tp-fill-1);
         }
         .tp-mail-preview-title {
             font-size: 10px; font-weight: 700; letter-spacing: .06em;
@@ -3278,7 +3390,6 @@
 
         /* ---- доверительный платёж: вложенность без второй карточки */
         .tp-trust-inner { display: block; }
-        .tp-trust-inner .tp-fields { margin-top: 2px; }
         /* «Дней» + кнопка в одну строку: поле узкое, кнопка забирает остаток */
         .tp-trust-row { display: flex; align-items: flex-end; gap: 8px; }
         .tp-trust-days { flex: 0 0 72px; }
@@ -3291,7 +3402,6 @@
         .tp-trust-calc b { color: var(--tp-fg); font-weight: 650; }
         .tp-trust-lead { font-size: 13px; color: var(--tp-fg2); margin: 0 0 14px; }
         .tp-trust-lead b { color: var(--tp-fg); font-weight: 650; }
-        .tp-fields { display: grid; grid-template-columns: 150px 110px minmax(0, 1fr); gap: 10px; }
         .tp-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
         /* display: flex перебивает атрибут hidden — возвращаем ему силу.
            Без этого скрытое «Устройство» оставалось видимым при PPPoE. */
@@ -3304,7 +3414,7 @@
             padding: 8px 11px; width: 100%; outline: none; transition: border-color .15s, background .15s;
         }
         .tp-field input:focus { border-color: var(--tp-blue); background: rgba(127,127,127,.06); }
-        .tp-field.is-auto input { font-weight: 650; font-variant-numeric: tabular-nums; }
+        .tp-field input { font-variant-numeric: tabular-nums; }
         .tp-btn {
             font: inherit; font-weight: 600; border: 0; cursor: pointer;
             padding: 9px 18px; border-radius: 12px; color: #fff;
@@ -3319,10 +3429,12 @@
             background: rgba(127,127,127,.12); color: var(--tp-fg); box-shadow: none;
         }
         .tp-msg { font-size: 12.5px; font-weight: 500; }
-        .tp-msg.is-ok { color: #1f8f42; } .tp-msg.is-bad { color: var(--tp-red); }
-        html[data-theme="dark"] .tp-msg.is-ok { color: #6ee7a0; }
+        .tp-msg.is-ok { color: var(--tp-ok); } .tp-msg.is-bad { color: var(--tp-bad); }
 
         .tp-hint { font-size: 12px; color: var(--tp-fg3); margin-top: 10px; }
+        /* Единое пустое состояние. Раньше «Сервисов нет» и «Активных сессий
+           нет» стояли с разными отступами и кеглем в одной колонке. */
+        .tp-empty { padding: 12px 0; color: var(--tp-fg3); font-size: 12.5px; }
         .tp-loading { color: var(--tp-fg3); padding: 24px; font-size: 13px; }
         .tp-err { color: var(--tp-red); padding: 10px 0; }
         .tp-wrap a { color: var(--tp-blue); text-decoration: none; }
@@ -3338,12 +3450,9 @@
             font: inherit; font-size: 12px; font-weight: 600; border: 0; cursor: pointer;
             padding: 5px 12px; border-radius: 8px; background: transparent; color: var(--tp-fg2);
         }
+        .tp-tabs-mini button:hover { background: var(--tp-fill-1); color: var(--tp-fg); }
+        .tp-tabs-mini button:focus-visible { outline: 2px solid var(--tp-blue); outline-offset: 1px; }
         .tp-tabs-mini button.is-on { background: var(--tp-card); color: var(--tp-fg); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-        .tp-sess-live {
-            display: inline-flex; align-items: center; gap: 6px;
-            font-size: 11.5px; font-weight: 600; color: var(--tp-fg2);
-        }
-        .tp-sess-live .tp-dot-live,
         .tp-live .tp-dot-live {
             position: relative;
             width: 7px; height: 7px; border-radius: 50%; background: var(--tp-green);
@@ -3351,7 +3460,6 @@
         /* Пульс — тем же способом, что у .tp-signal: transform + opacity на
            псевдоэлементе. Индикатор автообновления виден всегда, пока открыт
            договор, поэтому box-shadow здесь стоил бы постоянной перерисовки. */
-        .tp-sess-live .tp-dot-live::after,
         .tp-live .tp-dot-live::after {
             content: ''; position: absolute; inset: 0; border-radius: 50%;
             background: var(--tp-green); opacity: 0;
@@ -3374,29 +3482,20 @@
         .tp-sess-meta { font-size: 11.5px; color: var(--tp-fg2); margin-top: 2px; font-variant-numeric: tabular-nums; }
         .tp-sess-btn {
             font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
-            padding: 5px 11px; border-radius: 9px; border: 0; white-space: nowrap;
-            background: rgba(255,59,48,.12); color: #d32b21;
+            padding: 5px 11px; border-radius: var(--tp-radius-sm); border: 0; white-space: nowrap;
+            background: var(--tp-bad-bg); color: var(--tp-bad);
         }
-        .tp-sess-btn:hover { background: rgba(255,59,48,.2); }
+        .tp-sess-btn:hover { filter: brightness(.96); }
         .tp-sess-btn[disabled] { opacity: .5; cursor: default; }
-        html[data-theme="dark"] .tp-sess-btn { color: #ff8a80; }
         .tp-sess-status { font-size: 11.5px; margin-top: 4px; line-height: 1.3; }
-        .tp-sess-status.is-ok { color: #1f8f42; }
-        .tp-sess-status.is-bad { color: var(--tp-red); }
-        html[data-theme="dark"] .tp-sess-status.is-ok { color: #6ee7a0; }
+        .tp-sess-status.is-ok { color: var(--tp-ok); }
+        .tp-sess-status.is-bad { color: var(--tp-bad); }
         .tp-fresh { animation: tpFresh 1.6s ease-out; }
         @keyframes tpFresh {
             from { background: rgba(52,199,89,.22); }
             to   { background: transparent; }
         }
 
-        /* ---- верхний блок: доверительный платёж на всю ширину */
-        .tp-top {
-            display: grid;
-            grid-template-columns: minmax(0, 1fr);
-            gap: 14px;
-            margin-top: 14px;
-        }
         /* ---- компактная карточка сессий в колонке */
         .tp-sessions .tp-sess-row { padding: 7px 0; }
         .tp-sessions .tp-sess-meta { line-height: 1.35; }
@@ -3409,8 +3508,7 @@
             background: rgba(127,127,127,.2); color: var(--tp-fg3);
             font-variant-numeric: tabular-nums;
         }
-        .tp-count.is-on { background: rgba(52,199,89,.22); color: #1f8f42; }
-        html[data-theme="dark"] .tp-count.is-on { color: #6ee7a0; }
+        .tp-count.is-on { background: var(--tp-ok-bg); color: var(--tp-ok); }
 
         /* ---- пароли */
         .tp-pwd-row {
@@ -3422,14 +3520,33 @@
         .tp-pwd-name { font-size: 12.5px; color: var(--tp-fg2); min-width: 0; flex: 1 1 auto;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .tp-pwd-val {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-family: var(--tp-font-mono);
             font-size: 13px; font-weight: 600; letter-spacing: .02em;
             cursor: pointer; white-space: nowrap; user-select: all;
-            padding: 2px 7px; border-radius: 6px;
-            background: rgba(127,127,127,.12);
+            /* Длинный пароль (32+ символа) в узкой третьей колонке раньше
+               выталкивал подпись в ноль и вылезал за карточку: nowrap без
+               ограничения ширины. Полное значение остаётся в title. */
+            max-width: 52%; overflow: hidden; text-overflow: ellipsis;
+            padding: 2px 7px; border-radius: var(--tp-radius-sm);
+            background: var(--tp-fill-2);
         }
-        .tp-pwd-val:hover { background: rgba(127,127,127,.2); }
+        .tp-pwd-val:hover { background: var(--tp-fill-3); }
+        .tp-pwd-val:focus-visible { outline: 2px solid var(--tp-blue); outline-offset: 1px; }
         .tp-pwd-val.is-empty { background: transparent; cursor: default; color: var(--tp-fg3); font-size: 12px; }
+        /* Бейдж «1 из 27» рядом со статусом: показывает, сколько записей
+           с этим паролем в биллинге и сколько из них действует. */
+        .tp-pwd-count {
+            font-size: 10px; font-weight: 600; color: var(--tp-fg3);
+            padding: 1px 6px; border-radius: var(--tp-radius-pill);
+            background: var(--tp-fill-2); white-space: nowrap; margin-left: 2px;
+        }
+        .tp-pwd-state.is-good { color: var(--tp-ok); background: var(--tp-ok-bg); }
+        /* Уменьшенный чип: раньше это делалось инлайн-стилем
+           style="padding:1px 7px" в шести местах — такой стиль нельзя
+           переопределить темой. */
+        .tp-chip.is-xs { padding: 1px 7px; }
+        /* Свёрнутая строка «ещё N закрытых» в списке сервисов */
+        .tp-svc-folded { opacity: .62; font-style: italic; }
 
         /* ---- скелетон загрузки */
         .tp-skeleton { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
@@ -3449,8 +3566,13 @@
         }
         .tp-lazy.is-filled > .tp-lazy-body > .tp-skeleton { display: none; }
 
+        /* Анимация висит на ::after, а не на самом элементе: без ::after
+           правило не срабатывало и пульсации игнорировали настройку ОС. */
         @media (prefers-reduced-motion: reduce) {
-            .tp-skeleton-line, .tp-signal, .tp-dot-live { animation: none; }
+            .tp-skeleton-line,
+            .tp-signal::after, .tp-signal,
+            .tp-dot-live::after, .tp-dot-live,
+            .tp-verdict-skel, .tp-fresh { animation: none !important; }
         }
 
         /* ---- история статусов */
@@ -3469,16 +3591,13 @@
             display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
         }
         .tp-tl-status { font-size: 12.5px; font-weight: 600; }
-        .tp-tl-row.is-ok .tp-tl-status { color: #1f8f42; }
-        .tp-tl-row.is-warn .tp-tl-status { color: #b26a00; }
-        html[data-theme="dark"] .tp-tl-row.is-ok .tp-tl-status { color: #6ee7a0; }
-        html[data-theme="dark"] .tp-tl-row.is-warn .tp-tl-status { color: #ffc46b; }
+        .tp-tl-row.is-ok .tp-tl-status { color: var(--tp-ok); }
+        .tp-tl-row.is-warn .tp-tl-status { color: var(--tp-warn); }
         .tp-tl-period { font-size: 10.5px; color: var(--tp-fg3); white-space: nowrap; font-variant-numeric: tabular-nums; }
         .tp-tl-comment { font-size: 11.5px; color: var(--tp-fg2); margin-top: 1px; line-height: 1.3; }
 
         /* ---- платежи */
         .tp-pay-date { white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 12.5px; }
-        .tp-pay-sum { font-weight: 650; white-space: nowrap; font-variant-numeric: tabular-nums; }
         .tp-pay-type { font-size: 11.5px; color: var(--tp-fg2); }
     `;
 
@@ -3830,7 +3949,10 @@
         if (!id) return '<div class="tp-err">Не удалось определить ID договора.</div>';
 
         const params = await ERP.params(id);
-        const tariff = ERP.tariff(id);
+        // Результат запоминаем на панели: hydrate() берёт его отсюда, а не
+        // читает #treeTable второй раз. Разбор таблицы — это обход всех строк
+        // с пересчётом вёрстки, и делать его дважды на одну отрисовку незачем.
+        if (panel) panel._tpParams = params;
 
         // Всё, что можно взять из уже отрисованной карточки — берём без сети
         const outNum = toNum(params.balanceOut);
@@ -4193,7 +4315,7 @@
             const isNew = !isFirst && !known.has(sessKey(r));
             const stateBadge = /отключ/i.test(r.state || '') ? '<span class="tp-badge is-bad">отключено</span>'
                 : /подключ/i.test(r.state || '') ? '<span class="tp-badge is-ok">подключено</span>' : '';
-            const typeChip = r.connType ? `<span class="tp-chip" style="padding:1px 7px">${esc(r.connType)}</span>` : '';
+            const typeChip = r.connType ? `<span class="tp-chip is-xs">${esc(r.connType)}</span>` : '';
             // ERP кладёт в «Сервис» номер договора и IP, которые уже показаны ниже
             // строкой «IP … · устройство». Оставляем только имя сервиса.
             // Заглушку [IpAddress:null] тоже выкидываем: она приходит из шаблона
@@ -4471,18 +4593,30 @@
                 const generation = genOf(panel);
                 const slow = (ticks += 1) % AUTO_SLOW_EVERY === 0;
 
-                // Сессии и ошибки — независимо: падение одного не должно гасить другой
+                /*
+                 * Сессии и ошибки — параллельно, а не по очереди. Раньше здесь
+                 * стояло `await sessionsPromise; await errorsPromise;` — то есть
+                 * тик ждал сначала один блок, потом другой, хотя комментарий
+                 * рядом обещал независимость. Ошибки Radius — пять запросов
+                 * с пагинацией, и сессии простаивали всё это время.
+                 *
+                 * Ошибки Radius идут в МЕДЛЕННЫЙ круг: их TTL 40 с, а тик — 7 с,
+                 * поэтому пять ответов разбирались заново вхолостую шесть раз
+                 * из семи. Счётчик ошибок подключения не меняется посекундно,
+                 * оператору он нужен с точностью до минуты.
+                 */
                 const sessionsCard = panel.querySelector('.tp-sessions');
                 const sessionsPromise = sessionsCard
                     ? loadSessions(sessionsCard, false).catch(() => null)
                     : Promise.resolve(null);
 
-                const errorsPromise = loadRadiusErrors(panel, cid).catch(() => null);
+                const errorsPromise = slow
+                    ? loadRadiusErrors(panel, cid).catch(() => null)
+                    : Promise.resolve(null);
 
                 try {
-                    await sessionsPromise;
+                    await Promise.allSettled([sessionsPromise, errorsPromise]);
                     if (genOf(panel) !== generation || !document.contains(panel)) { plan(AUTO_REFRESH_MS); return; }
-                    await errorsPromise;
 
                     // Медленный круг: доступы (пароль могли сменить в биллинге)
                     // и счётчик истории — цифра на вкладке не должна устаревать навсегда.
@@ -4749,8 +4883,7 @@
         // Дерево сервисов уже могло быть загружено блоком «Сервисы» — берём его.
         const svc = await erpOnce(panel, 'services', () => ERP.services(id))
             .catch(() => ({ list: [] }));
-        const active = (svc.list || []).filter((s) =>
-            !/закрыт|удален|удалён/i.test(s.status || '') && !/удален|удалён/i.test(s.state || ''));
+        const active = (svc.list || []).filter((s) => isAliveService(s));
         const hasActivePppoe = active.some((s) => /PPPoE/i.test(s.type || ''));
         const hasActiveIpoe = active.some((s) => /IPoE/i.test(s.type || ''));
         // Есть активный IPoE — он и главный (белый IP живёт на нём). Иначе PPPoE.
@@ -4787,7 +4920,7 @@
 
         const current = (svc.list || [])
             .filter((s) => /IPoE|PPPoE/i.test(s.type || ''))
-            .filter((s) => !/закрыт|удален|удалён/i.test(s.status || '') && !/удален|удалён/i.test(s.state || ''))
+            .filter((s) => isAliveService(s))
             .map((s) => {
                 const ip = (String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/) || [])[1] || '';
                 return {
@@ -5019,9 +5152,7 @@
         await waitUntil(async () => {
             const svc = await ERP.services(cid).catch(() => ({ list: [] }));
             const active = (svc.list || []).filter((s) =>
-                /IPoE|PPPoE/i.test(s.type || '')
-                && !/закрыт|удален|удалён/i.test(s.status || '')
-                && !/удален|удалён/i.test(s.state || ''));
+                /IPoE|PPPoE/i.test(s.type || '') && isAliveService(s));
 
             if (expect === 'white') {
                 // Публичный адрес может быть и в имени сервиса, и в его карточке
@@ -5266,9 +5397,7 @@
                 // в дереве они значатся открытыми, но в биллинге их уже нет,
                 // и serviceUpdate по ним отвечает «Сервис не найден».
                 const alive = (await ERP.services(cid)).list
-                    .filter((s) => /^(PPPoE|IPoE)$/i.test(s.type || '')
-                        && !/закрыт/i.test(s.status || '')
-                        && !/удален|удалён/i.test(s.state || ''));
+                    .filter((s) => /^(PPPoE|IPoE)$/i.test(s.type || '') && isAliveService(s));
                 const closeFailed = [];
                 for (let i = 0; i < alive.length; i++) {
                     const sid = alive[i].id;
@@ -5432,7 +5561,7 @@
                     <div class="tp-proc-name">${num ? `<span class="tp-proc-num">${num}</span> ` : ''}${esc(title)}</div>
                     <div class="tp-proc-meta">${esc(p.type || '')}${p.created ? ' · создан ' + esc(p.created) : ''}</div>
                 </div>
-                <span class="tp-chip ${chip}" style="padding:1px 7px">${esc(p.status || '—')}</span>
+                <span class="tp-chip is-xs ${chip}">${esc(p.status || '—')}</span>
             </div>`;
         });
         html += '</div>';
@@ -5582,8 +5711,11 @@
         const creds = st.creds || {};
         const login = creds.login || '';
         const pwdPppoe = creds.password || '';
-        // Пароль статистики — то же поле, что в блоке «Доступы»
-        const stat = panel.querySelector('.tp-pwd-val[data-pwd]');
+        // Пароль статистики ищем по ПРОИСХОЖДЕНИЮ строки, а не по позиции
+        // в DOM. Раньше брался первый .tp-pwd-val в панели: при пустом пароле
+        // статистики строки не было вовсе, и в письмо под подписью «личный
+        // кабинет» уходил пароль PPPoE.
+        const stat = panel.querySelector('.tp-pwd-row[data-kind="stat"] .tp-pwd-val[data-pwd]');
         const pwdStat = stat ? (stat.dataset.pwd || '') : '';
         return { login, pwdPppoe, pwdStat };
     }
@@ -6422,10 +6554,20 @@
         if (!document.contains(panel)) return null;
 
         const rows = [];
-        if (pwdData.stats) rows.push({ name: 'Статистика', state: '', value: pwdData.stats });
+        if (pwdData.stats) {
+            // kind:'stat' — служебная строка: она не участвует в выборе статуса
+            // и в счётчике сервисов. Пароль статистики и пароль PPPoE в биллинге
+            // часто совпадают (на AV0000001 оба 000666), поэтому различить их
+            // по значению невозможно — различаем по происхождению строки.
+            rows.push({ kind: 'stat', name: 'Статистика', state: '', value: pwdData.stats });
+        }
         (pwdData.accounts || []).forEach((a) => {
             if (!a.password) return;
-            const state = /отключ|заблок/i.test(a.state) ? 'отключён' : '';
+            // Статус аккаунта ТВ считается по ОБОИМ полям. Раньше смотрели
+            // только state, из-за чего аккаунт «открыт/удален» показывался
+            // как действующий, и оператор мог отправить абоненту пароль
+            // удалённого аккаунта.
+            const rank = svcRank(a);
             // ERP уже отдаёт имя аккаунта с префиксом «ТВ» («ТВ bg3»),
             // поэтому добавляем свой только если его там нет — иначе
             // получалось «ТВ ТВ bg3».
@@ -6435,44 +6577,73 @@
             // и кириллица в него не входит — /^ТВ\b/ не срабатывает никогда.
             const nm = String(a.name || '').trim();
             rows.push({
+                kind: 'tv',
                 name: /^ТВ(\s|$)/i.test(nm) ? nm : `ТВ ${nm}`,
-                state,
+                rank,
+                state: rank === 2 ? 'удалён' : rank === 1 ? 'отключён' : '',
                 value: a.password,
             });
         });
         (pwdData.services || []).forEach((s) => {
             if (!s.password) return;
-            const state = /закрыт/i.test(s.status) ? 'закрыт'
-                : /отключ/i.test(s.state) ? 'отключён' : '';
+            const rank = svcRank(s);
             // В названии сервиса ERP повторяет номер договора и IP — они уже
             // в шапке карточки и в списке сессий. Оставляем тип и имя.
             const cleanName = cleanBillServiceName(s.name, { dropLogin: true, dropAddr: true });
             const label = [s.type, cleanName].filter(Boolean).join(' ') || 'Интернет';
-            rows.push({ name: label, state, value: s.password });
+            rows.push({
+                kind: 'svc',
+                name: label,
+                rank,
+                state: rank === 2 ? 'удалён' : rank === 1 ? 'закрыт' : '',
+                value: s.password,
+            });
         });
 
         // Один и тот же пароль часто выдан и на статистику, и на PPPoE:
         // показываем его один раз, склеивая подписи.
         //
         // Подписи склеиваем БЕЗ повторов. В биллинге на договоре копятся
-        // закрытые сервисы с тем же паролем: у одного договора их было
-        // тринадцать, и строка превращалась в «Статистика · PPPoE · PPPoE ·
-        // PPPoE …» — один и тот же тип повторялся десяток раз, вытесняя
-        // полезную подпись за край экрана.
+        // закрытые сервисы с тем же паролем: у AV0000001 их 27, и строка
+        // превращалась в «Статистика · PPPoE · PPPoE …».
+        //
+        // Статус берём по САМОМУ ЖИВОМУ сервису, а не по первому встреченному.
+        // Раньше побеждал первый, а таблица идёт от старых к новым — поэтому
+        // к строке приклеивался статус давно удалённого сервиса, и оператор
+        // видел «Статистика · PPPoE закрыт» при действующем PPPoE.
         const byValue = new Map();
         rows.forEach((r) => {
             const key = String(r.value);
             const prev = byValue.get(key);
             if (!prev) {
-                byValue.set(key, { ...r, labels: [r.name] });
+                byValue.set(key, {
+                    value: r.value,
+                    labels: [r.name],
+                    // Infinity — «статуса нет»: служебная строка не должна
+                    // становиться лучшим статусом только из-за пустого rank.
+                    rank: r.kind === 'stat' ? Infinity : r.rank,
+                    total: r.kind === 'stat' ? 0 : 1,
+                    alive: (r.kind !== 'stat' && r.rank === 0) ? 1 : 0,
+                });
                 return;
             }
             if (r.name && prev.labels.indexOf(r.name) < 0) prev.labels.push(r.name);
-            if (r.state && !prev.state) prev.state = r.state;
+            if (r.kind === 'stat') return;
+            prev.total += 1;
+            if (r.rank === 0) prev.alive += 1;
+            prev.rank = Math.min(prev.rank, r.rank);
         });
         const uniq = Array.from(byValue.values()).map((r) => ({
-            name: (r.labels || [r.name]).filter(Boolean).join(' · '),
-            state: r.state,
+            name: r.labels.filter(Boolean).join(' · '),
+            state: r.rank === 0 ? 'действует'
+                : r.rank === 1 ? 'закрыт'
+                    : r.rank === 2 ? 'удалён' : '',
+            good: r.rank === 0,
+            // Пароль статистики помечаем явно: по значению его не отличить
+            // от пароля PPPoE (в биллинге они часто совпадают), а блоку
+            // «Отправить на почту» нужно взять именно его.
+            kind: r.rank === Infinity ? 'stat' : 'svc',
+            count: r.total > 1 ? { alive: r.alive, total: r.total } : null,
             value: r.value,
         }));
 
@@ -6485,9 +6656,13 @@
 
         let html = '<div class="tp-access-title">Доступы</div>';
         uniq.forEach((r) => {
-            html += `<div class="tp-pwd-row">
-                <span class="tp-pwd-name" title="${esc(r.name)}">${esc(r.name)}${r.state ? ` <span class="tp-pwd-state">${esc(r.state)}</span>` : ''}</span>
-                <span class="tp-pwd-val" data-pwd="${esc(r.value)}" title="Нажмите, чтобы скопировать">${esc(r.value)}</span>
+            const stateCls = r.good ? ' is-good' : '';
+            const cnt = r.count
+                ? ` <span class="tp-pwd-count" title="Действующих ${r.count.alive} из ${r.count.total} записей">${r.count.alive} из ${r.count.total}</span>`
+                : '';
+            html += `<div class="tp-pwd-row"${r.kind === 'stat' ? ' data-kind="stat"' : ''}>
+                <span class="tp-pwd-name" title="${esc(r.name)}">${esc(r.name)}${r.state ? ` <span class="tp-pwd-state${stateCls}">${esc(r.state)}</span>` : ''}${cnt}</span>
+                <span class="tp-pwd-val" data-pwd="${esc(r.value)}" tabindex="0" title="Нажмите, чтобы скопировать">${esc(r.value)}</span>
             </div>`;
         });
 
@@ -6646,12 +6821,19 @@
      * (например AGB0002323), и он же стоит в названии сервиса в карточке.
      */
     function pickBillingPassword(pwdData, userName) {
-        const entries = [
+        const all = [
             ...((pwdData && pwdData.services) || []).map((s) => ({ ...s, kind: s.type || 'Интернет' })),
             ...((pwdData && pwdData.accounts) || []).map((a) => ({ ...a, kind: 'ТВ' })),
         ].filter((e) => e.password);
 
-        if (!entries.length) return null;
+        if (!all.length) return null;
+
+        // Действующие сервисы — в приоритете. Таблица в карточке идёт от
+        // старых записей к новым, поэтому entries.find() возвращал пароль
+        // САМОГО СТАРОГО сервиса: на договоре, где пароль меняли, вердикт
+        // «пароль в биллинге» в RADIUS-логе был ложным.
+        const alive = all.filter((e) => isAliveService(e));
+        const entries = alive.length ? alive : all;
 
         const login = String(userName || '').trim().toLowerCase();
         if (login) {
@@ -7066,8 +7248,10 @@
                 });
         };
 
-        // cid обязателен: без него params() читает #treeTable всех открытых карточек
-        const params = await ERP.params(id);
+        // cid обязателен: без него params() читает #treeTable всех открытых карточек.
+        // Если buildContent уже разобрал таблицу — берём готовое, не читая
+        // живой DOM повторно.
+        const params = panel._tpParams || await ERP.params(id);
         const outNum = toNum(params.balanceOut);
         const limitNum = toNum(params.limit);
         const status = params.status || '';
@@ -7466,6 +7650,31 @@
     }
 
     /**
+     * Насколько сервис «живой»: 0 — действует, 1 — закрыт/отключён, 2 — удалён.
+     *
+     * Один предикат на весь файл. Раньше проверка «сервис ещё работает» была
+     * скопирована в шесть мест, и копии успели разойтись: где-то смотрели
+     * только status, где-то только state, где-то не учитывали «отключён»
+     * и «заблокирован». Из-за этого один и тот же сервис считался живым
+     * в одной карточке и мёртвым в соседней.
+     *
+     * В биллинге status и state — разные поля: status («открыт»/«закрыт») —
+     * период действия сервиса, state («включен»/«удален») — его состояние
+     * в базе. Удалённый сервис бывает закрыт, но закрытый не всегда удалён,
+     * поэтому «удалён» проверяем в обоих полях.
+     */
+    function svcRank(s) {
+        const st = String((s && s.status) || '');
+        const se = String((s && s.state) || '');
+        if (/удал[её]н/i.test(se) || /удал[её]н/i.test(st)) return 2;
+        if (/закрыт|отключ|блокиров/i.test(st)) return 1;
+        return 0;
+    }
+
+    /** Сервис действует: не закрыт, не отключён, не удалён. */
+    const isAliveService = (s) => svcRank(s) === 0;
+
+    /**
      * Список сервисов договора в биллинге.
      *
      * Показываем тип подключения, период и состояние. «Удалён» подсвечиваем:
@@ -7476,13 +7685,34 @@
         const arr = (list || []).slice();
         if (!arr.length) return '<div class="tp-hint">Сервисов нет.</div>';
 
+        // Действующие показываем всегда, удалённые — одной свёрнутой строкой.
+        // На AV0000001 в дереве 28 записей, из них 27 удалённых: список
+        // из двадцати семи одинаковых «удалён» оператор прочитать не может,
+        // а действующий сервис в нём теряется.
+        const alive = arr.filter((s) => svcRank(s) === 0);
+        const dead = arr.filter((s) => svcRank(s) !== 0);
+        const ordered = alive.concat(dead);
+        const deadFrom = alive.length;
+
         let html = '<div class="tp-pay">';
-        arr.forEach((s) => {
-            const dead = /удален|удалён/i.test(s.state || '');
-            const closed = /закрыт/i.test(s.status || '');
-            const stateChip = dead
+        ordered.forEach((s, i) => {
+            // Действующие — всегда. Из удалённых показываем только одну строку
+            // «ещё N закрытых», без подробностей: на AV0000001 их 27, и все
+            // с одинаковым именем — оператор в них всё равно ничего не найдёт.
+            if (i === deadFrom) {
+                if (!dead.length) return;
+                html += `<div class="tp-pay-row tp-svc-folded">
+                    <span class="tp-pay-name">${dead.length === 1 ? 'закрытый сервис' : `ещё ${dead.length} закрытых и удалённых`}</span>
+                    <span class="tp-pay-sum"></span>
+                </div>`;
+                return;
+            }
+            if (i > deadFrom) return;
+
+            const rank = svcRank(s);
+            const stateChip = rank === 2
                 ? '<span class="tp-chip is-bad">удалён</span>'
-                : closed ? '<span class="tp-chip is-warn">закрыт</span>'
+                : rank === 1 ? '<span class="tp-chip is-warn">закрыт</span>'
                     : '<span class="tp-chip is-good">открыт</span>';
             // Имя сервиса и признак адреса.
             //
@@ -7494,11 +7724,11 @@
             const addrMatch = String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/);
             const addr = addrMatch ? addrMatch[1] : '';
             const ipChip = addr
-                ? `<span class="tp-chip tp-svc-ip" style="padding:1px 7px">${esc(addr)}</span>`
-                : '<span class="tp-chip is-warn tp-svc-noip" style="padding:1px 7px" title="Сервису не выдан адрес: в имени стоит заглушка шаблона [IpAddress:null]">без адреса</span>';
+                ? `<span class="tp-chip tp-svc-ip is-xs">${esc(addr)}</span>`
+                : '<span class="tp-chip is-warn tp-svc-noip is-xs" title="Сервису не выдан адрес: в имени стоит заглушка шаблона [IpAddress:null]">без адреса</span>';
             html += `<div class="tp-pay-row">
                     <span class="tp-pay-name">${esc(cleanBillServiceName(s.name, { dropAddr: true }) || 'Сервис')} ${stateChip}
-                        <span class="tp-chip" style="padding:1px 7px">${esc(s.type || '')}</span> ${ipChip}
+                        <span class="tp-chip is-xs">${esc(s.type || '')}</span> ${ipChip}
                     </span>
                     <span class="tp-pay-sum">${esc(s.period || '')}</span>
                 </div>`;
@@ -7778,7 +8008,7 @@
             html += '<div class="tp-pay">';
             items.forEach((i) => {
                 html += `<div class="tp-pay-row${i.included ? ' is-free' : ''}">
-                    <span class="tp-pay-name">${esc(cleanServiceName(i.service))}${Number(i.qty) > 1 ? ` <span class="tp-chip" style="padding:1px 7px">×${esc(i.qty)}</span>` : ''}</span>
+                    <span class="tp-pay-name">${esc(cleanServiceName(i.service))}${Number(i.qty) > 1 ? ` <span class="tp-chip is-xs">×${esc(i.qty)}</span>` : ''}</span>
                     <span class="tp-pay-sum">${i.included ? 'включено' : esc(fmt(i.pay)) + ' ₽'}</span>
                 </div>`;
             });
@@ -7816,7 +8046,7 @@
                     const ambiguous = (shown.get(base) || 0) > 1;
                     const label = ambiguous ? `${base} · ${fmt(i.total)} ₽` : base;
                     html += `<div class="tp-pay-row">
-                        <span class="tp-pay-name">${esc(label)}${when ? ` <span class="tp-chip" style="padding:1px 7px">${esc(when)}</span>` : ''}</span>
+                        <span class="tp-pay-name">${esc(label)}${when ? ` <span class="tp-chip is-xs">${esc(when)}</span>` : ''}</span>
                         <span class="tp-pay-sum">${esc(fmt(i.total))} ₽</span>
                     </div>`;
                 });
@@ -8193,6 +8423,9 @@
         panel._tpPwdCache = null;
         panel._tpErrHtml = null;
         panel._tpAccessHtml = null;
+        // Разбор #treeTable тоже обнуляем: договор мог смениться, а кэш
+        // от прошлой отрисовки содержал бы прежние статус и баланс.
+        panel._tpParams = null;
 
         panel.innerHTML = '<div class="tp-loading">Загрузка данных договора…</div>'
             + '<div class="tp-body"></div>';
@@ -8219,7 +8452,9 @@
             .catch((e) => {
                 if (panel.dataset.gen !== generation || !loading) return;
                 loading.textContent = 'Ошибка построения содержимого: ' + (e && e.message ? e.message : e);
-                loading.style.color = '#c00';
+                // var(), а не #c00: на тёмном фоне тёмно-красный давал
+                // контраст ~1.9:1, и сообщение об ошибке было не видно.
+                loading.style.color = 'var(--tp-bad)';
             });
 
         return promise;
@@ -8621,6 +8856,7 @@
 
         let scheduled = false;
         let retryTimer = null;
+        let retryCount = 0;
 
         const tick = () => {
             scheduled = false;
@@ -8628,12 +8864,27 @@
             // от visibilitychange и всё догонит.
             if (document.hidden) return;
 
-            try { authTick(); } catch (e) { /* окно входа ещё не готово */ }
-            try { ensureSearchDefaults(); } catch (e) { /* форма ещё не готова */ }
-            try { bindAutoSearch(); } catch (e) { /* формы ещё нет */ }
+            /*
+             * Порядок важен для скорости: tick() вызывается на каждый клик,
+             * каждый AJAX и каждую значимую мутацию — десятки раз в минуту.
+             * authTick/ensureSearchDefaults/bindAutoSearch раньше дёргались
+             * ВСЕГДА, хотя 90% времени оператор не на форме входа и не на
+             * поиске: authTick читал localStorage, парсил JSON, декодировал
+             * base64 и искал форму входа по всему документу. Теперь сначала
+             * дешёвые проверки, потом работа.
+             */
+            if (document.querySelector('input[name="j_username"]')) {
+                try { authTick(); } catch (e) { /* окно входа ещё не готово */ }
+            }
+            if (location.pathname.indexOf('/user/search') >= 0) {
+                try { ensureSearchDefaults(); } catch (e) { /* форма ещё не готова */ }
+                try { bindAutoSearch(); } catch (e) { /* формы ещё нет */ }
+            }
+
             if (!contractPagePresent()) return;
             try {
                 const ok = install();
+                retryCount = 0;
                 // Если не вышло — попробуем чаще, пока карточка дорисовывается
                 if (!ok) retrySoon();
             } catch (e) {
@@ -8642,9 +8893,16 @@
         };
 
         // Короткие повторные попытки: ERP вставляет карточку частями,
-        // одного тика раз в секунду может не хватить.
+        // одного тика в секунду может не хватить.
+        //
+        // Счётчик обязателен: если install() не может отработать (карточка
+        // «битая», jQuery UI ещё не поднялся), без него получался вечный цикл
+        // раз в 150 мс с полным обходом всех .ui-tabs документа. После
+        // 20 попыток ждём обычного тика — он придёт от таймера или мутации.
         const retrySoon = () => {
             if (retryTimer) return;
+            if (retryCount >= 20) return;
+            retryCount += 1;
             retryTimer = setTimeout(() => { retryTimer = null; tick(); }, 150);
         };
 
@@ -8747,8 +9005,19 @@
 
         const $ = window.jQuery;
         if ($ && $.fn && $.fn.ajaxComplete) {
-            // любые AJAX-подгрузки ERP (в т.ч. карточки договоров) — повод проверить вкладку
-            $(document).on('ajaxComplete', schedule);
+            /*
+             * AJAX-подгрузки ERP — повод проверить вкладку, но далеко не любой
+             * запрос. Панель сама делает полтора десятка вызовов в hydrate(),
+             * и каждый из них через ajaxComplete вызывал tick() → install():
+             * получался самоподдерживающийся цикл hydrate → AJAX → tick.
+             * Реагируем только на то, что может поменять состав #content.
+             */
+            const NAV_URL = /contract_bill|contentLoad|contract\.do|process\.do|queue\.do|message\.do|customer\.do|search\.do/i;
+            $(document).on('ajaxComplete', (ev, xhr, settings) => {
+                const url = (settings && settings.url) || '';
+                if (!NAV_URL.test(url)) return;
+                schedule();
+            });
             watch.jq = $;
         }
 
@@ -10682,12 +10951,33 @@
 
     contentBuilder = buildContent;
 
+    /*
+     * Последний договор, чью панель мы видели.
+     *
+     * Нужен при смене договора: history.state в момент hashchange УЖЕ
+     * содержит новый адрес, поэтому «прежний» из него не достать.
+     */
+    let lastContractId = (location.hash || '').match(/#(\d+)/) ? (location.hash.match(/#(\d+)/) || [])[1] : '';
+
     window.addEventListener('hashchange', () => {
-        // Договор сменили — данные прежнего кэша не годятся
-        netDrop();
+        // Договор сменили — данные ПРЕЖНЕГО договора не годятся, но кэш
+        // остальных открытых карточек трогать нельзя: при трёх договорах
+        // полный сброс означал ~45 запросов на каждый переход.
+        const next = (location.hash || '').match(/#(\d+)/);
+        const nextId = next ? next[1] : '';
+        if (lastContractId && lastContractId !== nextId) {
+            netDrop(new RegExp('contractId=' + lastContractId + '\\b'));
+        }
+        lastContractId = nextId;
+
         setTimeout(() => {
-            // Перерисовать панели — активная получит новые данные, остальные просто обновятся
-            document.querySelectorAll(PANEL_SEL).forEach((panel) => applyContent(panel, contentBuilder));
+            // Перерисовываем только активную панель: скрытые обновятся сами,
+            // когда оператор вернётся на их вкладку (refreshOnShow).
+            const cards = Array.from(document.querySelectorAll('#content > div[id^="contract_bill-"]'));
+            const shown = cards.filter((el) => el.offsetParent !== null);
+            const host = shown.length ? shown[shown.length - 1] : null;
+            const panel = host ? findPanel(host) : null;
+            if (panel) applyContent(panel, contentBuilder);
         }, 600);
     });
 
