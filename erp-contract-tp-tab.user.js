@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.71.32
+// @version      0.71.33
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.71.32';
+    const SELF_VERSION = '0.71.33';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3157,10 +3157,23 @@
         .tp-proc-list { display: flex; flex-direction: column; gap: 8px; }
         .tp-proc-row {
             display: flex; align-items: flex-start; justify-content: space-between;
-            gap: 10px; padding-bottom: 8px;
+            gap: 10px; padding: 6px 8px; margin: 0 -8px;
             border-bottom: 1px solid var(--tp-border);
         }
-        .tp-proc-row:last-child { border-bottom: 0; padding-bottom: 0; }
+        .tp-proc-row:last-child { border-bottom: 0; }
+        /* Кликабельная строка ведёт в карточку процесса. Подсветка при наведении
+           нужна как подсказка: без неё список выглядит справочным, и оператор
+           не догадывается, что по нему можно перейти. Отрицательный margin
+           компенсирует боковые отступы — подсветка шире текста, но строка
+           визуально не сдвигается. */
+        .tp-proc-row.is-link { cursor: pointer; border-radius: 8px; }
+        .tp-proc-row.is-link:hover { background: rgba(127,127,127,.09); }
+        .tp-proc-row.is-link:hover .tp-proc-num { color: var(--tp-fg); }
+        /* Фокус с клавиатуры: строка получает tabindex, и без видимой рамки
+           было бы непонятно, где находится клавиатурный курсор. */
+        .tp-proc-row.is-link:focus-visible {
+            outline: 2px solid var(--tp-blue); outline-offset: 1px;
+        }
         .tp-proc-main { min-width: 0; flex: 1 1 auto; }
         .tp-proc-name {
             font-size: 13px; font-weight: 550; color: var(--tp-fg);
@@ -5404,7 +5417,15 @@
             const num = p.id ? `#${esc(p.id)}` : '';
             const title = p.name || p.type || 'Процесс';
 
-            html += `<div class="tp-proc-row">
+            // Строка ведёт в карточку процесса — тот же переход, что делает сам
+            // ERP из очереди процессов. Без id строку не делаем ссылкой: лучше
+            // некликабельный текст, чем переход в никуда.
+            //
+            // role/tabindex — чтобы строку можно было открыть с клавиатуры:
+            // это div с обработчиком клика, сам по себе он фокус не получает.
+            const linkable = !!p.id;
+            html += `<div class="tp-proc-row${linkable ? ' is-link' : ''}"`
+                + `${linkable ? ` data-proc="${esc(p.id)}" role="link" tabindex="0"` : ''}>
                 <div class="tp-proc-main">
                     <div class="tp-proc-name">${num ? `<span class="tp-proc-num">${num}</span> ` : ''}${esc(title)}</div>
                     <div class="tp-proc-meta">${esc(p.type || '')}${p.created ? ' · создан ' + esc(p.created) : ''}</div>
@@ -5458,14 +5479,42 @@
         return state;
     }
 
-    /** Переключение «Активные / Закрытые». */
+    /**
+     * Переключение «Активные / Закрытые» и переход в карточку процесса.
+     *
+     * Переход делаем через штатный API оболочки — им же пользуется сам ERP в
+     * списке процессов: `$$.process.open(id)` разворачивается в
+     * `$$.shell.contentLoad("process#" + id)`. Так открывается карточка, и URL
+     * меняется на `/user/process#N`, поэтому кнопка «Назад» возвращает к
+     * договору — проверено на живой странице.
+     *
+     * Если API недоступен (ядро ERP ещё не инициализировалось или версия другая),
+     * переходим по адресу напрямую: ERP разбирает hash при загрузке и открывает
+     * тот же процесс. Без этого запасного пути клик просто ничего не делал бы.
+     */
     function mountProcesses(panel) {
         const card = panel.querySelector('.tp-processes');
         if (!card) return;
         if (card.dataset.bound === '1') return;
         card.dataset.bound = '1';
 
+        const openProcess = (pid) => {
+            if (!pid) return;
+            const api = window.$$ && window.$$.process;
+            if (api && typeof api.open === 'function') {
+                try { api.open(pid); return; } catch (e) { /* упадём на адрес ниже */ }
+            }
+            window.location.href = '/user/process#' + encodeURIComponent(pid);
+        };
+
         card.addEventListener('click', (ev) => {
+            // Строка процесса: клик по любому месту строки ведёт в карточку
+            const row = ev.target.closest('.tp-proc-row[data-proc]');
+            if (row) {
+                openProcess(row.dataset.proc);
+                return;
+            }
+
             const btn = ev.target.closest('.tp-proc-tabs button');
             if (!btn) return;
             const kind = btn.dataset.kind || 'open';
@@ -5475,6 +5524,16 @@
             // Списки уже загружены — перерисовываем без сети
             const body = card.querySelector('.tp-lazy-body');
             if (body) setHtmlIfChanged(body, renderProcesses(Object.assign({}, state, { kind }), kind));
+        });
+
+        // Строка — это div с role="link", сам по себе он Enter не обрабатывает.
+        // Без этого клавиатура открыть процесс не могла бы, хотя мышью — можно.
+        card.addEventListener('keydown', (ev) => {
+            if (ev.key !== 'Enter' && ev.key !== ' ') return;
+            const row = ev.target.closest('.tp-proc-row[data-proc]');
+            if (!row) return;
+            ev.preventDefault();
+            openProcess(row.dataset.proc);
         });
     }
 
