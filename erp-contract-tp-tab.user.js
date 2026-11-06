@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.10
+// @version      0.72.11
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.10';
+    const SELF_VERSION = '0.72.11';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -308,7 +308,7 @@
      * с отсутствующей сессией: панель писала «не подключён», хотя услуги
      * отключены статусом и платёж их не вернёт.
      */
-    function connectionVerdict(outNum, limitNum, statusText, aliveCount) {
+    function connectionVerdict(outNum, limitNum, statusText, aliveCount, extra) {
         const hasData = Number.isFinite(outNum) && Number.isFinite(limitNum);
         const deficit = hasData ? Number((limitNum - outNum).toFixed(2)) : 0; // > 0 = нужно внести
         const blockedByBalance = hasData && deficit > 0;
@@ -322,6 +322,21 @@
         const isClosed = !isActiveStatus && /закрыт|удал|отключ/i.test(status);
         const isSuspended = !isActiveStatus && !isClosed;
 
+        /*
+         * Биллинг мог отключить услугу сам, и это факт важнее арифметики.
+         *
+         * На договоре YL0001806 сервис в состоянии «отключен [Недостаточно
+         * средств]», а отчёт balance.do из-за обнулённого переноса остатка
+         * показывал запас 2440 ₽ — панель писала «Блокировки нет». Оператор
+         * видел зелёный вердикт при мёртвом доступе.
+         */
+        const e = extra || {};
+        const disabled = Array.isArray(e.disabled) ? e.disabled : [];
+        const disabledMoney = disabled.filter((d) => d && d.money);
+        const disabledAny = disabled.length > 0;
+        // Причина для подписи: первая денежная, иначе первая вообще
+        const disabledReason = (disabledMoney[0] || disabled[0] || {}).reason || '';
+
         const online = Number(aliveCount) > 0;
         return {
             hasData,
@@ -333,20 +348,67 @@
             statusText: status,
             isActive: isActiveStatus,
             online,
+            // Отключение на стороне биллинга: услуга жива по периоду, но
+            // состояние «отключен». Деньги это или нет — видно по причине.
+            disabledByBilling: disabledAny,
+            disabledMoney,
+            disabledReason,
+            // Остаток в отчёте не сошёлся с карточкой биллинга или цепочка
+            // переносов оборвана: цифрам верим с оговоркой.
+            balanceUnreliable: !!e.balanceUnreliable,
+            cardOut: Number.isFinite(e.cardOut) ? e.cardOut : NaN,
+            reportOut: Number.isFinite(e.reportOut) ? e.reportOut : NaN,
             needPay: deficit > 0 ? deficit : 0,
             headroom: deficit < 0 ? Number((-deficit).toFixed(2)) : 0,
-            // Причина офлайна для подписи — деньги важнее статуса договора
-            offlineReason: blockedByBalance ? 'баланс'
-                : isClosed ? 'договор закрыт'
-                    : isSuspended ? `статус «${status || 'не активен'}»`
-                        : 'не подключён',
+            // Причина офлайна для подписи — деньги важнее статуса договора,
+            // а отключение биллингом важнее расчётного запаса
+            offlineReason: disabledAny ? 'биллинг'
+                : blockedByBalance ? 'баланс'
+                    : isClosed ? 'договор закрыт'
+                        : isSuspended ? `статус «${status || 'не активен'}»`
+                            : 'не подключён',
             // деньги не виноваты, но связи нет — оператору не надо трогать лимит
-            notMoney: !blockedByBalance && !online,
+            notMoney: !blockedByBalance && !disabledAny && !online,
         };
     }
 
     const MONTHS_RU = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
         'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+
+    /**
+     * Отключённые биллингом сервисы: что именно и по какой причине.
+     *
+     * В дереве сервисов поле «Состояние» приходит в виде
+     * «отключен [Недостаточно средств]» — статус плюс причина в скобках.
+     * Это самый точный факт о блокировке: он приходит из биллинга и не
+     * зависит от того, сходятся ли цифры в отчёте. Раньше панель смотрела
+     * только на «остаток + лимит» и писала «Блокировки нет» даже когда
+     * услуга уже отключена по балансу (договор YL0001806).
+     *
+     * Удалённые и закрытые сервисы не считаем: это история, а не текущее
+     * состояние. Берём только живые по периоду и не помеченные как удалённые.
+     */
+    function disabledServices(list) {
+        const out = [];
+        (list || []).forEach((s) => {
+            const state = String((s && s.state) || '');
+            const status = String((s && s.status) || '');
+            if (!/отключ|блокиров|приостанов/i.test(state)) return;
+            if (/закрыт|удал[её]н/i.test(status)) return;
+            if (/удал[её]н/i.test(state)) return;
+            const reason = (state.match(/\[([^\]]+)\]/) || [])[1] || '';
+            out.push({
+                name: s.name || '',
+                type: s.type || '',
+                state,
+                reason: reason.trim(),
+                // «Недостаточно средств» — это ровно та причина, по которой
+                // блокировка денежная, а не административная
+                money: /средств|баланс|денег|оплат/i.test(reason),
+            });
+        });
+        return out;
+    }
 
     /** Русские склонения: 1 день / 2 дня / 5 дней. */
     function plural(n, one, few, many) {
@@ -1453,7 +1515,27 @@
             };
         },
 
-        /** Баланс (берём последнюю строку таблицы за «весь период договора»). */
+        /**
+         * Баланс за расчётный период: последняя строка отчёта плюс сверка
+         * с карточкой биллинга.
+         *
+         * Отчёт balance.do показывает движение по месяцам, но НЕ всегда
+         * переносит остаток: у договора YL0001806 «Входящий остаток» обнулён
+         * в каждом месяце, поэтому последняя строка даёт −1220 ₽, хотя
+         * в карточке биллинга долг −93600 ₽ — и именно по нему BGBilling
+         * отключил услугу. Панель верила отчёту и писала «блокировки нет».
+         *
+         * Поэтому считаем отчёт подозрительным в двух случаях и сверяемся
+         * с карточкой:
+         *   • carryBroken — «Входящий остаток» месяца не равен «Исходящему»
+         *     предыдущего (цепочка оборвана, итог не накопительный);
+         *   • mismatch — остаток в карточке не совпал с последней строкой.
+         *
+         * Поле out остаётся значением отчёта: по нему считается обещанный
+         * платёж, и подменять его долгом из карточки нельзя — оператору
+         * предложили бы внести девяносто тысяч вместо пары тысяч.
+         * Для показа и вердикта отдаём отдельно cardOut/outTrusted.
+         */
         async balance(cid) {
             const id = cid || this.contractId();
             if (!id) return null;
@@ -1462,23 +1544,64 @@
             const html = await fetchText(url);
             const body = parseHtml(html);
 
-            let last = null;
+            const rows = [];
             body.querySelectorAll('table.data tr').forEach((tr) => {
                 const tds = Array.from(tr.querySelectorAll('td'));
                 if (tds.length < 6) return;
                 const month = tds[0].innerText.trim();
-                // Берём последнюю строку с годом (порядок в таблице — хронологический)
+                // Берём только строки с годом (порядок в таблице — хронологический)
                 if (!/\d{4}/.test(month) || /месяц|год/i.test(month)) return;
-                last = {
+                rows.push({
                     month,
                     in: tds[1].innerText.trim(),
                     payment: tds[2].innerText.trim(),
                     account: tds[3].innerText.trim(),
                     charge: tds[4].innerText.trim(),
                     out: tds[5].innerText.trim(),
-                };
+                });
             });
-            return last;
+            if (!rows.length) return null;
+
+            const last = rows[rows.length - 1];
+
+            // Цепочка остатков: «вход» каждого месяца должен совпадать
+            // с «выходом» предыдущего. Расхождение — отчёт не накопительный.
+            let carryBroken = false;
+            for (let i = 1; i < rows.length; i += 1) {
+                const prevOut = toNum(rows[i - 1].out);
+                const curIn = toNum(rows[i].in);
+                if (!Number.isFinite(prevOut) || !Number.isFinite(curIn)) continue;
+                if (Math.abs(prevOut - curIn) > 0.005) { carryBroken = true; break; }
+            }
+
+            // Остаток из карточки биллинга — то же число, по которому биллинг
+            // блокирует услуги. Карточка недоступна по правам — просто не сверяем.
+            let cardOut = NaN;
+            try {
+                const cardHtml = await fetchText(
+                    `/user/plugin/bgbilling/proto/contract.do?method=contractCards`
+                    + `&billingId=bill&contractId=${id}`
+                );
+                const m = cardHtml.match(
+                    /Остаток на счете:?\s*<\/b>\s*<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/i
+                );
+                if (m) cardOut = toNum(m[1].replace(/&nbsp;/g, ' ').replace(/<[^>]*>/g, '').trim());
+            } catch (e) { /* нет прав на карточку — сверять не с чем */ }
+
+            const reportOut = toNum(last.out);
+            const mismatch = Number.isFinite(cardOut) && Number.isFinite(reportOut)
+                && Math.abs(cardOut - reportOut) > 0.005;
+
+            return Object.assign({}, last, {
+                rows,
+                reportOut,
+                cardOut,
+                mismatch,
+                carryBroken,
+                // Остаток, которому можно верить: карточка биллинга точнее отчёта
+                outTrusted: Number.isFinite(cardOut) && (mismatch || carryBroken) ? cardOut : reportOut,
+                unreliable: mismatch || carryBroken,
+            });
         },
 
         /**
@@ -2928,6 +3051,13 @@
         .tp-forecast b { color: var(--tp-fg); font-weight: 600; }
         .tp-forecast.is-warn { color: var(--tp-warn); }
         .tp-forecast.is-warn b { color: var(--tp-warn); }
+        /* Расхождение отчёта и карточки биллинга: это не прогноз, а
+           предупреждение о том, что цифрам отчёта верить нельзя. Отделяем
+           полосой слева, чтобы не путалось с «До блокировки N дней». */
+        .tp-balance-warn {
+            padding-left: 9px; border-left: 2px solid var(--tp-warn);
+            border-top: 0; margin-top: 8px;
+        }
 
         /* Пустая панель «Для ТП» (только что создана, контент ещё не вставлен)
            не должна показываться при открытии договора — иначе мелькает
@@ -7143,6 +7273,7 @@
     function renderMoney(opts) {
         const {
             outNum, limitNum, fee = null, pending = false, statusText = '', aliveCount = 0,
+            disabled = null, balanceUnreliable = false, cardOut = NaN, reportOut = NaN,
         } = opts || {};
 
         // Статус договора — не мелочь. По документации BGBilling статус глобальный:
@@ -7150,7 +7281,15 @@
         // (bgbilling.ru/versions/v7.2/doc/43384998.html). Раньше сюда передавалась
         // пустая строка, и закрытый договор с положительным остатком показывался
         // как «Блокировки нет».
-        const v = connectionVerdict(outNum, limitNum, statusText, aliveCount);
+        const v = connectionVerdict(outNum, limitNum, statusText, aliveCount, {
+            disabled,
+            balanceUnreliable,
+            cardOut,
+            // Без reportOut предупреждение о расхождении печатало бы
+            // «Отчёт за период показывает undefined ₽»: значение приходит
+            // из отчёта отдельно от outNum (там остаток из «Параметров»).
+            reportOut,
+        });
 
         let moneyClass = 'is-ok';
         // Заголовок несёт статус, ниже — только сумма. Раньше было и «Блокировки нет»,
@@ -7185,6 +7324,18 @@
             moneyLabel = 'Заблокирован по балансу';
             heroValue = `${fmt(v.needPay)} ₽`;
             heroCaption = 'Внести, чтобы разблокировать';
+        } else if (v.disabledByBilling) {
+            // Биллинг уже отключил услугу, хотя по цифрам запаса хватает.
+            // Так бывает, когда отчёт balance.do не переносит остаток между
+            // месяцами: запас «есть», а биллинг видит долг и режет доступ.
+            moneyClass = 'is-bad';
+            moneyLabel = v.disabledMoney.length
+                ? 'Отключён биллингом по балансу'
+                : 'Отключён биллингом';
+            heroValue = 'Отключён';
+            heroCaption = v.disabledReason
+                ? `${v.disabledReason} — доступ восстановится после оплаты`
+                : 'Доступ восстановится после оплаты';
         } else {
             // Не заблокирован — подпись не нужна: «0 ₽» и так означает «вносить нечего»
             heroCaption = '';
@@ -7192,8 +7343,10 @@
 
         // Прогноз: сколько дней осталось до ухода в минус.
         // Для закрытого и приостановленного договора он бессмыслен — блокировка
-        // уже наступила по статусу.
-        const forecast = (v.hasData && !v.blockedByBalance && !v.isClosed && !v.isSuspended)
+        // уже наступила по статусу. Отключённому биллингом прогноз тоже не нужен:
+        // он не «скоро будет», а уже есть.
+        const forecast = (v.hasData && !v.blockedByBalance && !v.isClosed && !v.isSuspended
+            && !v.disabledByBilling)
             ? daysUntilBlock(outNum, limitNum, fee)
             : null;
 
@@ -7222,6 +7375,29 @@
                </div>`
             : '';
 
+        // Расхождение источников баланса.
+        //
+        // Оператор должен видеть оба числа: отчёт balance.do и карточку
+        // биллинга. Блокирует доступ именно второе, и именно из-за разницы
+        // договор YL0001806 выглядел «зелёным» при отключённой услуге.
+        // Расхождение источников баланса.
+        //
+        // Оператор должен видеть оба числа: отчёт balance.do и карточку
+        // биллинга. Блокирует доступ именно второе, и именно из-за разницы
+        // договор YL0001806 выглядел «зелёным» при отключённой услуге.
+        //
+        // Второе число показываем только если оно известно: fmt(NaN) даёт
+        // «NaN ₽», и такая строка выглядит как поломка панели, а не как факт.
+        const reportKnown = Number.isFinite(v.reportOut);
+        const mismatchHtml = v.balanceUnreliable && Number.isFinite(v.cardOut)
+            ? `<div class="tp-forecast is-warn tp-balance-warn">
+                   В карточке биллинга: <b>${esc(fmt(v.cardOut))} ₽</b> — по ней и блокируется доступ.
+                   ${reportKnown
+                       ? `Отчёт за период показывает ${esc(fmt(v.reportOut))} ₽ и остаток между месяцами не переносит.`
+                       : 'Отчёт за период остаток между месяцами не переносит, поэтому его итог занижен.'}
+               </div>`
+            : '';
+
         return `<div class="tp-money">
             <div class="tp-verdict-head ${moneyClass}">
                 <span class="tp-signal ${moneyClass}"></span>
@@ -7235,6 +7411,7 @@
 
             ${facts}
             ${forecastHtml}
+            ${mismatchHtml}
         </div>`;
     }
 
@@ -7249,6 +7426,12 @@
             pending: !!ctx.pending,
             statusText: ctx.status || '',
             aliveCount: ctx.aliveCount || 0,
+            // Отключение на стороне биллинга и надёжность остатка: без них
+            // вердикт снова стал бы «Блокировки нет» при мёртвой услуге.
+            disabled: ctx.disabled || null,
+            balanceUnreliable: !!ctx.balanceUnreliable,
+            cardOut: Number.isFinite(ctx.cardOut) ? ctx.cardOut : NaN,
+            reportOut: Number.isFinite(ctx.reportOut) ? ctx.reportOut : NaN,
         }));
     }
 
@@ -7270,6 +7453,12 @@
             // как «Блокировки нет» — денежный блок перерисовывался после
             // загрузки абонплаты и терял статус из контекста.
             status: ctx.status || '',
+            // То же и для отключения биллингом: оно приходит из сервисов,
+            // а перерисовка по абонплате случается позже их загрузки.
+            disabled: ctx.disabled || null,
+            balanceUnreliable: !!ctx.balanceUnreliable,
+            cardOut: Number.isFinite(ctx.cardOut) ? ctx.cardOut : NaN,
+            reportOut: Number.isFinite(ctx.reportOut) ? ctx.reportOut : NaN,
         });
     }
 
@@ -7419,7 +7608,16 @@
 
         // Контекст «Состояния связи» — нужен автообновлению, чтобы не перезапрашивать
         // параметры договора и историю статусов каждые несколько секунд.
-        panel._tpCtx = { outNum, limitNum, status, mode: params.mode, v };
+        //
+        // Отключение биллингом и надёжность остатка досчитываются ниже, когда
+        // придут сервисы и отчёт: до этого вердикт опирается только на цифры.
+        panel._tpCtx = {
+            outNum, limitNum, status, mode: params.mode, v,
+            disabled: null,
+            balanceUnreliable: false,
+            cardOut: NaN,
+            reportOut: NaN,
+        };
 
         // Денежный блок снимаем со скелетона СРАЗУ, ещё до запроса абонплаты.
         //
@@ -7546,6 +7744,16 @@
 
         alive('balance', balanceOnce(), (bal) => {
             fillLazy(panel, 'balance', buildBalanceHtml(bal));
+
+            // Отчёт пришёл — проверяем, можно ли ему верить, и перерисовываем
+            // денежный блок. Порядок важен: остаток в «Параметрах» берётся
+            // из живой таблицы договора, а отчёт может показывать другое число.
+            if (bal && panel._tpCtx) {
+                panel._tpCtx.balanceUnreliable = !!bal.unreliable;
+                panel._tpCtx.cardOut = bal.cardOut;
+                panel._tpCtx.reportOut = bal.reportOut;
+                refreshMoney(panel);
+            }
         });
 
         // Процессы договора: активные и закрытые. Два независимых запроса,
@@ -7597,6 +7805,11 @@
                 // Режим («Дебет»/«Кредит») берём из параметров договора: в ответе
                 // balance.do его нет, поэтому проверка по balance.mode не работала.
                 mode: params.mode,
+                // Отключение биллингом и ненадёжный остаток: без них блок
+                // предлагал «Вносить не нужно» договору с мёртвой услугой.
+                disabled: (panel._tpCtx && panel._tpCtx.disabled) || null,
+                balanceUnreliable: !!(bal && bal.unreliable),
+                cardOut: bal ? bal.cardOut : NaN,
             }));
             mountTrustButton(panel);
             // Абонплата пришла — обновим денежный блок (цена дня и прогноз блокировки)
@@ -7625,6 +7838,17 @@
         // Сервисы в биллинге: тип, период, статус и устройство.
         alive('services', servicesOnce(), (data) => {
             fillLazy(panel, 'services', renderServices((data && data.list) || []));
+
+            // Состояние сервиса — самый точный признак блокировки: «отключен
+            // [Недостаточно средств]» приходит от биллинга и не зависит от
+            // того, сходятся ли цифры в отчёте. Без этого панель писала
+            // «Блокировки нет» договору с уже отключённой услугой.
+            const disabled = disabledServices((data && data.list) || []);
+            if (panel._tpCtx) {
+                panel._tpCtx.disabled = disabled.length ? disabled : null;
+                refreshMoney(panel);
+            }
+
             // Раскрытие истории сервисов переживает перерисовку: автообновление
             // перерисовывает блок каждые 42 секунды, и без восстановления
             // открытый оператором список закрывался бы сам.
@@ -8380,6 +8604,12 @@
 
     /** HTML карточки «Доверительный платёж». */
     function buildTrustHtml(balance, limitData, ctx) {
+        // Остаток для расчёта платежа берём из отчёта, а не из карточки.
+        //
+        // Отчёт и карточка могут расходиться (YL0001806: −1220 против −93600).
+        // Считать платёж по карточке нельзя: оператору предложили бы внести
+        // девяносто тысяч вместо пары тысяч. Но и молчать о расхождении
+        // нельзя — о нём говорит денежный блок выше (renderMoney).
         const outNum = (balance && balance.out != null) ? toNum(balance.out) : ctx.outNum;
         // Пустая строка от ERP — это «нет данных», а не лимит 0
         const rawLimit = limitData && limitData.limit;
@@ -8402,6 +8632,12 @@
         const statusActive = !statusText || /^актив/i.test(statusText);
         const isClosed = !statusActive && /закрыт|удал|отключ/i.test(statusText);
         const isSuspended = !statusActive && !isClosed;
+
+        // Биллинг уже отключил услугу по балансу. Платёж тут как раз помогает —
+        // но после него сервис надо переоткрыть, и об этом оператор должен знать.
+        const disabled = (ctx && ctx.disabled) || [];
+        const disabledMoney = disabled.filter((d) => d && d.money);
+        const disabledReason = (disabledMoney[0] || disabled[0] || {}).reason || '';
 
         // Правила: как в оригинале — платить можно всегда, когда есть что вносить.
         // Закрытый договор не блокируем: оператор видит предупреждение, но решает
@@ -8427,7 +8663,10 @@
                     + 'а не по балансу. Платёж доступ не вернёт: статус ставит администратор.'
                 : (!Number.isFinite(outNum) || !Number.isFinite(limitNum))
                     ? 'Не удалось прочитать остаток или лимит — проверьте вкладку «Лимит» вручную.'
-                    : (!elig.allowed ? elig.reason + '.' : (elig.note ? elig.note + '.' : ''));
+                    : disabled.length
+                        ? `Биллинг уже отключил услугу${disabledReason ? `: ${disabledReason}` : ''}. `
+                            + 'После оплаты сервис нужно переоткрыть — сам он не включится.'
+                        : (!elig.allowed ? elig.reason + '.' : (elig.note ? elig.note + '.' : ''));
 
         // Сумма и комментарий — не поля, а подпись: их всё равно считает биллинг,
         // а оператору важно только число дней. Раньше три поля занимали три строки
@@ -8455,8 +8694,10 @@
         // Предупреждение — жёлтым, когда это не блокировка, а совет.
         // «Вносить нечего» — не ошибка: красным подсвечиваем только настоящие
         // запреты (режим, статус, нечитаемые данные), иначе спокойный договор
-        // выглядел как авария.
-        const warnCls = (isClosed || isSuspended || (!elig.allowed && !elig.nothing)) ? 'is-bad' : 'is-warn';
+        // выглядел как авария. Отключение биллингом — тоже «bad»: доступ уже
+        // мёртв, это не совет.
+        const warnCls = (isClosed || isSuspended || disabled.length
+            || (!elig.allowed && !elig.nothing)) ? 'is-bad' : 'is-warn';
 
         return `<div class="tp-trust-inner">
             ${warn ? `<p class="tp-trust-lead ${warnCls}">${warn}</p>` : ''}
