@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.4
+// @version      0.72.5
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.4';
+    const SELF_VERSION = '0.72.5';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3054,27 +3054,13 @@
         .tp-device-main { min-width: 0; flex: 1 1 auto; }
         .tp-device-name { font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
         .tp-device-meta { font-size: 12px; color: var(--tp-fg2); }
-        /* Копируемый фрагмент: адрес OLT и подобное. Подчёркивание пунктиром —
-           единственный признак кликабельности, который не спорит с вёрсткой
-           строки; после клика поверх значения всплывает «Скопировано». */
+        /* Копируемый фрагмент: адрес OLT и подобное.
+           Снаружи ничем не выделен — ни подчёркиванием, ни подсветкой при
+           клике. Оператору нужно «нажал — уже в буфере», а пунктир и синее
+           выделение текста только отвлекали от строки. О кликабельности
+           говорит курсор-рука и подсказка title. */
         .tp-copy {
-            position: relative; cursor: pointer; user-select: all;
-            border-bottom: 1px dashed currentColor; color: var(--tp-fg);
-        }
-        .tp-copy:hover { color: var(--tp-blue); }
-        .tp-copied-tip {
-            position: absolute; left: 0; bottom: 100%; margin-bottom: 3px;
-            padding: 2px 6px; border-radius: var(--tp-radius-sm);
-            /* Плашка «Скопировано» — инверсия фона, поэтому цвета заданы
-               буквально: на тёмной теме var(--tp-fg) светлый, и текст слился
-               бы с подложкой. В dark-блоке ниже они переворачиваются. */
-            background: #1d1d1f; color: #fff;
-            font-size: 11px; font-weight: 500; white-space: nowrap;
-            pointer-events: none; z-index: 3;
-        }
-        html[data-theme="dark"] .tp-copied-tip,
-        html[data-theme="modern-dark"] .tp-copied-tip {
-            background: #f5f5f7; color: #1d1d1f;
+            position: relative; cursor: pointer; user-select: none;
         }
         .tp-mono { font-variant-numeric: tabular-nums; letter-spacing: .01em; }
         .tp-eq-group {
@@ -4730,6 +4716,14 @@
      * значением (адрес OLT) вёрстка прыгала — «Скопировано» короче и короче
      * оригинала, из-за чего соседние строки сдвигались.
      */
+    /**
+     * Копирование по клику — без визуальных эффектов.
+     *
+     * Оператору нужен один жест: нажал — значение уже в буфере. Плашку
+     * «Скопировано» убрали: она всплывала над строкой и на мгновение
+     * перекрывала соседние данные, а клик всё равно уже сделан и результат
+     * виден при вставке.
+     */
     function bindCopyTargets(root) {
         const scope = root || document;
         scope.querySelectorAll('[data-tp-copy]').forEach((el) => {
@@ -4741,14 +4735,7 @@
                 ev.stopPropagation();
                 const value = el.dataset.tpCopy || '';
                 if (!value) return;
-
-                copyToClipboard(value, () => {
-                    const tip = document.createElement('span');
-                    tip.className = 'tp-copied-tip';
-                    tip.textContent = 'Скопировано';
-                    el.appendChild(tip);
-                    setTimeout(() => { tip.remove(); }, 900);
-                });
+                copyToClipboard(value);
             });
         });
     }
