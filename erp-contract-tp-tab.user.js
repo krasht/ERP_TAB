@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.13
+// @version      0.72.14
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.13';
+    const SELF_VERSION = '0.72.14';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3445,6 +3445,11 @@
         }
         .tp-whiteip-cred-hint { font-size: 11px; line-height: 1.4; color: var(--tp-fg3); }
         .tp-whiteip-cred-hint.is-bad { color: var(--tp-red); }
+        /* Предупреждение о побочном эффекте действия (снятие услуги):
+           важнее подсказки о пуле, поэтому цвет предупреждающий. */
+        .tp-whiteip-warn { color: var(--tp-warn); }
+        .tp-whiteip-warn[hidden] { display: none; }
+        .tp-whiteip-pool-hint[hidden] { display: none; }
         .tp-whiteip-mac-wrap input {
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         }
@@ -5084,6 +5089,83 @@
      *  - «обычный» — сервис с публичным адресом, услуга «Публичный IP-адрес»
      *    или «(юрлица)» уже входит в абонплату тарифа.
      */
+    /**
+     * Единственный расчёт действия кнопки блока «Белый IP».
+     *
+     * Подпись, доступность и подсказка зависят от двух вещей: что выбрано
+     * в «Типе» (test / regular / grey) и что уже есть у договора (белый адрес
+     * и позиция «Публичный IP» в абонплате). Раньше эти условия жили ДВУМЯ
+     * копиями — в renderWhiteIp и в refreshButton, — и правка в одной из них
+     * давала разное поведение до и после смены «Типа». Теперь копия одна.
+     *
+     * state: { ipKind: 'white'|'grey'|'none', npay, free, greyFree, personType }.
+     * Возвращает { label, canApply, hint, warn }.
+     */
+    function whiteIpAction(kind, state) {
+        const st = state || {};
+        const isLegal = st.personType === 'legal';
+        const serviceName = 'Публичный IP' + (isLegal ? ' (юрлица)' : '');
+        const white = ((st.free || [])[0]) || '';
+        const grey = ((st.greyFree || [])[0]) || '';
+        const hasWhite = st.ipKind === 'white';
+        const hasService = !!st.npay;
+        // В ветках «Тестовый» и «Серый» обработчик кнопки всегда вызывает
+        // removePublicIpService — платная позиция снимается. Оператор обязан
+        // видеть это ДО нажатия: иначе «Навесить серый IP» тихо лишает абонента
+        // услуги, и он перестаёт за неё платить.
+        const dropsService = (kind === 'test' || kind === 'grey') && hasService;
+        const noWhitePool = 'Свободных белых адресов в пуле нет — освободите адрес в биллинге.';
+
+        if (kind === 'grey') {
+            return {
+                label: 'Навесить серый IP',
+                canApply: !!grey,
+                hint: grey ? '' : 'Свободных серых адресов в пуле нет — освободите адрес в биллинге.',
+                warn: dropsService
+                    ? 'Услуга «' + serviceName + '» будет снята — абонент перестанет за неё платить.'
+                    : '',
+            };
+        }
+
+        // «С услугой», адрес уже навешен, позиции нет: сервис не пересоздаём,
+        // только добавляем услугу в абонплату — свободный адрес не нужен.
+        if (kind === 'regular' && hasWhite && !hasService) {
+            return {
+                label: 'Подключить услугу «' + serviceName + '»',
+                canApply: true,
+                hint: white ? '' : 'Свободных белых адресов нет, но услугу можно подключить к уже выданному.',
+                warn: '',
+            };
+        }
+
+        // Белый адрес уже выдан: нажатие пересоздаст сервис и выдаст ДРУГОЙ
+        // адрес, оборвав сессию абонента, — «Навесить» здесь было бы обманом.
+        // «Тестовый» вдобавок снимает платную услугу, поэтому подпись говорит
+        // об этом прямо (предупреждение под кнопкой тут не нужно — дубль).
+        if (hasWhite) {
+            return {
+                label: (kind === 'test' && hasService)
+                    ? 'Перевести на тестовый (услуга снимется)'
+                    : 'Перевыдать адрес',
+                canApply: !!white,
+                hint: white ? '' : noWhitePool,
+                warn: '',
+            };
+        }
+
+        // Белого адреса нет — обычная выдача из пула. Услуга при этом может
+        // быть уже подключена (абонент на сером IP платит за белый): выдача
+        // тестового её снимет, и об этом надо предупредить.
+        return {
+            label: 'Навесить белый IP',
+            canApply: !!white,
+            hint: white ? '' : noWhitePool,
+            warn: dropsService
+                ? 'Услуга «' + serviceName + '» будет снята — абонент перестанет за неё платить.'
+                : '',
+        };
+    }
+
     function renderWhiteIp(state) {
         const { current, free, personType, devices, deviceId, svcType, creds } = state || {};
         const isLegal = personType === 'legal';
@@ -5228,46 +5310,17 @@
         // поэтому свободный адрес из пула не нужен и кнопку гасить не за что.
         // Раньше она оставалась disabled при пустом пуле, хотя действие
         // не требует выдачи адреса, и подключить услугу из панели было нельзя.
-        const isGreyKind = kind === 'grey';
-        const needsService = kind === 'regular' && ipKind === 'white' && !hasService;
-        // Белый адрес и услуга уже есть: нажатие пересоздаст сервис и выдаст
-        // ДРУГОЙ адрес, оборвав сессию абонента. Поведение оставляем, но
-        // подпись должна об этом говорить — иначе оператор жмёт «Навесить»,
-        // думая, что ничего не изменится.
-        const alreadyConfigured = kind === 'regular' && ipKind === 'white' && hasService;
-
-        let canApply;
-        let applyLabel;
-        if (isGreyKind) {
-            canApply = !!greyAddr;
-            applyLabel = 'Навесить серый IP';
-        } else if (needsService) {
-            canApply = true;
-            applyLabel = 'Подключить услугу «Публичный IP' + (isLegal ? ' (юрлица)' : '') + '»';
-        } else if (alreadyConfigured) {
-            canApply = !!autoAddr;
-            applyLabel = 'Перевыдать адрес';
-        } else {
-            canApply = !!autoAddr;
-            applyLabel = 'Навесить белый IP';
-        }
-
-        // Услугу подключить можно и без свободных адресов — говорим об этом
-        // прямо, иначе погасшая кнопка читается как «действие недоступно».
-        // Текст живёт в отдельном узле: его переписывает refreshButton при
-        // смене «Типа», иначе подсказка оставалась бы от прежнего выбора.
-        const noPoolHint = isGreyKind
-            ? (greyAddr ? '' : 'Свободных серых адресов в пуле нет — освободите адрес в биллинге.')
-            : (!needsService && !autoAddr)
-                ? 'Свободных белых адресов в пуле нет — освободите адрес в биллинге.'
-                : (needsService && !autoAddr
-                    ? 'Свободных белых адресов нет, но услугу можно подключить к уже выданному.'
-                    : '');
+        const action = whiteIpAction(kind, state);
+        const canApply = action.canApply;
+        const applyLabel = action.label;
+        const noPoolHint = action.hint;
+        const actionWarn = action.warn;
 
         html += `<input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
             <button type="button" class="tp-btn tp-whiteip-apply"${canApply ? '' : ' disabled'}
                     data-grey="${esc(greyAddr)}">${esc(applyLabel)}</button>
             <span class="tp-whiteip-cred-hint tp-whiteip-pool-hint"${noPoolHint ? '' : ' hidden'}>${esc(noPoolHint)}</span>
+            <span class="tp-whiteip-cred-hint tp-whiteip-warn"${actionWarn ? '' : ' hidden'}>${esc(actionWarn)}</span>
             <span class="tp-msg tp-whiteip-msg"></span>
         </div>`;
 
@@ -5631,53 +5684,37 @@
          * и получает отказ биллинга вместо понятного «адресов нет».
          *
          * Исключение — «адрес выдан, услуги нет»: там действие не выдаёт
-         * адрес, и пустой пул ему не мешает. Логика обязана совпадать
-         * с renderWhiteIp, иначе смена «Типа» погасит рабочую кнопку.
+         * адрес, и пустой пул ему не мешает.
+         *
+         * Все условия живут в whiteIpAction — той же функции, что рисует блок.
+         * Раньше здесь была вторая копия, и любое расхождение давало разное
+         * поведение до и после смены «Типа».
          */
         const refreshButton = () => {
             const st = panel._tpWhiteIp || {};
             const kind = kindEl ? kindEl.value : 'test';
-            const isGrey = kind === 'grey';
             // Выбор запоминаем на панели: без этого после перерисовки селект
             // сбрасывался на «Тестовый», и оператор терял свой выбор.
             panel._tpWhiteIpKind = kind;
 
-            const isLegal = st.personType === 'legal';
-            const needsService = kind === 'regular' && st.ipKind === 'white' && !st.npay;
-            const alreadyConfigured = kind === 'regular' && st.ipKind === 'white' && !!st.npay;
-
-            // Подсказка о пуле зависит от выбранного типа — переписываем её
-            // вместе с кнопкой, иначе после смены «Типа» остаётся прежний текст.
-            const poolHint = panel.querySelector('.tp-whiteip-pool-hint');
-            const setHint = (text) => {
-                if (!poolHint) return;
-                poolHint.textContent = text || '';
-                poolHint.hidden = !text;
-            };
-
-            if (isGrey) {
-                btn.textContent = 'Навесить серый IP';
-                const grey = (st.greyFree && st.greyFree[0]) || '';
-                btn.disabled = !grey;
-                setHint(grey ? '' : 'Свободных серых адресов в пуле нет — освободите адрес в биллинге.');
-                return;
-            }
-
             const white = (st.free && st.free[0]) || '';
             if (addrInput) addrInput.value = white;
 
-            if (needsService) {
-                btn.textContent = 'Подключить услугу «Публичный IP'
-                    + (isLegal ? ' (юрлица)' : '') + '»';
-                // Адрес уже навешен — свободный из пула не нужен
-                btn.disabled = false;
-                setHint(white ? '' : 'Свободных белых адресов нет, но услугу можно подключить к уже выданному.');
-                return;
-            }
+            // Подсказки переписываем вместе с кнопкой, иначе после смены
+            // «Типа» остаётся прежний текст.
+            const poolHint = panel.querySelector('.tp-whiteip-pool-hint');
+            const warnHint = panel.querySelector('.tp-whiteip-warn');
+            const setHint = (el, text) => {
+                if (!el) return;
+                el.textContent = text || '';
+                el.hidden = !text;
+            };
 
-            btn.textContent = alreadyConfigured ? 'Перевыдать адрес' : 'Навесить белый IP';
-            btn.disabled = !white;
-            setHint(white ? '' : 'Свободных белых адресов в пуле нет — освободите адрес в биллинге.');
+            const action = whiteIpAction(kind, st);
+            btn.textContent = action.label;
+            btn.disabled = !action.canApply;
+            setHint(poolHint, action.hint);
+            setHint(warnHint, action.warn);
         };
 
         if (kindEl) {
@@ -6253,9 +6290,18 @@
                 <pre class="tp-mail-preview-text">${esc(buildMailBody(kind, d, customText))}</pre>
             </div>
             <button type="button" class="tp-btn tp-mail-send"${(noTo || noPwd || noBody) ? ' disabled' : ''}>Отправить</button>
-            ${noTo ? '<span class="tp-mail-hint is-bad">В договоре не заполнен E-mail — впишите адрес вручную.</span>' : ''}
-            ${!noTo && noPwd ? '<span class="tp-mail-hint is-bad">Нет пароля для выбранного доступа — отправка невозможна.</span>' : ''}
-            ${!noTo && noBody ? '<span class="tp-mail-hint is-bad">Впишите текст письма.</span>' : ''}
+            ${/*
+              Все три подсказки — отдельные узлы, которые пересчитывает
+              refreshPreview. Раньше две из них были статичными строками:
+              выбрав PPPoE, оператор видел «Нет пароля для выбранного доступа»
+              и после переключения на «личный кабинет», где пароль есть, —
+              текст не пропадал, хотя кнопка уже становилась активной.
+              Подсказка про E-mail страдала тем же: её показывали только
+              при отрисовке, и после ввода адреса она оставалась на экране.
+            */ ''}
+            <span class="tp-mail-hint is-bad tp-mail-hint-to"${noTo ? '' : ' hidden'}>В договоре не заполнен E-mail — впишите адрес вручную.</span>
+            <span class="tp-mail-hint is-bad tp-mail-hint-pwd"${(!noTo && noPwd) ? '' : ' hidden'}>Нет пароля для выбранного доступа — отправка невозможна.</span>
+            <span class="tp-mail-hint is-bad tp-mail-hint-body"${(!noTo && noBody) ? '' : ' hidden'}>Впишите текст письма.</span>
             <span class="tp-msg tp-mail-msg"></span>
         </div>`;
     }
@@ -6340,6 +6386,16 @@
                 : ((kind === 'pppoe' || kind === 'both') ? !!d.pwdPppoe : !!d.pwdStat);
             const hasBody = isCustom ? !!String(customText || '').trim() : true;
             if (btn) btn.disabled = !hasPwd || !hasBody || !(toEl && toEl.value.trim());
+
+            // Подсказки пересчитываем вместе с кнопкой: они объясняют, ПОЧЕМУ
+            // она неактивна, и обязаны исчезать, когда причина ушла.
+            const hasTo = !!(toEl && toEl.value.trim());
+            const toHint = card.querySelector('.tp-mail-hint-to');
+            if (toHint) toHint.hidden = hasTo;
+            const pwdHint = card.querySelector('.tp-mail-hint-pwd');
+            if (pwdHint) pwdHint.hidden = !hasTo || hasPwd;
+            const bodyHint = card.querySelector('.tp-mail-hint-body');
+            if (bodyHint) bodyHint.hidden = !hasTo || hasBody;
         };
 
         if (kindEl) {
