@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.11
+// @version      0.72.12
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.11';
+    const SELF_VERSION = '0.72.12';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5136,13 +5136,52 @@
         // Одна кнопка вместо четырёх. Подпись и доступность зависят от того,
         // что выбрано в «Типе»: белый пул и серый пул — разные ресурсы, и
         // «Применить» не должно быть активным, когда нужного адреса нет.
+        //
+        // Отдельный случай — «адрес уже выдан, услуги нет»: оператору нужно
+        // только добавить позицию в абонплату. Сервис при этом не трогаем,
+        // поэтому свободный адрес из пула не нужен и кнопку гасить не за что.
+        // Раньше она оставалась disabled при пустом пуле, хотя действие
+        // не требует выдачи адреса, и подключить услугу из панели было нельзя.
         const isGreyKind = kind === 'grey';
-        const canApply = isGreyKind ? !!greyAddr : !!autoAddr;
-        const applyLabel = isGreyKind ? 'Навесить серый IP' : 'Навесить белый IP';
+        const needsService = kind === 'regular' && ipKind === 'white' && !hasService;
+        // Белый адрес и услуга уже есть: нажатие пересоздаст сервис и выдаст
+        // ДРУГОЙ адрес, оборвав сессию абонента. Поведение оставляем, но
+        // подпись должна об этом говорить — иначе оператор жмёт «Навесить»,
+        // думая, что ничего не изменится.
+        const alreadyConfigured = kind === 'regular' && ipKind === 'white' && hasService;
+
+        let canApply;
+        let applyLabel;
+        if (isGreyKind) {
+            canApply = !!greyAddr;
+            applyLabel = 'Навесить серый IP';
+        } else if (needsService) {
+            canApply = true;
+            applyLabel = 'Подключить услугу «Публичный IP' + (isLegal ? ' (юрлица)' : '') + '»';
+        } else if (alreadyConfigured) {
+            canApply = !!autoAddr;
+            applyLabel = 'Перевыдать адрес';
+        } else {
+            canApply = !!autoAddr;
+            applyLabel = 'Навесить белый IP';
+        }
+
+        // Услугу подключить можно и без свободных адресов — говорим об этом
+        // прямо, иначе погасшая кнопка читается как «действие недоступно».
+        // Текст живёт в отдельном узле: его переписывает refreshButton при
+        // смене «Типа», иначе подсказка оставалась бы от прежнего выбора.
+        const noPoolHint = isGreyKind
+            ? (greyAddr ? '' : 'Свободных серых адресов в пуле нет — освободите адрес в биллинге.')
+            : (!needsService && !autoAddr)
+                ? 'Свободных белых адресов в пуле нет — освободите адрес в биллинге.'
+                : (needsService && !autoAddr
+                    ? 'Свободных белых адресов нет, но услугу можно подключить к уже выданному.'
+                    : '');
 
         html += `<input type="hidden" class="tp-whiteip-addr" value="${esc(autoAddr)}">
             <button type="button" class="tp-btn tp-whiteip-apply"${canApply ? '' : ' disabled'}
                     data-grey="${esc(greyAddr)}">${esc(applyLabel)}</button>
+            <span class="tp-whiteip-cred-hint tp-whiteip-pool-hint"${noPoolHint ? '' : ' hidden'}>${esc(noPoolHint)}</span>
             <span class="tp-msg tp-whiteip-msg"></span>
         </div>`;
 
@@ -5504,6 +5543,10 @@
          * Пул белых и пул серых — разные ресурсы: «Применить» должно гаснуть,
          * когда в нужном пуле нет свободного адреса. Иначе оператор нажимает
          * и получает отказ биллинга вместо понятного «адресов нет».
+         *
+         * Исключение — «адрес выдан, услуги нет»: там действие не выдаёт
+         * адрес, и пустой пул ему не мешает. Логика обязана совпадать
+         * с renderWhiteIp, иначе смена «Типа» погасит рабочую кнопку.
          */
         const refreshButton = () => {
             const st = panel._tpWhiteIp || {};
@@ -5512,15 +5555,43 @@
             // Выбор запоминаем на панели: без этого после перерисовки селект
             // сбрасывался на «Тестовый», и оператор терял свой выбор.
             panel._tpWhiteIpKind = kind;
-            btn.textContent = isGrey ? 'Навесить серый IP' : 'Навесить белый IP';
+
+            const isLegal = st.personType === 'legal';
+            const needsService = kind === 'regular' && st.ipKind === 'white' && !st.npay;
+            const alreadyConfigured = kind === 'regular' && st.ipKind === 'white' && !!st.npay;
+
+            // Подсказка о пуле зависит от выбранного типа — переписываем её
+            // вместе с кнопкой, иначе после смены «Типа» остаётся прежний текст.
+            const poolHint = panel.querySelector('.tp-whiteip-pool-hint');
+            const setHint = (text) => {
+                if (!poolHint) return;
+                poolHint.textContent = text || '';
+                poolHint.hidden = !text;
+            };
 
             if (isGrey) {
-                btn.disabled = !((st.greyFree && st.greyFree[0]) || '');
+                btn.textContent = 'Навесить серый IP';
+                const grey = (st.greyFree && st.greyFree[0]) || '';
+                btn.disabled = !grey;
+                setHint(grey ? '' : 'Свободных серых адресов в пуле нет — освободите адрес в биллинге.');
                 return;
             }
+
             const white = (st.free && st.free[0]) || '';
             if (addrInput) addrInput.value = white;
+
+            if (needsService) {
+                btn.textContent = 'Подключить услугу «Публичный IP'
+                    + (isLegal ? ' (юрлица)' : '') + '»';
+                // Адрес уже навешен — свободный из пула не нужен
+                btn.disabled = false;
+                setHint(white ? '' : 'Свободных белых адресов нет, но услугу можно подключить к уже выданному.');
+                return;
+            }
+
+            btn.textContent = alreadyConfigured ? 'Перевыдать адрес' : 'Навесить белый IP';
             btn.disabled = !white;
+            setHint(white ? '' : 'Свободных белых адресов в пуле нет — освободите адрес в биллинге.');
         };
 
         if (kindEl) {
