@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.2
+// @version      0.72.3
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.2';
+    const SELF_VERSION = '0.72.3';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3211,25 +3211,6 @@
         .tp-whiteip-dev-name { font-size: 12.5px; font-weight: 550; color: var(--tp-fg2); }
         .tp-whiteip-dev-name.is-bad { color: var(--tp-red); }
 
-        /* ---- меню вкладки панели задач */
-        /* Своё меню нужно из-за закреплённых вкладок: у них нет крестика,
-           и без пункта «Закрыть» закрепление стало бы необратимым. */
-        #tp-tasktab-menu {
-            position: absolute; z-index: 2147483002; display: none;
-            min-width: 150px; padding: 4px;
-            background: #fff; border: 1px solid rgba(0,0,0,.1); border-radius: 8px;
-            box-shadow: 0 2px 6px rgba(0,0,0,.08), 0 12px 32px -8px rgba(0,0,0,.28);
-            font-size: 13px; color: #1d1d1f;
-        }
-        html[data-theme="dark"] #tp-tasktab-menu,
-        html[data-theme="modern-dark"] #tp-tasktab-menu {
-            background: #2c2c2e; border-color: rgba(255,255,255,.1); color: #f5f5f7;
-        }
-        #tp-tasktab-menu .tp-tasktab-item {
-            padding: 6px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap;
-        }
-        #tp-tasktab-menu .tp-tasktab-item:hover { background: rgba(0,122,255,.14); }
-
         /* ---- процессы */
         .tp-proc-state {
             font-size: 11px; font-weight: 600; color: var(--tp-fg3);
@@ -5649,7 +5630,7 @@
 
         const openProcess = (pid) => {
             if (!pid) return;
-            // $$ объявлен как const и не является свойством window — см. erpShell.
+            // $$ объявлен как const и не является свойством window.
             // Обращаемся к глобальной переменной напрямую, с проверкой typeof.
             let api = null;
             try {
@@ -9083,10 +9064,6 @@
         if (watch.timer) { clearInterval(watch.timer); watch.timer = null; }
         if (watch.observer) { watch.observer.disconnect(); watch.observer = null; }
 
-        // Постоянные вкладки панели задач: снимаем наблюдение и sortable,
-        // иначе после переинъекции скрипта остались бы два наблюдателя.
-        try { teardownTaskTabs(); } catch (e) { /* модуль не успел подняться */ }
-
         // Таймеры автообновления всех панелей и сетевой кэш
         document.querySelectorAll(PANEL_SEL).forEach((p) => stopAutoRefresh(p));
         netDrop();
@@ -10623,353 +10600,31 @@
         return true;
     }
 
-    /* ------------------------------------------- постоянные вкладки панели задач */
-
     /*
-     * Панель задач ERP (#taskPanel) — это вкладки-инструменты меню: Поиск,
-     * Radius Logs, Очереди процессов и прочие. ERP создаёт их через
-     * loadMenuTool (kernel.shell.js) и НЕ сохраняет между загрузками страницы:
-     * после F5 панель пуста, и оператор каждый раз открывает нужные разделы
-     * заново.
+     * Постоянные вкладки панели задач (#taskPanel: Поиск, Radius Logs,
+     * Очереди процессов и прочие) раньше восстанавливались после F5 из
+     * localStorage — скрипт запоминал состав, порядок и закрепление вкладок
+     * и открывал их заново через $$.shell.contentLoad.
      *
-     * Здесь мы запоминаем открытые вкладки и восстанавливаем их сами.
+     * Функция убрана: в самом ERP панель между загрузками НЕ сохраняется,
+     * и восстановление расходилось с поведением сайта — оператор видел
+     * вкладки, которых «не открывал», а закрепление (удалённый крестик)
+     * переживало перезагрузку. Теперь поведение совпадает с оригиналом:
+     * после F5 панель пуста.
      *
-     * Устройство вкладки в ERP:
-     *   • id — href без «/user/», слэши заменены дефисами (/user/search → user-search);
-     *   • адрес лежит в jQuery-данных: $(вкладка).data('href');
-     *   • название — текст внутри .title;
-     *   • закрытие — обработчик на .icon-close внутри вкладки. Нет крестика —
-     *     вкладку нельзя закрыть мышью. Именно это и есть «закрепление»:
-     *     в самом ERP для этого есть параметр options.pinned у loadMenuTool,
-     *     но вызвать её напрямую нельзя — функция внутренняя.
+     * Оставшийся снимок в localStorage чистим один раз, чтобы он не занимал
+     * место и не сбивал с толку при разборе проблем.
      */
-    const TASK_TABS_KEY = 'erpTpTaskTabs';
-    /** Снимок старше суток не восстанавливаем: вчерашние очереди не нужны. */
-    const TASK_TABS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    const TASK_TABS_KEY_LEGACY = 'erpTpTaskTabs';
 
-    /**
-     * Доступ к объекту оболочки ERP.
-     *
-     * ВАЖНО: `$$` объявлен в kernel.js как `const bgerp = {}; const $$ = bgerp;`.
-     * Глобальный `const` живёт в лексической области скрипта, но НЕ становится
-     * свойством `window`. Поэтому `window.$$` — undefined, а `$$` — объект.
-     * Раньше код проверял `window.$$` и всегда получал «API недоступен»,
-     * хотя оболочка была на месте.
-     *
-     * `typeof` обязателен: если ядро ещё не загрузилось, прямое обращение к
-     * необъявленной переменной бросит ReferenceError.
-     */
-    function erpShell() {
-        try {
-            if (typeof $$ !== 'undefined' && $$ && $$.shell) return $$.shell;
-        } catch (e) { /* ядро ещё не загрузилось */ }
-        // Запасной путь: некоторые версии ERP всё же кладут объект в window
-        const w = typeof window !== 'undefined' ? window : null;
-        return (w && w.$$ && w.$$.shell) || null;
-    }
-
-    const taskTabs = {
-        observer: null,
-        timer: null,
-        // Пока идёт восстановление, снимок не пишем: панель на старте пуста,
-        // и запись затёрла бы сохранённый список до того, как он прочитан.
-        restoring: false,
-        // Первая запись — только после восстановления. До этого момента DOM
-        // не отражает намерения оператора.
-        ready: false,
-        sortableBound: false,
-        menuEl: null,
-    };
-
-    /** Список открытых вкладок из DOM: href и признак закрепления. */
-    function readTaskTabs() {
-        const $ = window.jQuery;
-        if (!$) return [];
-        const out = [];
-        $('#taskPanel > div').each(function () {
-            const $tab = $(this);
-            const href = $tab.data('href');
-            if (!href) return;
-            out.push({
-                href: String(href),
-                // Крестик отсутствует — вкладка закреплена
-                pinned: $tab.find('.icon-close').length === 0,
-            });
-        });
-        return out;
-    }
-
-    /** Сохраняет текущий состав и порядок вкладок. */
-    function snapshotTaskTabs() {
-        if (taskTabs.restoring || !taskTabs.ready) return;
-        const tabs = readTaskTabs();
-        try {
-            // Пустой список тоже сохраняем: если оператор закрыл все вкладки,
-            // они не должны вернуться при следующей загрузке.
-            window.localStorage.setItem(TASK_TABS_KEY, JSON.stringify({
-                at: Date.now(),
-                tabs,
-            }));
-        } catch (e) { /* приватный режим или переполнение */ }
-    }
-
-    function readSavedTaskTabs() {
-        try {
-            const raw = window.localStorage.getItem(TASK_TABS_KEY);
-            if (!raw) return [];
-            const data = JSON.parse(raw);
-            if (!data || !Array.isArray(data.tabs)) return [];
-            if (data.at && Date.now() - data.at > TASK_TABS_MAX_AGE_MS) return [];
-            return data.tabs.filter((t) => t && t.href);
-        } catch (e) {
-            return [];
-        }
-    }
-
-    /** Ставит снимок на паузу и склеивает частые изменения в один вызов. */
-    function scheduleTaskTabsSnapshot() {
-        if (taskTabs.timer) clearTimeout(taskTabs.timer);
-        taskTabs.timer = setTimeout(() => {
-            taskTabs.timer = null;
-            snapshotTaskTabs();
-        }, 300);
-    }
-
-    /**
-     * Закрепление вкладки: убираем или возвращаем крестик.
-     *
-     * Крестик — не просто иконка: ERP вешает обработчик закрытия именно на него
-     * (kernel.shell.js, $taskButton.find('.icon-close').click). Без элемента
-     * вкладку нельзя закрыть мышью, но она продолжает работать.
-     */
-    function setTabPinned($tab, pinned) {
-        if (!$tab || !$tab.length) return;
-        const hasClose = $tab.find('.icon-close').length > 0;
-        if (pinned && hasClose) {
-            $tab.find('.icon-close').remove();
-        } else if (!pinned && !hasClose) {
-            $tab.append('<span class="icon-close ti-close"></span>');
-        }
-    }
-
-    /**
-     * Контекстное меню вкладки: закрепить, открепить, закрыть.
-     *
-     * Своё меню нужно потому, что у закреплённой вкладки нет крестика, и без
-     * него она стала бы необратимой. У ERP на вкладках уже есть свой
-     * contextmenu (пункт «Обновить»), поэтому перехватываем и гасим его.
-     */
-    function taskTabMenu(ev) {
-        const $ = window.jQuery;
-        const $tab = $(ev.currentTarget);
-        ev.preventDefault();
-        ev.stopPropagation();
-
-        const isPinned = $tab.find('.icon-close').length === 0;
-        const $menu = $('#tp-tasktab-menu');
-        $menu.empty();
-
-        const add = (label, handler) => {
-            const $item = $('<div class="tp-tasktab-item"></div>').text(label);
-            $item.on('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                $menu.hide();
-                handler();
-            });
-            $menu.append($item);
-        };
-
-        add(isPinned ? 'Открепить' : 'Закрепить', () => {
-            setTabPinned($tab, !isPinned);
-            snapshotTaskTabs();
-        });
-        add('Закрыть', () => {
-            const id = $tab.attr('id');
-            // Закрываем так же, как ERP: убираем вкладку и её содержимое.
-            // removeCommandDiv снимает и #content, и #title, и запись в буфере.
-            try {
-            const api = erpShell();
-            if (api && typeof api.removeCommandDiv === 'function') {
-                try { api.removeCommandDiv(id); } catch (e) { /* объект уже закрыт */ }
-            }
-            } catch (e) { /* объект уже закрыт */ }
-            $tab.remove();
-            snapshotTaskTabs();
-        });
-
-        $menu.css({ left: ev.pageX, top: ev.pageY }).show();
-    }
-
-    /** Подключает меню и обработчики к вкладкам (вызывается после изменений). */
-    function bindTaskTabs() {
-        const $ = window.jQuery;
-        if (!$) return;
-
-        $('#taskPanel > div').each(function () {
-            const $tab = $(this);
-            if ($tab.data('tpBound') === 1) return;
-            $tab.data('tpBound', 1);
-            $tab.on('contextmenu', taskTabMenu);
-        });
-    }
-
-    /**
-     * Восстановление вкладок.
-     *
-     * Открываем ПОСЛЕДОВАТЕЛЬНО и ждём Deferred от contentLoad: внутри ERP
-     * держит единую очередь contentLoadDfd, и параллельные вызовы перетирают
-     * друг друга — при залпе открылась бы только последняя вкладка.
-     *
-     * Оператора не переключаем: contentLoad открывает вкладку и делает её
-     * активной, поэтому после восстановления возвращаем ту, что была открыта
-     * до нас — обычно это договор, на котором работает оператор.
-     */
-    async function restoreTaskTabs() {
-        const saved = readSavedTaskTabs();
-        if (!saved.length) {
-            taskTabs.ready = true;
-            return;
-        }
-
-        taskTabs.restoring = true;
-        try {
-            // Ждём инициализации оболочки: панель и API появляются не сразу.
-            const api = await waitUntil(() => {
-                const shell = erpShell();
-                return !!(shell && typeof shell.contentLoad === 'function'
-                    && document.getElementById('taskPanel'));
-            }, [0, 300, 600, 1200, 2000, 3500]).then(() => erpShell());
-            if (!api) return;
-
-            // Запоминаем активную вкладку, чтобы вернуть её после восстановления
-            const activeId = $('#taskPanel > div.btn-task-active').attr('id') || '';
-
-            for (let i = 0; i < saved.length; i += 1) {
-                const href = saved[i].href;
-                try {
-                    const dfd = api.contentLoad(href);
-                    if (dfd && typeof dfd.always === 'function') {
-                        await new Promise((resolve) => { dfd.always(resolve); });
-                    } else {
-                        await sleep(400);
-                    }
-                } catch (e) { /* одна вкладка не открылась — остальные пробуем */ }
-            }
-
-            // Возвращаем оператора туда, где он был до восстановления
-            if (activeId) {
-                const $back = $('#taskPanel > div#' + activeId);
-                if ($back.length) $back.trigger('click');
-            }
-
-            // Закреплённые вкладки: убираем крестик
-            saved.forEach((t) => {
-                if (!t.pinned) return;
-                const $tab = $('#taskPanel > div').filter(function () {
-                    return $(this).data('href') === t.href;
-                });
-                setTabPinned($tab, true);
-            });
-        } finally {
-            taskTabs.restoring = false;
-            taskTabs.ready = true;
-            bindTaskTabs();
-            // Снимок после восстановления: фиксируем фактическое состояние,
-            // оно могло отличаться от сохранённого (вкладка не открылась).
-            snapshotTaskTabs();
-        }
-    }
-
-    /**
-     * Перетаскивание вкладок — УЖЕ ЕСТЬ В ERP.
-     *
-     * Проверено на живой странице: `#taskPanel` приходит с классом `ui-sortable`
-     * и такими настройками:
-     *   items: '> div', cancel: '.icon-close', axis: 'x'
-     * То есть порядок вкладок оператор меняет мышью штатно, и крестик из
-     * захвата исключён — перетаскивание не закрывает вкладку.
-     *
-     * Поэтому свой sortable НЕ создаём: второй экземпляр на том же элементе
-     * ломает первый (jQuery UI перезаписывает данные виджета), и перетаскивание
-     * начинает дёргаться. Нам остаётся только сохранять порядок после того,
-     * как ERP его изменила — это делает MutationObserver.
-     */
-    function mountTaskTabsSortable() {
-        // Намеренно пусто: перетаскивание обеспечивает сам ERP.
-        // Функция оставлена, чтобы вызывающий код не менялся, и чтобы было
-        // видно, где именно это решение принято.
-    }
-
-    /**
-     * Наблюдение за панелью задач.
-     *
-     * ERP меняет панель через append и remove, поэтому ловим мутации, а не
-     * опрашиваем DOM. Изменения склеиваются дебаунсом: за одно открытие
-     * вкладки приходит несколько мутаций.
-     */
-    function watchTaskTabs() {
-        const panel = document.getElementById('taskPanel');
-        if (!panel || taskTabs.observer) return;
-
-        taskTabs.menuEl = document.getElementById('tp-tasktab-menu');
-        if (!taskTabs.menuEl) {
-            const menu = document.createElement('div');
-            menu.id = 'tp-tasktab-menu';
-            (document.body || document.documentElement).appendChild(menu);
-        }
-
-        taskTabs.observer = new MutationObserver(() => {
-            bindTaskTabs();
-            mountTaskTabsSortable();
-            scheduleTaskTabsSnapshot();
-        });
-        // subtree обязателен: крестик закрепления лежит ВНУТРИ вкладки, и без
-        // него удаление .icon-close не считается изменением панели. С childList
-        // на самой панели мы бы видели только добавление и удаление вкладок.
-        taskTabs.observer.observe(panel, { childList: true, subtree: true });
-        bindTaskTabs();
-        mountTaskTabsSortable();
-    }
-
-    /** Снимает наблюдение и убирает всё, что навесили на панель. */
-    function teardownTaskTabs() {
-        if (taskTabs.observer) {
-            taskTabs.observer.disconnect();
-            taskTabs.observer = null;
-        }
-        if (taskTabs.timer) {
-            clearTimeout(taskTabs.timer);
-            taskTabs.timer = null;
-        }
-        // sortable НЕ трогаем: он принадлежит ERP, а не нам. Вызов destroy
-        // снял бы штатное перетаскивание вкладок до перезагрузки страницы.
-        taskTabs.sortableBound = false;
-        taskTabs.ready = false;
-        const menu = document.getElementById('tp-tasktab-menu');
-        if (menu) menu.remove();
-    }
-
-    /** Закрывает меню вкладки при клике вне его. */
-    function initTaskTabMenuClose() {
-        document.addEventListener('mousedown', (ev) => {
-            const menu = document.getElementById('tp-tasktab-menu');
-            if (!menu || menu.style.display === 'none' || !menu.style.display) return;
-            if (ev.target.closest('#tp-tasktab-menu')) return;
-            menu.style.display = 'none';
-        }, true);
+    function dropLegacyTaskTabs() {
+        try { window.localStorage.removeItem(TASK_TABS_KEY_LEGACY); } catch (e) { /* приватный режим */ }
     }
 
     function waitAndInit() {
         watch();
 
-        // Постоянные вкладки панели задач: сначала восстанавливаем сохранённые,
-        // потом начинаем следить за изменениями. Порядок важен — если начать
-        // наблюдение раньше, пустая панель на старте затрёт сохранённый список.
-        restoreTaskTabs()
-            .catch(() => { /* без восстановления работа продолжается */ })
-            .then(() => { watchTaskTabs(); });
-        initTaskTabMenuClose();
+        dropLegacyTaskTabs();
 
         // Отметка могла остаться с прошлой загрузки: оператор нажал «Обновить»,
         // ушёл ставить версию и вернулся уже через F5. Тогда перезагружать не
