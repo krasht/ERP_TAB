@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.16
+// @version      0.72.17
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.16';
+    const SELF_VERSION = '0.72.17';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -129,19 +129,28 @@
     const MAIL_STORE_TO = 'erpTpMailTo';
 
     /**
-     * Сумма позиций состава тарифа, которые сняты с договора в абонплате.
+     * Сумма строк состава тарифа, за которые биллинг НЕ начисляет.
      *
-     * «Итого в месяц» ERP считает по ШАБЛОНУ тарифа: позиция остаётся в итоге,
-     * даже когда её сняли (на AV0000001 — «Публичный IP-адрес», 220.50 ₽).
-     * Сверяем строки тарифа с закрытыми услугами абонплаты и возвращаем сумму,
-     * которую из итога надо вычесть.
+     * «Итого в месяц» ERP считает по ШАБЛОНУ тарифа, а не по тому, что реально
+     * стоит на договоре. Расхождение бывает двух видов:
+     *   • позицию сняли — она осталась в итоге (на AV0000001 «Публичный
+     *     IP-адрес» снят, но 220.50 ₽ в итоге висят);
+     *   • шаблон повторяет позицию, а на договоре она одна — ERP берёт в итог
+     *     обе копии, а начисляет одну (тот же адрес: 2 × 220.50 в шаблоне,
+     *     одна строка в абонплате).
+     *
+     * Сверяем строки шаблона с ОТКРЫТЫМИ строками абонплаты: начисляется
+     * столько копий, сколько строк открыто. Всё, что сверх, из итога вычитаем.
+     * Услугу, которой в абонплате нет вовсе, не трогаем: она может входить
+     * в тариф целиком и начисляться без отдельной строки npay (проверено
+     * на 2546 — там «Публичный IP-адрес» в итоге и начисляется).
      *
      * Отдельная функция, а не общий paidItems: feeProfile объявлен ВЫШЕ объекта
      * ERP и paidItems, поэтому вызывать их отсюда нельзя — получили бы
      * «Cannot access before initialization» на первой же отрисовке.
      */
-    function removedChargeSum(body, npayList) {
-        // Имена снятых услуг в том же виде, в каком их пишет состав тарифа
+    function unbilledTemplateSum(body, npayList) {
+        // Имена в том же виде, в каком их пишет состав тарифа
         const norm = (raw) => String(raw || '')
             .toLowerCase()
             .replace(/\s*\(\s*[\d\s.,]+\s*руб\.?\s*\)/gi, '')
@@ -150,13 +159,18 @@
             .replace(/\s+/g, ' ')
             .trim();
 
-        const removed = new Set(
-            (npayList || [])
-                .filter((s) => s && s.closed)
-                .map((s) => norm(s.name))
-                .filter(Boolean)
-        );
-        if (!removed.size) return 0;
+        // Сколько копий услуги реально начисляется: открытые строки абонплаты.
+        // Услуги, которой в npay нет совсем, в карте не будет — её не трогаем.
+        const billed = new Map();
+        (npayList || []).forEach((s) => {
+            const k = norm(s.name);
+            if (!k) return;
+            const rec = billed.get(k) || { known: false, open: 0 };
+            rec.known = true;
+            if (s.open) rec.open += 1;
+            billed.set(k, rec);
+        });
+        if (!billed.size) return 0;
 
         let sum = 0;
         Array.from(body.querySelectorAll('table.sv-t')).forEach((table) => {
@@ -164,14 +178,24 @@
             const head = table.querySelector('tr');
             if (head && /\d{4}-\d{2}/.test(head.innerText || '')) return;
 
+            const perName = new Map();
             table.querySelectorAll('tr').forEach((tr) => {
                 const tds = Array.from(tr.querySelectorAll('td'));
                 if (tds.length < 6) return;
                 const name = norm(tds[0].innerText);
-                if (!name || !removed.has(name)) return;
+                if (!name) return;
+                const info = billed.get(name);
+                if (!info || !info.known) return;
                 const pay = tds[5].innerText.replace(/[^\d.,-]/g, '').replace(',', '.');
                 const value = Number(pay);
-                if (Number.isFinite(value) && value > 0) sum += value;
+                if (!Number.isFinite(value) || value <= 0) return;
+                const rec = perName.get(name) || { count: 0, pay: value, open: info.open };
+                rec.count += 1;
+                perName.set(name, rec);
+            });
+            perName.forEach((rec) => {
+                const extra = rec.count - rec.open;
+                if (extra > 0) sum += rec.pay * extra;
             });
         });
         return Number(sum.toFixed(2));
@@ -218,20 +242,20 @@
                 }
             }
 
-            // ---- снятые позиции вычитаем
+            // ---- позиции, за которые биллинг не начисляет
             //
-            // «Итого в месяц» считается по шаблону тарифа и включает услуги,
-            // которых на договоре уже нет: на AV0000001 это «Публичный IP-адрес»
-            // (220.50 ₽), снятый в npay. Доверительный платёж по такой сумме
-            // завышал бы норму на 7.35 ₽/день — оператор вносил бы деньги
-            // за услугу, которая не начисляется.
+            // «Итого в месяц» считается по шаблону тарифа и включает то, чего
+            // на договоре нет: на AV0000001 «Публичный IP-адрес» снят, но его
+            // 220.50 ₽ в итоге висят — да ещё и дважды, потому что шаблон
+            // повторяет строку. Доверительный платёж по такой сумме завышал
+            // норму почти вдвое (929 против фактических 708.50 ₽): оператор
+            // вносил деньги за услугу, которая не начисляется.
+            const unbilled = unbilledTemplateSum(body, npayList);
             let removedSum = 0;
-            if ((npayList || []).some((s) => s && s.closed)) {
-                removedSum = removedChargeSum(body, npayList);
-            }
-            if (removedSum > 0 && perMonth > removedSum) {
-                perMonth = Number((perMonth - removedSum).toFixed(2));
-            } else if (removedSum > 0) {
+            if (unbilled > 0 && perMonth > unbilled) {
+                removedSum = unbilled;
+                perMonth = Number((perMonth - unbilled).toFixed(2));
+            } else if (unbilled > 0) {
                 // Вычет больше итога — значит «Итого» уже без этой позиции
                 removedSum = 0;
             }
@@ -2452,6 +2476,64 @@
                 }
             }
 
+            // ---- «Списания по дням»
+            //
+            // Под таблицей состава тарифа ERP рисует <details> по каждому дню,
+            // внутри — строки «Категория | Услуга | Сумма | Пояснение».
+            // Категорию ставит сам ERP, и это единственный надёжный признак
+            // разового начисления: «Разовый расход» начисляется один раз,
+            // «Абонплата» и «ТВ» — ежемесячные позиции.
+            //
+            // Без этого признака «Ночной» и «Комбо Хит» попадали в разовые:
+            // это опции ТВ, снятые 01.11.2026, поэтому их уже нет ни в составе
+            // тарифа, ни в абонплате (npay) — фильтр по именам их не узнавал.
+            info.daily = { months: [], onetime: [], recurring: [], from: '', truncated: false };
+            const otByKey = new Map();
+            const recurringNames = new Set();
+            const dailyMonths = new Set();
+            Array.from(body.querySelectorAll('details.sv-den')).forEach((det) => {
+                const sum = det.querySelector('summary');
+                const m = String(sum ? sum.innerText : '').match(/(\d{4})-(\d{2})-(\d{2})/);
+                if (!m) return;
+                const month = `${m[1]}-${m[2]}`;
+                dailyMonths.add(month);
+                Array.from(det.querySelectorAll('table.sv-t tr')).forEach((tr) => {
+                    const tds = Array.from(tr.querySelectorAll('td'));
+                    if (tds.length < 3) return;
+                    const kind = tds[0].innerText.trim();
+                    const name = tds[1].innerText.replace(/\s+/g, ' ').trim();
+                    const amount = toNum(tds[2].innerText);
+                    if (!name || !Number.isFinite(amount) || amount === 0) return;
+                    if (/разов/i.test(kind)) {
+                        // Ключ — сырое имя: «Инсталляционные работы (3500 руб.)»
+                        // и «(1000 руб.)» разные услуги, нормализация их склеит.
+                        let item = otByKey.get(name);
+                        if (!item) {
+                            item = { service: name, months: {} };
+                            otByKey.set(name, item);
+                        }
+                        item.months[month] = Number(((item.months[month] || 0) + amount).toFixed(2));
+                    } else {
+                        // Услуга хотя бы один день начислялась как абонплата —
+                        // значит она ежемесячная, разовой быть не может.
+                        recurringNames.add(normServiceName(name));
+                    }
+                });
+            });
+            info.daily.months = Array.from(dailyMonths).sort();
+            info.daily.from = info.daily.months[0] || '';
+            info.daily.onetime = Array.from(otByKey.values());
+            info.daily.recurring = Array.from(recurringNames).filter(Boolean);
+
+            // «Договор создан: 2026-08-01» — ERP печатает ISO-дату, а не dd.mm.yyyy.
+            // Нужна только для честной подписи «за весь период»: если история
+            // списаний по дням короче жизни договора, сумма за период неполная.
+            const created = info.header.match(/Договор создан:\s*(\d{4})-(\d{2})-(\d{2})/);
+            info.created = created ? `${created[1]}-${created[2]}` : '';
+            // История «Списаний по дням» у ERP ограничена (на 06.11.2026 —
+            // с 2026-08-01). Если договор старше, «за весь период» — неправда.
+            info.daily.truncated = !!(info.created && info.daily.from && info.daily.from > info.created);
+
             return info;
         },
 
@@ -2497,6 +2579,12 @@
                 if (period) {
                     item.period = period;
                     item.connected = true;
+                    // Сколько строк реально стоит на договоре. Нужно, чтобы
+                    // вычитать из «Итого в месяц» ровно столько копий снятой
+                    // услуги, сколько их в шаблоне: на AV0000001 «Публичный
+                    // IP-адрес» есть дважды, и вычет одной копии оставлял
+                    // половину снятой позиции в дневной норме.
+                    item.rows = (item.rows || 0) + 1;
                     // «05.11.2026 - 06.11.2026» — закрыта, «26.10.2026 -» — действует.
                     // Открытая строка перебивает закрытые: у услуги бывает история
                     // снятий и одно текущее подключение.
@@ -8007,9 +8095,10 @@
                 card.classList.add('is-filled');
             };
 
-            // Сначала рисуем без истории за период, потом дополняем — чтобы блок не ждал
+            // Сначала рисуем без истории за период, потом дополняем — чтобы блок не ждал.
+            // Источник — тот же разбор «Списаний по дням», что и у cost, второй запрос не нужен.
             draw(null);
-            oneTimeByPeriod(id, fee && fee.perMonth).then((period) => {
+            oneTimeByPeriod(id, cost).then((period) => {
                 if (period && period.rows.length) draw(period);
             }).catch(() => {});
         });
@@ -8103,6 +8192,15 @@
      * Нулевые строки не показываем: «Приход 0.00 · Наработка 0.00 · Расход 0.00»
      * занимают полблока и не несут смысла. Если движений не было вовсе, остаётся
      * только остаток — этого достаточно.
+     *
+     * Подписи со знаками. Формула отчёта:
+     *   исходящий = входящий + приход − наработка − расход
+     * Наработка и расход УМЕНЬШАЮТ остаток, но обе строки печатались без знака,
+     * и блок читался как «2576.40 + 150.10 = 2426.30», то есть как арифметическая
+     * ошибка. На AV0000001 (ноябрь 2026) оператор именно так и посчитал.
+     * Теперь у вычитаемых строк стоит «−», у прихода — «+», а если формула
+     * всё-таки не сходится, об этом сказано прямо: расхождение в отчёте ERP
+     * (например, из-за отложенных операций) не должно выглядеть нашей ошибкой.
      */
     function buildBalanceHtml(bal) {
         if (!bal) return '<div class="tp-hint">Нет данных по балансу.</div>';
@@ -8119,12 +8217,14 @@
             return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) < 0.005;
         };
 
+        // [подпись, значение, знак, прятать ли при совпадении с исходящим]
+        // Знак — часть формулы: исходящий = входящий + приход − наработка − расход.
         const rows = [
-            ['Входящий', bal.in, true],
-            ['Приход', bal.payment, false],
-            ['Наработка', bal.account, false],
-            ['Расход', bal.charge, false],
-        ].filter(([, v, skipIfSameAsOut]) => {
+            ['Входящий', bal.in, '', true],
+            ['Приход', bal.payment, '+', false],
+            ['Наработка', bal.account, '−', false],
+            ['Расход', bal.charge, '−', false],
+        ].filter(([, v, , skipIfSameAsOut]) => {
             if (v == null || String(v).trim() === '') return false;
             if (isZero(v)) return false;
             if (skipIfSameAsOut && sameAsOut(v)) return false;
@@ -8139,12 +8239,34 @@
             </div>`;
         if (rows.length) {
             html += '<div class="tp-balance-rows">';
-            rows.forEach(([k, v]) => {
-                html += `<div class="tp-balance-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`;
+            rows.forEach(([k, v, sign]) => {
+                // Знак только у вычитаемых и у прихода: «Входящий» — это остаток,
+                // а не слагаемое с плюсом, и «+2576.40» читалось бы странно.
+                const shown = sign ? `${sign}${esc(v)}` : esc(v);
+                html += `<div class="tp-balance-row"><span>${esc(k)}</span><b>${shown}</b></div>`;
             });
             html += '</div>';
         } else {
             html += '<div class="tp-balance-row is-empty"><span>Движений за месяц не было</span></div>';
+        }
+
+        // Формула не сошлась — говорим прямо, что это данные ERP, а не наш счёт.
+        // Молчать нельзя: оператор складывает числа на экране и получает не то,
+        // что в «Исходящем остатке», и идёт искать ошибку в скрипте.
+        const vIn = toNum(bal.in);
+        const vPay = toNum(bal.payment);
+        const vAcc = toNum(bal.account);
+        const vChg = toNum(bal.charge);
+        const vOut = toNum(bal.out);
+        if ([vIn, vPay, vAcc, vChg, vOut].every(Number.isFinite)) {
+            const calc = vIn + vPay - vAcc - vChg;
+            if (Math.abs(calc - vOut) > 0.005) {
+                html += `<div class="tp-hint" style="padding-top:6px">`
+                    + `Проверка: ${esc(fmt(vIn))} + ${esc(fmt(vPay))} − ${esc(fmt(vAcc))} `
+                    + `− ${esc(fmt(vChg))} = ${esc(fmt(calc))} ₽ — расхождение `
+                    + `${esc(fmt(Math.abs(calc - vOut)))} ₽ даёт отчёт ERP, а не этот блок.`
+                    + '</div>';
+            }
         }
         return html + '</div>';
     }
@@ -8457,6 +8579,12 @@
         // потому что normServiceName срезает цену в скобках.
         const byKey = new Map();
         const duplicates = [];
+        // Сколько денег реально действует и сколько «Итого в месяц» считает
+        // по шаблону. Сумма по шаблону = все строки, включая скрытые дубли:
+        // ERP берёт в итог именно их, поэтому разница с заголовком объясняется
+        // ровно этими двумя числами.
+        let activeSum = 0;
+        let templateSum = 0;
         ((cost && cost.groups) || []).forEach((g) => {
             (g.items || []).forEach((i) => {
                 const pay = toNum(i.pay);
@@ -8474,6 +8602,8 @@
                     // Снято с договора, хотя в шаблоне тарифа ещё есть
                     removed: removed.has(normServiceName(name)),
                 };
+
+                templateSum += amount;
 
                 const key = `${normServiceName(name)}|${amount}|${qty}`;
                 const seen = byKey.get(key);
@@ -8496,9 +8626,15 @@
         });
 
         const out = Array.from(byKey.values());
+        // Фактическая сумма по действующим позициям — то, что оператор видит
+        // в списке. Заголовок показывает «Итого в месяц» из шаблона тарифа,
+        // и эти числа законно расходятся (см. buildTariffHtml).
+        out.forEach((i) => { if (!i.removed && i.pay > 0) activeSum += i.pay; });
         // Необязательная нагрузка для отрисовки: сам список остаётся массивом,
         // поэтому все прежние вызовы (.length, .forEach, .filter) работают как раньше.
         out.duplicates = duplicates;
+        out.activeSum = Number(activeSum.toFixed(2));
+        out.templateSum = Number(templateSum.toFixed(2));
         return out;
     }
 
@@ -8511,16 +8647,23 @@
      *   тариф:      «Видеонаблюдение: запись 3 дня (300 руб.)» > «Видеонаблюдение: запись 3 дня»
      * Приводим к общему виду: без служебного префикса «Бандл ·» / «Доп ·» / «Пакет ·»,
      * без хвоста «(… руб.)». Без этого ежемесячная «Доп · Ночной» попадала в разовые.
+     *
+     * Группа тарифа приходит и СУФФИКСОМ — в «Списаниях по дням» ERP пишет
+     * «Бандл · Комбо Хит», а в «Фактически начислено» — просто «Комбо Хит».
+     * Поэтому срезаем метку с обеих сторон, иначе сравнение не срабатывает.
+     * Функция идемпотентна: повторный вызов результата не меняет — это важно,
+     * потому что нормализованные имена сравниваются между собой в разных местах.
      */
     function normServiceName(raw) {
         return String(raw || '')
             .toLowerCase()
             .replace(/\s*\(\s*[\d\s.,]+\s*руб\.?\s*\)/gi, '')   // цена в скобках у разовых
-            // Служебный префикс группы тарифа: «Бандл ·», «Доп ·», «Пакет ·», «Опция ·».
+            // Служебная метка группы тарифа: «Бандл ·», «Доп ·», «Пакет ·», «Опция ·».
             // Именно группа, а не часть названия — в начислениях её не пишут.
             // Список явный: общее правило «любое слово с точкой» срезало бы
             // «Скорость: 500M» и другие настоящие названия.
             .replace(/^(?:бандл|доп|пакет|опция|услуга)\s*[·.:]\s*/i, '')
+            .replace(/\s*[·]\s*(?:бандл|доп|пакет|опция|услуга)\s*$/i, '')
             .replace(/[\u00a0]/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
@@ -8557,6 +8700,14 @@
      * Наличие цены в скобках — дополнительный признак, но сам по себе не решает:
      * у разовых она бывает, у тарифных — нет.
      *
+     * ГЛАВНЫЙ признак — категория начисления в «Списаниях по дням» (cost.daily):
+     * ERP сам помечает строку «Разовый расход» или «Абонплата»/«ТВ».
+     * Раньше фильтр опирался только на имена, и это ломалось на снятых опциях:
+     * на AV0000001 «Ночной» и «Комбо Хит» — ежемесячные опции ТВ, отключённые
+     * 01.11.2026, поэтому в составе тарифа и в npay их уже нет, а в начислениях
+     * за октябрь они есть. Итог: 60.39 ₽ ежемесячных опций висели в «Разовых»,
+     * да ещё и раздували «За весь период договора» до 413.56 ₽.
+     *
      * Одноимённые разовые НЕ склеиваем: «Инсталляционные работы (3500 руб.)»
      * и «(1000 руб.)» — разные услуги, а после среза цены имена совпадают.
      * Поэтому строки идут по одной, а не сливаются в одну сумму.
@@ -8564,6 +8715,7 @@
      */
     function oneTimeItems(cost, npayList) {
         const charged = (cost && cost.charged) || { months: [], items: [] };
+        const daily = (cost && cost.daily) || null;
         const tariffNames = new Set(
             ((cost && cost.groups) || [])
                 .flatMap((g) => (g.items || []).map((i) => normServiceName(i.service)))
@@ -8573,6 +8725,29 @@
         const npayNames = new Set(
             (npayList || []).map((s) => normServiceName(s.name)).filter(Boolean)
         );
+        // Услуги, которые в «Списаниях по дням» хотя бы раз шли как абонплата
+        // или ТВ-опция: это ежемесячные позиции, даже если сейчас сняты.
+        const recurringNames = new Set(daily ? daily.recurring : []);
+
+        // Есть точная категоризация от ERP — она главнее любых догадок по имени.
+        // Возвращаем результат и когда разовых нет вовсе: пустой ответ ERP — это
+        // тоже ответ, а откат на разбор по именам вернул бы ту же ошибку.
+        if (daily && daily.months && daily.months.length) {
+            const items = daily.onetime
+                .map((i) => {
+                    const months = Object.assign({}, i.months);
+                    const total = Object.keys(months)
+                        .reduce((s, k) => s + (Number(months[k]) || 0), 0);
+                    return { service: i.service, months, total: Number(total.toFixed(2)) };
+                })
+                .filter((i) => i.total > 0);
+            return {
+                months: daily.months || [],
+                items,
+                total: Number(items.reduce((s, i) => s + i.total, 0).toFixed(2)),
+                exact: true,
+            };
+        }
 
         const out = [];
         (charged.items || []).forEach((row) => {
@@ -8581,7 +8756,10 @@
 
             const key = normServiceName(name);
             // Есть в тарифе или в абонплате — это ежемесячная позиция, не разовая
-            if (tariffNames.has(key) || npayNames.has(key)) return;
+            if (tariffNames.has(key) || npayNames.has(key) || recurringNames.has(key)) return;
+            // Название встречается в составе тарифа с другим написанием
+            // («Бандл · Комбо Хит» против «Комбо Хит») — сверяем ещё и по вхождению
+            if (matchesAnyName(key, tariffNames) || matchesAnyName(key, recurringNames)) return;
 
             const months = {};
             let total = 0;
@@ -8598,42 +8776,70 @@
             out.push({ service: name, months, total });
         });
 
-        return { months: charged.months || [], items: out, total: out.reduce((s, i) => s + i.total, 0) };
+        return { months: charged.months || [], items: out, total: out.reduce((s, i) => s + i.total, 0), exact: false };
+    }
+
+    /**
+     * Имя встречается среди известных названий как часть другого.
+     *
+     * «Комбо Хит» и «Бандл · Комбо Хит» после нормализации совпадают, но
+     * бывают и вложенные варианты («Комбо Микс + START» против «Комбо Микс»).
+     * Сравнение по вхождению спасает только при длине ≥ 4 символов: иначе
+     * «ТВ» совпало бы с половиной прайса.
+     */
+    function matchesAnyName(key, names) {
+        if (!key || key.length < 4) return false;
+        const it = names.values();
+        for (let v = it.next(); !v.done; v = it.next()) {
+            const other = v.value;
+            if (!other || other.length < 4) continue;
+            if (other === key) return true;
+            if (other.includes(key) || key.includes(other)) return true;
+        }
+        return false;
     }
 
     /**
      * Разовые начисления за весь период договора по месяцам.
-     * balance.do отдаёт «Наработка» за каждый месяц — это все начисления.
-     * Тариф известен из «Итого в месяц», поэтому разово = наработка − тариф.
+     *
+     * Раньше считалось как «Наработка месяца − абонплата»: любой месяц, где
+     * начислялось больше тарифа, объявлялся разовым. Это неверно сразу по
+     * трём причинам:
+     *   • в наработку входят снятые ежемесячные опции («Ночной», «Комбо Хит»),
+     *     и разница с тарифом — это они, а не разовые;
+     *   • смена тарифа внутри месяца даёт «излишек», которого никто не платил;
+     *   • расход (списание долга) вообще не начисление.
+     *
+     * На AV0000001 это давало 413.56 ₽ «за весь период» при фактических
+     * 2400 ₽ разовых (перенос из Carbon в октябре) — цифра не совпадала ни
+     * с чем и объяснить её оператору было нельзя.
+     *
+     * Теперь источник — «Списания по дням»: ERP прямо помечает строки как
+     * «Разовый расход». Точность важнее: если история у ERP обрезана, честно
+     * говорим «с такого-то месяца», а не выдаём неполную сумму за полную.
      */
-    async function oneTimeByPeriod(contractId, monthlyFeeValue) {
-        try {
-            const html = await fetchText(
-                `/user/plugin/bgbilling/proto/balance.do?billingId=bill&contractId=${contractId}` +
-                `&method=balance&dateFrom=01.01.2000&dateTo=${encodeURIComponent(todayRu())}`
-            );
-            const body = parseHtml(html);
-            const rows = [];
+    async function oneTimeByPeriod(contractId, cost) {
+        const daily = (cost && cost.daily) || null;
+        if (!daily || !daily.months || !daily.months.length) return { rows: [], total: 0, from: '', truncated: false };
 
-            body.querySelectorAll('table.data tr').forEach((tr) => {
-                const tds = Array.from(tr.querySelectorAll('td'));
-                if (tds.length < 6) return;
-                const month = tds[0].innerText.replace(/\s+/g, ' ').trim();
-                if (!/\d{4}/.test(month) || /месяц|год/i.test(month)) return;
-
-                const charge = toNum(tds[3].innerText);  // Наработка — все начисления месяца
-                if (!Number.isFinite(charge)) return;
-
-                const fee = Number(monthlyFeeValue) || 0;
-                const extra = fee > 0 ? Number((charge - fee).toFixed(2)) : 0;
-                rows.push({ month, charge, extra: extra > 0 ? extra : 0 });
+        const byMonth = new Map();
+        (daily.onetime || []).forEach((i) => {
+            Object.keys(i.months || {}).forEach((m) => {
+                byMonth.set(m, Number(((byMonth.get(m) || 0) + (Number(i.months[m]) || 0)).toFixed(2)));
             });
+        });
 
-            const total = rows.reduce((s, r) => s + r.extra, 0);
-            return { rows, total: Number(total.toFixed(2)) };
-        } catch (e) {
-            return { rows: [], total: 0 };
-        }
+        const rows = Array.from(byMonth.keys()).sort()
+            .map((m) => ({ month: m, extra: byMonth.get(m) }))
+            .filter((r) => r.extra > 0);
+
+        const total = rows.reduce((s, r) => s + r.extra, 0);
+        return {
+            rows,
+            total: Number(total.toFixed(2)),
+            from: daily.from || '',
+            truncated: !!daily.truncated,
+        };
     }
 
     /**
@@ -8670,6 +8876,59 @@
                 ${payPrice && payPrice !== payTotal ? `<span class="tp-old">${esc(payPrice)} ₽</span>` : ''}
                 <span class="tp-per">в месяц</span>
             </div>`;
+
+            // «Итого в месяц» из ERP — это сумма по ШАБЛОНУ тарифа: в неё входят
+            // снятые позиции и дубли шаблона. На AV0000001 заголовок показывал
+            // 929.00 ₽, а по списку действующих позиций выходило 708.50 ₽ —
+            // оператор видел два разных числа и не понимал, какому верить.
+            // Поэтому рядом с шаблонной суммой показываем фактическую и объясняем
+            // разницу одной строкой. Ничего не пересчитываем: 929 ₽ — правда
+            // для шаблона, 708.50 ₽ — правда для текущего состава договора.
+            const activeSum = Number(items.activeSum) || 0;
+            const templateSum = Number(items.templateSum) || 0;
+            const headerNum = toNum(payTotal);
+            const removedItems0 = items.filter((i) => i.removed);
+            const dupItems0 = (items.duplicates || []).filter((d) => d.hidden > 0);
+            const removedSum0 = removedItems0.reduce(
+                (s, i) => s + (Number(i.pay) || 0) * (1 + (Number(i.hidden) || 0)), 0
+            );
+            const dupSum0 = dupItems0.reduce((s, d) => s + (Number(d.pay) || 0) * d.hidden, 0);
+            const differs = Number.isFinite(headerNum) && activeSum > 0
+                && Math.abs(headerNum - activeSum) >= 0.5;
+
+            if (differs) {
+                // Разницу объясняем только если она ровно складывается из
+                // известных слагаемых. Иначе — просто два числа без домыслов:
+                // выдуманное объяснение хуже отсутствующего.
+                //
+                // Сумму дубля здесь не повторяем: она уже названа в подсказке
+                // под списком («… · 220.50 ₽ в „Итого в месяц“ учтены повторно»),
+                // а два одинаковых числа в одном блоке читаются как 441 ₽.
+                const known = removedSum0 + dupSum0;
+                const explained = known > 0 && Math.abs(known - (headerNum - activeSum)) < 0.5;
+                if (explained) {
+                    const why = [];
+                    if (removedSum0 > 0 && dupSum0 > 0) {
+                        why.push('снятые и задвоенные позиции');
+                    } else if (removedSum0 > 0) {
+                        why.push(`снятая позиция на ${esc(fmt(removedSum0))} ₽`);
+                    } else {
+                        why.push('задвоенная позиция шаблона');
+                    }
+                    html += `<div class="tp-hint" style="padding-top:4px">`
+                        + `По действующим позициям: <b>${esc(fmt(activeSum))} ₽</b> в месяц — `
+                        + `в «Итого в месяц» входят ${why.join(' и ')}.</div>`;
+                } else {
+                    html += `<div class="tp-hint" style="padding-top:4px">`
+                        + `По действующим позициям: <b>${esc(fmt(activeSum))} ₽</b> в месяц; `
+                        + '«Итого в месяц» выше — сумма из шаблона тарифа ERP.</div>';
+                }
+            } else if (templateSum > 0 && Math.abs(templateSum - headerNum) >= 0.5) {
+                // Итог шаблона не равен сумме строк — так бывает при скидке на
+                // тариф целиком. Не выдумываем объяснение, просто фиксируем факт.
+                html += `<div class="tp-hint" style="padding-top:4px">`
+                    + `Сумма по составу тарифа: ${esc(fmt(templateSum))} ₽ — разница из-за скидки на тариф.</div>`;
+            }
         }
 
         // Скидки и опции тарифа
@@ -8779,21 +9038,27 @@
                 html += '<div class="tp-hint" style="padding:2px 0 6px">За последние месяцы разовых не было.</div>';
             }
 
-            // Итог за весь период по данным наработки (названия по старым месяцам ERP не отдаёт)
-            // Итог за весь период по данным наработки (названия по старым месяцам ERP не отдаёт).
-            // Суммы не совпадают с верхней строкой по двум причинам, и это нормально:
-            //   • верхняя — только за 2 месяца, которые отдаёт ERP;
-            //   • здесь — вся наработка сверх абонплаты, включая прошлые месяцы,
-            //     поэтому возможна и разница из-за смены тарифа внутри месяца.
+            // Итог за весь период. Источник — «Списания по дням», где ERP сам
+            // помечает строки «Разовый расход», поэтому сумма сходится с
+            // начислениями по месяцам из balance.do, а не с «наработка − тариф».
+            // Если история у ERP обрезана, так и пишем — иначе неполная сумма
+            // читается как полная за весь договор.
             if (period && period.rows.length) {
                 const extraMonths = period.rows.filter((r) => r.extra > 0);
+                const since = period.from ? ` · с ${esc(period.from)}` : '';
                 html += `<div class="tp-period-total">
-                    <span>За весь период договора</span>
+                    <span>За весь период договора${period.truncated ? since : ''}</span>
                     <b>${esc(fmt(period.total))} ₽</b>
                 </div>`;
                 if (extraMonths.length) {
                     html += '<div class="tp-hint" style="padding-top:2px">'
                         + extraMonths.map((r) => `${esc(r.month)}: ${esc(fmt(r.extra))} ₽`).join(' · ')
+                        + '</div>';
+                }
+                if (period.truncated) {
+                    html += '<div class="tp-hint" style="padding-top:2px">'
+                        + `ERP отдаёт списания по дням только с ${esc(period.from)} — `
+                        + 'разовые за более ранние месяцы в сумму не входят.'
                         + '</div>';
                 }
                 if (oneTime.items.length && Number.isFinite(period.total)
