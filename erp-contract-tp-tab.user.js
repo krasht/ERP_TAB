@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.15
+// @version      0.72.16
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.15';
+    const SELF_VERSION = '0.72.16';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -8429,6 +8429,10 @@
      * но в «За что платит» висел с суммой 220.50 ₽ — оператор считал, что абонент
      * платит за адрес, которого у него нет. Поэтому сверяем с npay и помечаем
      * такие строки как снятые.
+     *
+     * Одинаковые позиции схлопываются в одну (см. комментарий внутри): шаблон
+     * тарифа на AV0000001 содержит «Публичный IP-адрес» дважды, и без этого
+     * в блоке было две строки по 220.50 ₽, а счётчик показывал «6 поз.».
      */
     function paidItems(cost, npayList) {
         // Услуги абонплаты, снятые с договора (есть запись, но ни одна не открыта)
@@ -8439,24 +8443,62 @@
                 .filter(Boolean)
         );
 
-        const out = [];
+        // Одноимённые строки шаблона схлопываем в одну.
+        //
+        // Это не наша ошибка разбора: ERP на AV0000001 отдаёт в составе тарифа
+        // ДВЕ одинаковые строки «Публичный IP-адрес» — та же цена 350.00, та же
+        // скидка −129.50, то же «к оплате» 220.50 и тот же источник «шаблон
+        // тарифа». При этом в «Фактически начислено» и в абонплате (npay)
+        // услуга одна, и биллинг начисляет за неё один раз. В блоке это
+        // выглядело как две строки по 220.50 ₽ — оператор читал 441 ₽ за адрес.
+        //
+        // Ключ включает сумму и количество: разные по цене позиции с похожим
+        // именем («Инсталляционные работы» за 3500 и за 1000 руб.) не слипнутся,
+        // потому что normServiceName срезает цену в скобках.
+        const byKey = new Map();
+        const duplicates = [];
         ((cost && cost.groups) || []).forEach((g) => {
             (g.items || []).forEach((i) => {
                 const pay = toNum(i.pay);
                 const sum = toNum(i.sum);
                 const name = String(i.service || '');
-                out.push({
+                const amount = Number.isFinite(pay) ? pay : (Number.isFinite(sum) ? sum : 0);
+                const qty = String(i.qty == null ? '' : i.qty).trim();
+                const item = {
                     group: g.name,
                     service: name,
                     qty: i.qty,
                     price: i.price,
-                    pay: Number.isFinite(pay) ? pay : (Number.isFinite(sum) ? sum : 0),
-                    included: !(Number.isFinite(pay) ? pay > 0 : Number.isFinite(sum) && sum > 0),
+                    pay: amount,
+                    included: !(amount > 0),
                     // Снято с договора, хотя в шаблоне тарифа ещё есть
                     removed: removed.has(normServiceName(name)),
-                });
+                };
+
+                const key = `${normServiceName(name)}|${amount}|${qty}`;
+                const seen = byKey.get(key);
+                if (seen) {
+                    // Дубль: оставляем первую строку. Но если снята хотя бы одна
+                    // из копий — объединённая позиция тоже считается снятой,
+                    // иначе пометка «снято» пропала бы вместе с дублем.
+                    if (item.removed) seen.removed = true;
+                    // Сколько копий скрыли: «Итого в месяц» ERP считает по
+                    // шаблону и дубль учитывает дважды, поэтому без пояснения
+                    // сумма сверху не сходится со списком.
+                    seen.hidden = (seen.hidden || 0) + 1;
+                    const dup = duplicates.find((d) => d.service === name);
+                    if (dup) { dup.hidden += 1; dup.pay += amount; }
+                    else duplicates.push({ service: name, hidden: 1, pay: amount });
+                    return;
+                }
+                byKey.set(key, item);
             });
         });
+
+        const out = Array.from(byKey.values());
+        // Необязательная нагрузка для отрисовки: сам список остаётся массивом,
+        // поэтому все прежние вызовы (.length, .forEach, .filter) работают как раньше.
+        out.duplicates = duplicates;
         return out;
     }
 
@@ -8668,12 +8710,31 @@
 
             // Итог тарифа считается по шаблону и снятые позиции в него входят.
             // Говорим об этом прямо: иначе сумма сверху не сходится со списком.
+            // Считаем по всем копиям строки: если шаблон повторяет услугу, в
+            // «Итого в месяц» она тоже попала столько же раз.
             const removedItems = items.filter((i) => i.removed);
             if (removedItems.length) {
-                const removedSum = removedItems.reduce((s, i) => s + (Number(i.pay) || 0), 0);
+                const removedSum = removedItems.reduce(
+                    (s, i) => s + (Number(i.pay) || 0) * (1 + (Number(i.hidden) || 0)), 0
+                );
                 html += `<div class="tp-hint" style="padding-top:2px">`
                     + `Снято с договора: ${esc(removedItems.map((i) => cleanServiceName(i.service)).join(', '))}`
                     + `${removedSum > 0 ? ` · ${esc(fmt(removedSum))} ₽ в итоге тарифа не действуют` : ''}.`
+                    + '</div>';
+            }
+
+            // Одинаковые строки шаблона ERP: скрыли дубли — предупреждаем, что
+            // «Итого в месяц» наверху считает их дважды и потому больше списка.
+            // Снятые позиции сюда не берём: про них уже сказано выше, и там
+            // сумма посчитана по всем копиям.
+            const dups = (items.duplicates || [])
+                .filter((d) => d.hidden > 0 && !removedItems.some((i) => i.service === d.service));
+            if (dups.length) {
+                const dupSum = dups.reduce((s, d) => s + (Number(d.pay) || 0) * d.hidden, 0);
+                html += `<div class="tp-hint" style="padding-top:2px">`
+                    + 'В шаблоне тарифа ERP эта услуга указана несколько раз с одинаковой ценой — '
+                    + `показана одной строкой: ${esc(dups.map((d) => cleanServiceName(d.service)).join(', '))}`
+                    + `${dupSum > 0 ? ` · ${esc(fmt(dupSum))} ₽ в «Итого в месяц» учтены повторно` : ''}.`
                     + '</div>';
             }
         }
