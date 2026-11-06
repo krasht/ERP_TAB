@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.7
+// @version      0.72.8
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.7';
+    const SELF_VERSION = '0.72.8';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3055,19 +3055,33 @@
         .tp-device-name { font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
         .tp-device-meta { font-size: 12px; color: var(--tp-fg2); }
         /* Копируемый фрагмент: адрес OLT и подобное.
-           Снаружи ничем не выделен — ни подчёркиванием, ни подсветкой при
-           клике. Оператору нужно «нажал — уже в буфере», а пунктир и синее
-           выделение текста только отвлекали от строки. О кликабельности
-           говорят курсор-рука и подсказка title. */
+           Признак кликабельности — маленькая иконка копирования справа от
+           значения. Подчёркивание и подсветку выделением не используем:
+           оператор жаловался, что строка «выделяется» при клике, но без
+           иконки было непонятно, что вообще можно нажать. При наведении
+           иконка темнеет и строка получает лёгкую подложку — цель клика
+           видна, но в спокойном состоянии строка читается как обычный текст. */
         .tp-copy {
-            position: relative; cursor: pointer; user-select: none;
+            display: inline-flex; align-items: center; gap: 3px;
+            cursor: pointer; user-select: none;
+            padding: 0 3px; margin: 0 -3px; border-radius: var(--tp-radius-sm);
+            transition: background .12s ease, color .12s ease;
         }
+        .tp-copy:hover { background: var(--tp-fill-2); color: var(--tp-blue); }
+        .tp-copy-icon {
+            width: 11px; height: 11px; flex: 0 0 auto;
+            opacity: .45; transition: opacity .12s ease;
+        }
+        .tp-copy:hover .tp-copy-icon { opacity: 1; }
         /* Подтверждение копирования: значение на 900 мс меняется на
            «Скопировано: 94.241». Отдельную плашку поверх строки не рисуем —
            она перекрывала соседние данные (в блоке ONU это уровни сигнала
            и телеметрия), а вставка текста на месте значения ничего не
            закрывает и сразу показывает, что именно попало в буфер. */
-        .tp-copy.is-copied { color: var(--tp-ok); }
+        .tp-copy.is-copied { color: var(--tp-ok); background: var(--tp-ok-bg); }
+        /* Иконка при подтверждении убирается: текст «Скопировано: 94.241»
+           уже длиннее адреса, и лишний значок сдвигал бы строку. */
+        .tp-copy.is-copied .tp-copy-icon { display: none; }
         .tp-mono { font-variant-numeric: tabular-nums; letter-spacing: .01em; }
         .tp-eq-group {
             font-size: 10.5px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase;
@@ -3871,6 +3885,23 @@
     }
 
     /**
+     * Иконка копирования для копируемых значений.
+     *
+     * Два наложенных квадрата — стандартный знак «скопировать». Рисуем SVG,
+     * а не символ шрифта: у ERP свои иконочные наборы (ti-*), и в чужой
+     * версии шрифта нужного глифа может не быть.
+     */
+    function copyIcon() {
+        return '<svg class="tp-copy-icon" viewBox="0 0 16 16" aria-hidden="true">'
+            + '<rect x="5.5" y="5.5" width="8" height="8" rx="1.6"'
+            + ' fill="none" stroke="currentColor" stroke-width="1.5"/>'
+            + '<path d="M10.5 3.5v-.4A1.6 1.6 0 0 0 8.9 1.5H3.1A1.6 1.6 0 0 0 1.5 3.1v5.8'
+            + 'a1.6 1.6 0 0 0 1.6 1.6h.4" fill="none" stroke="currentColor"'
+            + ' stroke-width="1.5" stroke-linecap="round"/>'
+            + '</svg>';
+    }
+
+    /**
      * Последние два октета IPv4: «10.90.94.241» → «94.241».
      *
      * Именно в таком виде адрес вбивают в поиск на OLT — полный адрес там
@@ -3903,7 +3934,9 @@
                     o.oltIp
                         ? (oltShort
                             ? `OLT <span class="tp-copy" data-tp-copy="${esc(oltShort)}"`
-                                + ` title="Нажмите, чтобы скопировать ${esc(oltShort)}">${esc(o.oltIp)}</span>`
+                                + ` title="Нажмите, чтобы скопировать ${esc(oltShort)}">`
+                                + `<span class="tp-copy-val">${esc(o.oltIp)}</span>`
+                                + `${copyIcon()}</span>`
                             : `OLT ${esc(o.oltIp)}`)
                         : '',
                     o.port ? `порт ${o.port}${o.onuId ? ' / ONU ' + o.onuId : ''}` : '',
@@ -4719,9 +4752,8 @@
      *
      * Оператор должен видеть, что скопировалось. Значение на 900 мс меняется
      * на «Скопировано: 94.241» и зеленеет — так видно и сам факт, и то, что
-     * попало в буфер. Текст возвращаем из dataset, а не из замыкания: панель
-     * перерисовывается (автообновление раз в 7 секунд), и старый узел может
-     * быть уже заменён новым.
+     * попало в буфер. Меняем текст ТОЛЬКО в .tp-copy-val: внутри .tp-copy
+     * ещё лежит иконка, и замена textContent стёрла бы её.
      */
     function bindCopyTargets(root) {
         const scope = root || document;
@@ -4729,9 +4761,10 @@
             if (el.dataset.tpCopyBound === '1') return;
             el.dataset.tpCopyBound = '1';
 
+            const val = el.querySelector('.tp-copy-val') || el;
             // Исходный текст — в data-атрибуте, чтобы возврат работал
             // независимо от того, сколько раз нажали
-            if (el.dataset.tpLabel == null) el.dataset.tpLabel = el.textContent;
+            if (val.dataset.tpLabel == null) val.dataset.tpLabel = val.textContent;
 
             el.addEventListener('click', (ev) => {
                 ev.preventDefault();
@@ -4741,15 +4774,15 @@
 
                 copyToClipboard(value, () => {
                     // Повторный клик во время показа: сначала вернуть текст,
-                    // иначе в dataset.tpLabel попадёт «Скопировано: …»
+                    // иначе в tpLabel попадёт «Скопировано: …»
                     if (el._tpCopyTimer) {
                         clearTimeout(el._tpCopyTimer);
-                        el.textContent = el.dataset.tpLabel;
+                        val.textContent = val.dataset.tpLabel;
                     }
-                    el.textContent = 'Скопировано: ' + value;
+                    val.textContent = 'Скопировано: ' + value;
                     el.classList.add('is-copied');
                     el._tpCopyTimer = setTimeout(() => {
-                        el.textContent = el.dataset.tpLabel;
+                        val.textContent = val.dataset.tpLabel;
                         el.classList.remove('is-copied');
                         el._tpCopyTimer = null;
                     }, 900);
