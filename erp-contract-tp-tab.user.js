@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.8
+// @version      0.72.9
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.8';
+    const SELF_VERSION = '0.72.9';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3902,6 +3902,39 @@
     }
 
     /**
+     * MAC без разделителей и без префикса вендора:
+     * «HWTC:6A:DD:EC:D9» → «6ADDECD9», «CC:2D:21:87:DD:D1» → «CC2D2187DDD1».
+     *
+     * В GetOLT MAC приходит с текстовым префиксом модели («HWTC» — Huawei),
+     * а в биллинге и на OLT его вбивают чистыми hex-парами. Поэтому берём
+     * только группы из 1–2 hex-символов: «HWTC» в них не попадает и
+     * отбрасывается сам, а разделители (двоеточие, дефис) уходят.
+     * Возвращаем пустую строку, если hex-групп не нашлось.
+     */
+    function macPlain(mac) {
+        const groups = String(mac || '').trim().split(/[:\-\s]+/);
+        const hex = groups.filter((g) => /^[0-9a-f]{1,2}$/i.test(g));
+        if (!hex.length) return '';
+        return hex.join('').toUpperCase();
+    }
+
+    /**
+     * Копируемый фрагмент: значение с иконкой копирования.
+     *
+     * Один помощник на все места (адрес OLT, MAC): разметка, title и иконка
+     * должны совпадать, иначе обработчик bindCopyTargets находит не всё.
+     * Пустое значение — просто текст без иконки, копировать нечего.
+     */
+    function copySpan(copyValue, text) {
+        const value = String(copyValue || '');
+        const label = String(text == null ? value : text);
+        if (!value) return esc(label);
+        return `<span class="tp-copy" data-tp-copy="${esc(value)}"`
+            + ` title="Нажмите, чтобы скопировать ${esc(value)}">`
+            + `<span class="tp-copy-val">${esc(label)}</span>${copyIcon()}</span>`;
+    }
+
+    /**
      * Последние два октета IPv4: «10.90.94.241» → «94.241».
      *
      * Именно в таком виде адрес вбивают в поиск на OLT — полный адрес там
@@ -3926,19 +3959,11 @@
             html += '<div class="tp-eq-group">GPON</div>';
             onu.forEach((o) => {
                 // Где стоит: OLT + порт/ONU ID — то, что нужно диспетчеру для выезда.
-                // Адрес OLT делаем копируемым: на OLT его ищут по последним двум
-                // октетам, поэтому в буфер уходит «94.241», а не «10.90.94.241».
-                // Порт и ONU ID копировать не даём — их набирают в других полях.
-                const oltShort = shortIp(o.oltIp);
+                // Адрес OLT копируем по последним двум октетам: на OLT его ищут
+                // именно так. Порт и ONU ID копировать не даём — их набирают
+                // в других полях.
                 const place = [
-                    o.oltIp
-                        ? (oltShort
-                            ? `OLT <span class="tp-copy" data-tp-copy="${esc(oltShort)}"`
-                                + ` title="Нажмите, чтобы скопировать ${esc(oltShort)}">`
-                                + `<span class="tp-copy-val">${esc(o.oltIp)}</span>`
-                                + `${copyIcon()}</span>`
-                            : `OLT ${esc(o.oltIp)}`)
-                        : '',
+                    o.oltIp ? `OLT ${copySpan(shortIp(o.oltIp), o.oltIp)}` : '',
                     o.port ? `порт ${o.port}${o.onuId ? ' / ONU ' + o.onuId : ''}` : '',
                 ].filter(Boolean).join(' · ');
 
@@ -3952,10 +3977,12 @@
                     .filter(Boolean).join(' · ');
 
                 // MAC за ONU — устройство абонента; в плагине это список,
-                // показываем первый и счётчик остальных
+                // показываем первый и счётчик остальных. Копируем первый:
+                // именно его ищут в биллинге по таблице MAC.
                 const macs = o.macs || [];
                 const macLine = macs.length
-                    ? `${macs[0]}${macs.length > 1 ? ` и ещё ${macs.length - 1}` : ''}`
+                    ? `${copySpan(macPlain(macs[0]), macs[0])}`
+                        + `${macs.length > 1 ? ` и ещё ${macs.length - 1}` : ''}`
                     : '';
 
                 html += `<div class="tp-device">
@@ -3966,9 +3993,9 @@
                                 ? '<span class="tp-chip is-good">online</span>'
                                 : `<span class="tp-chip is-bad">${esc(o.state || 'offline')}</span>`}
                         </div>
-                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${esc(o.mac)}</div>` : ''}
+                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(macPlain(o.mac), o.mac)}</div>` : ''}
                         ${place ? `<div class="tp-device-meta">${place}</div>` : ''}
-                        ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${esc(macLine)}</div>` : ''}
+                        ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${macLine}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
                         ${chips ? `<div class="tp-chips tp-eq-chips">${chips}</div>` : ''}
                         ${o.updated ? `<div class="tp-device-meta tp-eq-upd">Обновлено: ${esc(o.updated)}</div>` : ''}
