@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.3
+// @version      0.72.4
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.3';
+    const SELF_VERSION = '0.72.4';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -3054,6 +3054,28 @@
         .tp-device-main { min-width: 0; flex: 1 1 auto; }
         .tp-device-name { font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
         .tp-device-meta { font-size: 12px; color: var(--tp-fg2); }
+        /* Копируемый фрагмент: адрес OLT и подобное. Подчёркивание пунктиром —
+           единственный признак кликабельности, который не спорит с вёрсткой
+           строки; после клика поверх значения всплывает «Скопировано». */
+        .tp-copy {
+            position: relative; cursor: pointer; user-select: all;
+            border-bottom: 1px dashed currentColor; color: var(--tp-fg);
+        }
+        .tp-copy:hover { color: var(--tp-blue); }
+        .tp-copied-tip {
+            position: absolute; left: 0; bottom: 100%; margin-bottom: 3px;
+            padding: 2px 6px; border-radius: var(--tp-radius-sm);
+            /* Плашка «Скопировано» — инверсия фона, поэтому цвета заданы
+               буквально: на тёмной теме var(--tp-fg) светлый, и текст слился
+               бы с подложкой. В dark-блоке ниже они переворачиваются. */
+            background: #1d1d1f; color: #fff;
+            font-size: 11px; font-weight: 500; white-space: nowrap;
+            pointer-events: none; z-index: 3;
+        }
+        html[data-theme="dark"] .tp-copied-tip,
+        html[data-theme="modern-dark"] .tp-copied-tip {
+            background: #f5f5f7; color: #1d1d1f;
+        }
         .tp-mono { font-variant-numeric: tabular-nums; letter-spacing: .01em; }
         .tp-eq-group {
             font-size: 10.5px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase;
@@ -3856,6 +3878,21 @@
             + `${esc(label)} ${sign}${v.toFixed(1)} дБм</span>`;
     }
 
+    /**
+     * Последние два октета IPv4: «10.90.94.241» → «94.241».
+     *
+     * Именно в таком виде адрес вбивают в поиск на OLT — полный адрес там
+     * не нужен, а набирать «94.241» руками из строки «10.90.94.241» долго.
+     * Возвращаем пустую строку, если это не IPv4 из четырёх чисел: тогда
+     * копировать нечего и подчёркивать нечего.
+     */
+    function shortIp(ip) {
+        const parts = String(ip || '').trim().split('.');
+        if (parts.length !== 4) return '';
+        if (!parts.every((p) => /^\d{1,3}$/.test(p))) return '';
+        return parts[2] + '.' + parts[3];
+    }
+
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
     function renderEquipment(onuList, objects) {
         const onu = onuList || [];
@@ -3865,9 +3902,18 @@
         if (onu.length) {
             html += '<div class="tp-eq-group">GPON</div>';
             onu.forEach((o) => {
-                // Где стоит: OLT + порт/ONU ID — то, что нужно диспетчеру для выезда
+                // Где стоит: OLT + порт/ONU ID — то, что нужно диспетчеру для выезда.
+                // Адрес OLT делаем копируемым: на OLT его ищут по последним двум
+                // октетам, поэтому в буфер уходит «94.241», а не «10.90.94.241».
+                // Порт и ONU ID копировать не даём — их набирают в других полях.
+                const oltShort = shortIp(o.oltIp);
                 const place = [
-                    o.oltIp ? `OLT ${o.oltIp}` : '',
+                    o.oltIp
+                        ? (oltShort
+                            ? `OLT <span class="tp-copy" data-tp-copy="${esc(oltShort)}"`
+                                + ` title="Нажмите, чтобы скопировать ${esc(oltShort)}">${esc(o.oltIp)}</span>`
+                            : `OLT ${esc(o.oltIp)}`)
+                        : '',
                     o.port ? `порт ${o.port}${o.onuId ? ' / ONU ' + o.onuId : ''}` : '',
                 ].filter(Boolean).join(' · ');
 
@@ -3896,7 +3942,7 @@
                                 : `<span class="tp-chip is-bad">${esc(o.state || 'offline')}</span>`}
                         </div>
                         ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${esc(o.mac)}</div>` : ''}
-                        ${place ? `<div class="tp-device-meta">${esc(place)}</div>` : ''}
+                        ${place ? `<div class="tp-device-meta">${place}</div>` : ''}
                         ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${esc(macLine)}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
                         ${chips ? `<div class="tp-chips tp-eq-chips">${chips}</div>` : ''}
@@ -4648,6 +4694,65 @@
         if (panel._tpAutoTimer) { clearTimeout(panel._tpAutoTimer); panel._tpAutoTimer = null; }
     }
 
+    /**
+     * Копирование в буфер с запасным путём.
+     *
+     * navigator.clipboard требует защищённого контекста и разрешения; в ERP
+     * (http, вставка в чужую страницу) он может быть недоступен. Тогда —
+     * скрытая textarea и execCommand, который работает везде.
+     */
+    function copyToClipboard(value, done) {
+        const text = String(value == null ? '' : value);
+        const fallback = () => {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            // Вне экрана: иначе страница дёргается к вставленному узлу
+            ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); } catch (e) { /* браузер запретил */ }
+            ta.remove();
+            if (done) done();
+        };
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => { if (done) done(); }, fallback);
+        } else {
+            fallback();
+        }
+    }
+
+    /**
+     * Копирование по клику с подсказкой «Скопировано».
+     *
+     * Подсказку рисуем отдельным узлом поверх значения, а не заменой текста:
+     * раньше на 900 мс подменялся сам текст, и в блоках с обрезанным по ширине
+     * значением (адрес OLT) вёрстка прыгала — «Скопировано» короче и короче
+     * оригинала, из-за чего соседние строки сдвигались.
+     */
+    function bindCopyTargets(root) {
+        const scope = root || document;
+        scope.querySelectorAll('[data-tp-copy]').forEach((el) => {
+            if (el.dataset.tpCopyBound === '1') return;
+            el.dataset.tpCopyBound = '1';
+
+            el.addEventListener('click', (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const value = el.dataset.tpCopy || '';
+                if (!value) return;
+
+                copyToClipboard(value, () => {
+                    const tip = document.createElement('span');
+                    tip.className = 'tp-copied-tip';
+                    tip.textContent = 'Скопировано';
+                    el.appendChild(tip);
+                    setTimeout(() => { tip.remove(); }, 900);
+                });
+            });
+        });
+    }
+
     /** Копирование пароля по клику — с подсказкой «Скопировано». */
     function mountPasswords(panel) {
         panel.querySelectorAll('.tp-pwd-val[data-pwd]').forEach((el) => {
@@ -4664,26 +4769,7 @@
                     setTimeout(() => { el.textContent = old; }, 900);
                 };
 
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(value).then(done).catch(() => {
-                        // запасной путь для старых браузеров / http
-                        const ta = document.createElement('textarea');
-                        ta.value = value;
-                        document.body.appendChild(ta);
-                        ta.select();
-                        document.execCommand('copy');
-                        ta.remove();
-                        done();
-                    });
-                } else {
-                    const ta = document.createElement('textarea');
-                    ta.value = value;
-                    document.body.appendChild(ta);
-                    ta.select();
-                    document.execCommand('copy');
-                    ta.remove();
-                    done();
-                }
+                copyToClipboard(value, done);
             });
         });
     }
@@ -7353,6 +7439,8 @@
                 html += '<div class="tp-hint">Данные ONU из GetOLT недоступны (нет доступа к плагину).</div>';
             }
             fillLazy(panel, 'equipment', html);
+            // Адрес OLT в блоке кликабелен — вешаем копирование после вставки
+            bindCopyTargets(panel);
         });
 
         // Radius Logs > mode=errors, все окна за 24 ч по номеру договора.
