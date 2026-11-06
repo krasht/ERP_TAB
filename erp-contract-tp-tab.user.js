@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.1
+// @version      0.72.2
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.1';
+    const SELF_VERSION = '0.72.2';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -6642,11 +6642,19 @@
                     rank: r.kind === 'stat' ? Infinity : r.rank,
                     total: r.kind === 'stat' ? 0 : 1,
                     alive: (r.kind !== 'stat' && r.rank === 0) ? 1 : 0,
+                    // Признак «в этой строке есть пароль статистики» запоминаем
+                    // отдельно от rank. Раньше его выводили из rank === Infinity,
+                    // и на договорах, где пароль статистики СОВПАДАЕТ с PPPoE
+                    // (BILL0042493: оба 677048), склейка по значению подмешивала
+                    // rank живого сервиса — строка переставала быть «stat»,
+                    // блоку «Отправить на почту» было нечего взять, и в письме
+                    // под подписью «личный кабинет» стоял прочерк.
+                    isStat: r.kind === 'stat',
                 });
                 return;
             }
             if (r.name && prev.labels.indexOf(r.name) < 0) prev.labels.push(r.name);
-            if (r.kind === 'stat') return;
+            if (r.kind === 'stat') { prev.isStat = true; return; }
             prev.total += 1;
             if (r.rank === 0) prev.alive += 1;
             prev.rank = Math.min(prev.rank, r.rank);
@@ -6660,7 +6668,7 @@
             // Пароль статистики помечаем явно: по значению его не отличить
             // от пароля PPPoE (в биллинге они часто совпадают), а блоку
             // «Отправить на почту» нужно взять именно его.
-            kind: r.rank === Infinity ? 'stat' : 'svc',
+            kind: r.isStat ? 'stat' : 'svc',
             count: r.total > 1 ? { alive: r.alive, total: r.total } : null,
             value: r.value,
         }));
