@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.12
+// @version      0.72.13
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.12';
+    const SELF_VERSION = '0.72.13';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -129,6 +129,55 @@
     const MAIL_STORE_TO = 'erpTpMailTo';
 
     /**
+     * Сумма позиций состава тарифа, которые сняты с договора в абонплате.
+     *
+     * «Итого в месяц» ERP считает по ШАБЛОНУ тарифа: позиция остаётся в итоге,
+     * даже когда её сняли (на AV0000001 — «Публичный IP-адрес», 220.50 ₽).
+     * Сверяем строки тарифа с закрытыми услугами абонплаты и возвращаем сумму,
+     * которую из итога надо вычесть.
+     *
+     * Отдельная функция, а не общий paidItems: feeProfile объявлен ВЫШЕ объекта
+     * ERP и paidItems, поэтому вызывать их отсюда нельзя — получили бы
+     * «Cannot access before initialization» на первой же отрисовке.
+     */
+    function removedChargeSum(body, npayList) {
+        // Имена снятых услуг в том же виде, в каком их пишет состав тарифа
+        const norm = (raw) => String(raw || '')
+            .toLowerCase()
+            .replace(/\s*\(\s*[\d\s.,]+\s*руб\.?\s*\)/gi, '')
+            .replace(/^(?:бандл|доп|пакет|опция|услуга)\s*[·.:]\s*/i, '')
+            .replace(/[\u00a0]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const removed = new Set(
+            (npayList || [])
+                .filter((s) => s && s.closed)
+                .map((s) => norm(s.name))
+                .filter(Boolean)
+        );
+        if (!removed.size) return 0;
+
+        let sum = 0;
+        Array.from(body.querySelectorAll('table.sv-t')).forEach((table) => {
+            // Таблица «Фактически начислено» — не состав тарифа, пропускаем
+            const head = table.querySelector('tr');
+            if (head && /\d{4}-\d{2}/.test(head.innerText || '')) return;
+
+            table.querySelectorAll('tr').forEach((tr) => {
+                const tds = Array.from(tr.querySelectorAll('td'));
+                if (tds.length < 6) return;
+                const name = norm(tds[0].innerText);
+                if (!name || !removed.has(name)) return;
+                const pay = tds[5].innerText.replace(/[^\d.,-]/g, '').replace(',', '.');
+                const value = Number(pay);
+                if (Number.isFinite(value) && value > 0) sum += value;
+            });
+        });
+        return Number(sum.toFixed(2));
+    }
+
+    /**
      * Абонплата договора в двух видах: в месяц и в день.
      *
      * Доверительный платёж считается по ДНЕВНОЙ абонплате: биллинг понижает лимит
@@ -149,8 +198,8 @@
      * Если разобрать дни не удалось (новый договор, пустая история) — откат
      * на месячную сумму из «Итого в месяц», делённую на дни месяца.
      */
-    async function feeProfile(contractId) {
-        const empty = { perDay: 0, perMonth: 0, source: '' };
+    async function feeProfile(contractId, npayList) {
+        const empty = { perDay: 0, perMonth: 0, source: '', removedSum: 0 };
         try {
             const html = await fetchText(`/user/plugin/dogovor/stoimost.do?billingId=bill&contractId=${contractId}`);
             const body = parseHtml(html);
@@ -167,6 +216,24 @@
                     const value = Number(nums[nums.length - 1]);
                     if (Number.isFinite(value) && value > 0) perMonth = value;
                 }
+            }
+
+            // ---- снятые позиции вычитаем
+            //
+            // «Итого в месяц» считается по шаблону тарифа и включает услуги,
+            // которых на договоре уже нет: на AV0000001 это «Публичный IP-адрес»
+            // (220.50 ₽), снятый в npay. Доверительный платёж по такой сумме
+            // завышал бы норму на 7.35 ₽/день — оператор вносил бы деньги
+            // за услугу, которая не начисляется.
+            let removedSum = 0;
+            if ((npayList || []).some((s) => s && s.closed)) {
+                removedSum = removedChargeSum(body, npayList);
+            }
+            if (removedSum > 0 && perMonth > removedSum) {
+                perMonth = Number((perMonth - removedSum).toFixed(2));
+            } else if (removedSum > 0) {
+                // Вычет больше итога — значит «Итого» уже без этой позиции
+                removedSum = 0;
             }
 
             // ---- дневная абонплата: месячная сумма / 30
@@ -2416,7 +2483,11 @@
                 const k = n.toLowerCase();
                 let item = byKey.get(k);
                 if (!item) {
-                    item = { name: n, period: '', closed: false };
+                    // connected — позиция реально стоит на договоре (в справочнике
+                    // её может не быть и наоборот). open — есть строка без даты
+                    // окончания. Итоговый closed считаем в конце: позиция снята,
+                    // только если она была подключена и ни одна её строка не открыта.
+                    item = { name: n, period: '', closed: false, connected: false, open: false };
                     byKey.set(k, item);
                     out.push(item);
                 }
@@ -2425,7 +2496,11 @@
                 // период оставался пустым и «подключена» определить было нельзя.
                 if (period) {
                     item.period = period;
-                    item.closed = /-\s*\d{2}\.\d{2}\.\d{4}/.test(period);
+                    item.connected = true;
+                    // «05.11.2026 - 06.11.2026» — закрыта, «26.10.2026 -» — действует.
+                    // Открытая строка перебивает закрытые: у услуги бывает история
+                    // снятий и одно текущее подключение.
+                    if (!/-\s*\d{2}\.\d{2}\.\d{4}/.test(period)) item.open = true;
                 }
                 return item;
             };
@@ -2464,6 +2539,13 @@
                     });
                 } catch (e) { /* справочник уже собран */ }
             }
+
+            // Итоговый признак: снята — значит была подключена и ни одна строка
+            // не открыта. Услуга только из справочника (никогда не стояла на
+            // договоре) тоже считается снятой: платить за неё нечего.
+            out.forEach((item) => {
+                item.closed = item.connected && !item.open;
+            });
 
             return out;
         },
@@ -3165,6 +3247,10 @@
         }
         .tp-pay-row:last-child { border-bottom: 0; }
         .tp-pay-row.is-free .tp-pay-sum { color: var(--tp-fg3); }
+        /* Позиция в шаблоне тарифа есть, но с договора снята: сумма не действует.
+           Приглушаем и зачёркиваем название — как в «Стоимости» у снятых услуг. */
+        .tp-pay-row.is-removed .tp-pay-name { color: var(--tp-fg3); text-decoration: line-through; }
+        .tp-pay-row.is-removed .tp-pay-sum { color: var(--tp-fg3); font-weight: 500; }
         .tp-pay-name { color: var(--tp-fg); min-width: 0; }
         .tp-pay-sum { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
         .tp-period-total {
@@ -7703,7 +7789,15 @@
 
         // Абонплата нужна и состоянию связи (прогноз блокировки), и доверительному платежу.
         // Берём один раз, чтобы не дёргать stoimost.do дважды.
-        const feePromise = feeProfile(id).catch(() => ({ perDay: 0, perMonth: 0, source: '' }));
+        //
+        // npay — чтобы вычесть из «Итого в месяц» снятые услуги: ERP считает
+        // итог по шаблону тарифа и оставляет в нём позицию, которую с договора
+        // уже убрали. Идём через общий кэш панели: тот же список нужен блоку
+        // «Тариф» и «Разовым услугам».
+        const npayOnce = () => erpOnce(panel, 'npay', () => ERP.npayServices(id).catch(() => []));
+        const feePromise = npayOnce()
+            .then((npayList) => feeProfile(id, npayList))
+            .catch(() => ({ perDay: 0, perMonth: 0, source: '', removedSum: 0 }));
 
         /*
          * Общие промисы на одну отрисовку.
@@ -7844,7 +7938,7 @@
             erpOnce(panel, 'cost', () => ERP.cost(id)),
             erpOnce(panel, 'tariffOptions', () => ERP.tariffOptions(id)),
             feePromise,
-            erpOnce(panel, 'npay', () => ERP.npayServices(id).catch(() => [])),
+            npayOnce(),
         ]), ([cost, options, fee, npayList]) => {
             const card = panel.querySelector('.tp-lazy[data-lazy="tariff"]');
             if (!card) return;
@@ -8268,19 +8362,42 @@
      * (доступ к ИТ-инфраструктуре, абонплата за скорость, публичный IP и т. д.).
      * Приводим их к плоскому списку: название, количество, цена, сумма к оплате.
      */
-    function paidItems(cost) {
+    /**
+     * Строки «Стоимости» — это и есть то, за что платит абонент
+     * (доступ к ИТ-инфраструктуре, абонплата за скорость, публичный IP и т. д.).
+     * Приводим их к плоскому списку: название, количество, цена, сумма к оплате.
+     *
+     * npayList — подключённые услуги абонплаты. Состав тарифа показывает позиции
+     * из ШАБЛОНА тарифа, независимо от того, стоит ли услуга на договоре сейчас.
+     * На AV0000001 «Публичный IP-адрес» был снят (в npay две закрытые записи),
+     * но в «За что платит» висел с суммой 220.50 ₽ — оператор считал, что абонент
+     * платит за адрес, которого у него нет. Поэтому сверяем с npay и помечаем
+     * такие строки как снятые.
+     */
+    function paidItems(cost, npayList) {
+        // Услуги абонплаты, снятые с договора (есть запись, но ни одна не открыта)
+        const removed = new Set(
+            (npayList || [])
+                .filter((s) => s && s.closed)
+                .map((s) => normServiceName(s.name))
+                .filter(Boolean)
+        );
+
         const out = [];
         ((cost && cost.groups) || []).forEach((g) => {
             (g.items || []).forEach((i) => {
                 const pay = toNum(i.pay);
                 const sum = toNum(i.sum);
+                const name = String(i.service || '');
                 out.push({
                     group: g.name,
-                    service: i.service,
+                    service: name,
                     qty: i.qty,
                     price: i.price,
                     pay: Number.isFinite(pay) ? pay : (Number.isFinite(sum) ? sum : 0),
                     included: !(Number.isFinite(pay) ? pay > 0 : Number.isFinite(sum) && sum > 0),
+                    // Снято с договора, хотя в шаблоне тарифа ещё есть
+                    removed: removed.has(normServiceName(name)),
                 });
             });
         });
@@ -8433,7 +8550,7 @@
         const planName = (((tariff && tariff.plans) || [])[0] || '').replace(/\s*\(.*\)\s*$/, '');
         const payTotal = ((cost && cost.total && cost.total.pay) || '').replace(/[^\d.,-]/g, '');
         const payPrice = ((cost && cost.total && cost.total.price) || '').replace(/[^\d.,-]/g, '');
-        const items = paidItems(cost);
+        const items = paidItems(cost, ctx && ctx.npayList);
         const bare = !!(ctx && ctx.bare);
 
         // Закрывающий </div> в конце функции общий для обоих вариантов.
@@ -8481,12 +8598,28 @@
         } else {
             html += '<div class="tp-pay">';
             items.forEach((i) => {
-                html += `<div class="tp-pay-row${i.included ? ' is-free' : ''}">
+                // Снятая с договора позиция: сумма не действует, поэтому вместо
+                // неё — пометка. Иначе оператор читает «220.50 ₽» как текущую плату.
+                const removed = !!i.removed;
+                const cls = removed ? ' is-removed' : (i.included ? ' is-free' : '');
+                html += `<div class="tp-pay-row${cls}">
                     <span class="tp-pay-name">${esc(cleanServiceName(i.service))}${Number(i.qty) > 1 ? ` <span class="tp-chip is-xs">×${esc(i.qty)}</span>` : ''}</span>
-                    <span class="tp-pay-sum">${i.included ? 'включено' : esc(fmt(i.pay)) + ' ₽'}</span>
+                    <span class="tp-pay-sum">${removed ? 'снято'
+                        : (i.included ? 'включено' : esc(fmt(i.pay)) + ' ₽')}</span>
                 </div>`;
             });
             html += '</div>';
+
+            // Итог тарифа считается по шаблону и снятые позиции в него входят.
+            // Говорим об этом прямо: иначе сумма сверху не сходится со списком.
+            const removedItems = items.filter((i) => i.removed);
+            if (removedItems.length) {
+                const removedSum = removedItems.reduce((s, i) => s + (Number(i.pay) || 0), 0);
+                html += `<div class="tp-hint" style="padding-top:2px">`
+                    + `Снято с договора: ${esc(removedItems.map((i) => cleanServiceName(i.service)).join(', '))}`
+                    + `${removedSum > 0 ? ` · ${esc(fmt(removedSum))} ₽ в итоге тарифа не действуют` : ''}.`
+                    + '</div>';
+            }
         }
         html += '</div>';
 
@@ -8807,10 +8940,13 @@
             msg.textContent = 'Считаю и отправляю…';
 
             try {
-                // Пересчёт «на лету»: остаток и лимит могли измениться после отрисовки карточки
-                const [bal, lim, fee] = await Promise.all([
-                    ERP.balance(id), ERP.limitInfo(id), feeProfile(id),
+                // Пересчёт «на лету»: остаток и лимит могли измениться после отрисовки карточки.
+                // npay нужен, чтобы вычесть снятые услуги из абонплаты — иначе платёж
+                // считался бы по шаблону тарифа, включая уже отключённые позиции.
+                const [bal, lim, npayList] = await Promise.all([
+                    ERP.balance(id), ERP.limitInfo(id), ERP.npayServices(id).catch(() => []),
                 ]);
+                const fee = await feeProfile(id, npayList);
                 const out = (bal && bal.out != null) ? toNum(bal.out) : NaN;
                 const limit = (lim && lim.limit != null && String(lim.limit).trim() !== '') ? toNum(lim.limit) : NaN;
                 const daysNum = Number(days);
