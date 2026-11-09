@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.24
+// @version      0.72.25
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.24';
+    const SELF_VERSION = '0.72.25';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1564,6 +1564,7 @@
                             else if (n === 'статус') idx.status = i;
                             else if (n === 'описание') idx.desc = i;
                             else if (n === 'создан') idx.created = i;
+                            else if (n === 'закрыт') idx.closed = i;
                             else if (n === 'исполнители') idx.executor = i;
                             else if (n === 'кем создан') idx.creator = i;
                         });
@@ -1573,7 +1574,10 @@
                             return;
                         }
                         // Не заголовок (его может не быть) — работаем по умолчанию
-                        col = { id: 1, type: 3, status: 4, desc: 5, created: 11, executor: 13, creator: 14 };
+                        col = {
+                            id: 1, type: 3, status: 4, desc: 5,
+                            created: 11, closed: 12, executor: 13, creator: 14,
+                        };
                     }
 
                     const pid = cells[col.id === undefined ? 1 : col.id];
@@ -1587,6 +1591,10 @@
                         status: cells[col.status] || '',
                         desc: cells[col.desc] || '',
                         created: cells[col.created] || '',
+                        // Дата закрытия нужна, чтобы считать «завершено сегодня».
+                        // Раньше колонка не читалась вовсе — r.closed был пустым,
+                        // и блок «Завершено сегодня» по операторам не появлялся.
+                        closed: col.closed === undefined ? '' : (cells[col.closed] || ''),
                         // Пустая ячейка = исполнителя нет
                         executor: cells[col.executor] || '',
                         creator: cells[col.creator] || '',
@@ -11455,26 +11463,28 @@
         // параметра «за сегодня» у очереди нет.
         const wantClosed = roles.isHead || !roles.known;
 
-        const [openMine, closedMine, ...rest] = await Promise.all([
+        // Запрашиваем очередь ОДИН раз: режим «все» включает и открытые,
+        // поэтому отдельный запрос с openClose=open — лишняя нагрузка на ERP.
+        // Раньше на каждую очередь уходило по два обхода страниц.
+        const [openMine, closedMine, ...queueAll] = await Promise.all([
             ERP.myProcesses({ open: true }).catch(() => ({ rows: [], total: 0 })),
             ERP.myProcesses({ open: false }).catch(() => ({ rows: [], total: 0 })),
-            ...queues.map((q) => ERP.queueRows(q).catch(() => ({ rows: [], total: 0 }))),
-            ...(wantClosed
-                ? queues.map((q) => ERP.queueRows(q, { openClose: '', maxPages: 6 })
-                    .catch(() => ({ rows: [], total: 0 })))
-                : []),
+            ...queues.map((q) => ERP.queueRows(q, {
+                // Руководителю нужны и закрытые за сегодня, оператору — только
+                // открытые: экономит запросы и не тянет историю впустую.
+                openClose: wantClosed ? '' : 'open',
+                maxPages: wantClosed ? 6 : 40,
+            }).catch(() => ({ rows: [], total: 0 }))),
         ]);
 
-        const queueData = rest.slice(0, queues.length);
-        const allData = rest.slice(queues.length);
+        // В режиме «все» строки содержат и закрытые — делим по статусу.
+        const queueData = queueAll.map((d) => ({
+            total: (d.rows || []).filter((r) => !/заверш|закрыт/i.test(r.status || '')).length,
+            rows: (d.rows || []).filter((r) => !/заверш|закрыт/i.test(r.status || '')),
+        }));
+        const allData = queueAll;
 
         const mineOpen = (openMine.rows || []);
-
-        // Закрытые сегодня — по дате закрытия, а не по статусу
-        const doneToday = (closedMine.rows || []).filter((p) => {
-            const d = String(p.closed || '').trim();
-            return d.startsWith(today);
-        }).length;
 
         const queueInfo = queues.map((id, i) => {
             const rows = (queueData[i] && queueData[i].rows) || [];
@@ -11555,6 +11565,23 @@
 
         // Мои непринятые: открытые процессы на мне, которые ещё «Новый»
         const mineNew = mineOpen.filter((p) => /нов(ый|ые)/i.test(p.status || '')).length;
+
+        // «Завершено сегодня» — по очередям, а не по «Моим процессам».
+        //
+        // Раньше считалось только личное: у руководителя счётчик показывал 0,
+        // хотя его операторы закрыли за день десяток процессов. У оператора
+        // цифра та же, потому что в его очередь попадают только его процессы.
+        // ID в наборе — чтобы процесс не посчитался дважды, если он есть
+        // и в очереди, и в «Моих процессах».
+        const doneIds = new Set();
+        queueInfo.forEach((q) => {
+            (q.closedRows || []).forEach((r) => doneIds.add(String(r.id)));
+        });
+        (closedMine.rows || []).forEach((p) => {
+            const d = String(p.closed || '').trim();
+            if (d.startsWith(today)) doneIds.add(String(p.id));
+        });
+        const doneToday = doneIds.size;
 
         return {
             inWork,
@@ -11770,7 +11797,6 @@
                 } else {
                     html += '<div class="tp-proc-hint">Открытых процессов нет.</div>';
                 }
-
                 // Закрытые сегодня по операторам. Очередь с openClose=open
                 // отдаёт только открытые, поэтому при пустой очереди руководитель
                 // видел «Открытых процессов нет» и не понимал, кто работал.
