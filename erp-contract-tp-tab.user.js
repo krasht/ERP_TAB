@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.25
+// @version      0.72.26
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.25';
+    const SELF_VERSION = '0.72.26';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1656,30 +1656,51 @@
          *
          * Возвращает { ids:Set<number>, isHead, isHeadB2c, isHeadB2b, isSupport, known }.
          */
-        async myRoles(processId) {
+        async myRoles(processIds) {
             const empty = {
                 ids: new Set(), isHead: false, isHeadB2c: false, isHeadB2b: false,
                 isSupport: false, isAdmin: false, known: false,
             };
-            if (!processId) return empty;
-            let html = '';
-            try {
-                html = await fetchText('/user/process.do?method=processGroupsEdit'
-                    + `&id=${encodeURIComponent(processId)}`);
-            } catch (e) {
-                return empty;
-            }
-            const m = html.match(/const source = (\[[\s\S]*?\]);/);
-            if (!m) return empty;
 
+            // Принимаем и один id, и массив: роли нужно читать с процессов
+            // РАЗНЫХ типов, см. ниже.
+            const list = (Array.isArray(processIds) ? processIds : [processIds])
+                .map((v) => String(v || '').trim())
+                .filter((v) => /^\d+$/.test(v));
+            if (!list.length) return empty;
+
+            /*
+             * ВАЖНО: source зависит от ТИПА процесса, а не только от прав.
+             *
+             * Проверено на живой базе: у пользователя с обеими ролями
+             * руководителя процесс «ТП B2C» (19437) отдаёт [1, 80], а
+             * «ТП B2B/Smart» (19438) — [1, 79, 52]. То есть один процесс
+             * показывает только роли СВОЕГО направления, и по одному процессу
+             * нельзя понять, есть ли вторая роль.
+             *
+             * Поэтому читаем роли с процессов разных типов и объединяем.
+             * Панель передаёт сюда по одному процессу из каждой доступной
+             * очереди (54 и 55) — тогда видны обе роли.
+             */
             const ids = new Set();
-            try {
-                (JSON.parse(m[1]) || []).forEach((o) => {
-                    // id вида «80:0» — группа и роль через двоеточие
-                    const gid = String((o && o.id) || '').split(':')[0];
-                    if (/^\d+$/.test(gid)) ids.add(Number(gid));
-                });
-            } catch (e) { /* разметка изменилась — считаем роли неизвестными */ }
+            for (let i = 0; i < list.length; i += 1) {
+                let html = '';
+                try {
+                    html = await fetchText('/user/process.do?method=processGroupsEdit'
+                        + `&id=${encodeURIComponent(list[i])}`);
+                } catch (e) {
+                    continue; // процесс недоступен — пробуем следующий
+                }
+                const m = html.match(/const source = (\[[\s\S]*?\]);/);
+                if (!m) continue;
+                try {
+                    (JSON.parse(m[1]) || []).forEach((o) => {
+                        // id вида «80:0» — группа и роль через двоеточие
+                        const gid = String((o && o.id) || '').split(':')[0];
+                        if (/^\d+$/.test(gid)) ids.add(Number(gid));
+                    });
+                } catch (e) { /* разметка изменилась — пропускаем процесс */ }
+            }
 
             if (!ids.size) return empty;
             const has = (n) => ids.has(n);
@@ -10732,6 +10753,12 @@
             color: var(--hint-color, rgba(29,29,31,.5));
             white-space: nowrap;
         }
+        /* «моих N» — только когда цифры отдела и личные различаются */
+        .tp-proc-mine {
+            font-size: 8.5px; color: var(--hint-color, rgba(29,29,31,.45));
+            white-space: nowrap; line-height: 1;
+        }
+        .tp-proc-mine[hidden] { display: none; }
         /* Внимание требует акцентного цвета. В теме ERP переменной
            --warning-color нет, поэтому задаём свой: тёмный янтарный на светлом
            фоне и светлый на тёмном — иначе на #101b2d он проваливается. */
@@ -11405,6 +11432,10 @@
         seenIds: null,
         data: null,
         open: false,
+        // Раскрытое состояние восстановлено из localStorage (один раз)
+        openRestored: false,
+        // ФИО текущего пользователя из шапки ERP — для «мои / отдела»
+        myName: '',
         toastTimers: new Map(),
     };
 
@@ -11485,6 +11516,16 @@
         const allData = queueAll;
 
         const mineOpen = (openMine.rows || []);
+
+        // Имя текущего пользователя — нужно, чтобы отделить «мои» процессы
+        // от «отдела»: в очереди исполнитель записан строкой, ID там нет.
+        // Берём из шапки ERP (ссылка .profile), а если не нашли — из localStorage
+        // входа, который уже хранит логин.
+        if (!processPanel.myName) {
+            const prof = document.querySelector('#head .profile');
+            const name = prof ? prof.textContent.replace(/\s+/g, ' ').trim() : '';
+            if (name) processPanel.myName = name;
+        }
 
         const queueInfo = queues.map((id, i) => {
             const rows = (queueData[i] && queueData[i].rows) || [];
@@ -11583,10 +11624,40 @@
         });
         const doneToday = doneIds.size;
 
+        // «Моё» отдельно от «отдела».
+        //
+        // Руководителю важно видеть свою загрузку на фоне общей: цифра «2»
+        // без пояснения не говорит, его это процессы или чужие. У оператора
+        // обе цифры совпадают, поэтому в подписи показываем «из них моих»
+        // только когда они различаются — лишний шум не нужен.
+        const myInWork = mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
+        const myDoneIds = new Set();
+        (closedMine.rows || []).forEach((p) => {
+            const d = String(p.closed || '').trim();
+            if (d.startsWith(today)) myDoneIds.add(String(p.id));
+        });
+        // Процессы из очереди, где я в исполнителях
+        const myName = processPanel.myName || '';
+        if (myName) {
+            queueInfo.forEach((q) => {
+                q.rows.forEach((r) => {
+                    if (/в работе/i.test(r.status || '')
+                        && String(r.executor || '').includes(myName)) {
+                        myDoneIds.add(String(r.id));
+                    }
+                });
+                (q.closedRows || []).forEach((r) => {
+                    if (String(r.executor || '').includes(myName)) myDoneIds.add(String(r.id));
+                });
+            });
+        }
+
         return {
             inWork,
+            myInWork,
             unhandled: queueInfo.reduce((s, q) => s + q.unassigned, 0) + mineNew,
             doneToday,
+            myDone: myDoneIds.size,
             queues: queueInfo,
             mine: mineOpen,
             roles,
@@ -11612,14 +11683,17 @@
                 <span class="tp-proc-item" data-k="inwork">
                     <span class="tp-proc-num">0</span>
                     <span class="tp-proc-lbl">в работе</span>
+                    <span class="tp-proc-mine" hidden></span>
                 </span>
                 <span class="tp-proc-item" data-k="unhandled">
                     <span class="tp-proc-num">0</span>
                     <span class="tp-proc-lbl">не отработаны</span>
+                    <span class="tp-proc-mine" hidden></span>
                 </span>
                 <span class="tp-proc-item" data-k="done">
                     <span class="tp-proc-num">0</span>
                     <span class="tp-proc-lbl">завершено</span>
+                    <span class="tp-proc-mine" hidden></span>
                 </span>
             </button>
             <div class="tp-proc-drop" hidden>
@@ -11662,7 +11736,7 @@
     function procRenderCounters(data) {
         const box = document.querySelector('.tp-proc-panel');
         if (!box || !data) return;
-        const set = (key, value, isBad) => {
+        const set = (key, value, isBad, mine, total, mineTitle, totalTitle) => {
             const item = box.querySelector(`.tp-proc-item[data-k="${key}"]`);
             if (!item) return;
             const num = item.querySelector('.tp-proc-num');
@@ -11670,13 +11744,27 @@
             if (num.textContent !== text) num.textContent = text;
             const bad = !!isBad && Number(value) > 0;
             if (item.classList.contains('is-on') !== bad) item.classList.toggle('is-on', bad);
-            item.title = key === 'inwork' ? 'В работе у меня'
-                : key === 'unhandled' ? 'Не распределено в очередях + мои непринятые'
-                    : 'Завершено мной сегодня';
+
+            // «из них моих» показываем только когда цифры различаются:
+            // у оператора они всегда совпадают, и подпись была бы шумом.
+            const mineEl = item.querySelector('.tp-proc-mine');
+            if (mineEl) {
+                const show = Number.isFinite(mine) && Number.isFinite(total)
+                    && mine !== total && total > 0;
+                const txt = show ? `моих ${mine}` : '';
+                if (mineEl.textContent !== txt) mineEl.textContent = txt;
+                if (mineEl.hidden !== !show) mineEl.hidden = !show;
+            }
+
+            item.title = Number.isFinite(mine) && Number.isFinite(total)
+                ? `${totalTitle} · всего ${total}, из них моих ${mine}`
+                : totalTitle;
         };
-        set('inwork', data.inWork, false);
-        set('unhandled', data.unhandled, true);
-        set('done', data.doneToday, false);
+        set('inwork', data.inWork, false, data.myInWork, data.inWork,
+            'В работе у меня', 'Процессы в работе');
+        set('unhandled', data.unhandled, true, null, null, '', 'Не распределено в очередях + мои непринятые');
+        set('done', data.doneToday, false, data.myDone, data.doneToday,
+            'Завершено мной сегодня', 'Завершено сегодня по отделу');
     }
 
     /**
@@ -11687,7 +11775,7 @@
      * Карточка живёт внутри .tp-proc-panel, поэтому закрывается кликом
      * в любом другом месте шапки.
      */
-    function procTogglePanel(box) {
+    function procTogglePanel(box, silent) {
         const drop = box.querySelector('.tp-proc-drop');
         if (!drop) return;
 
@@ -11695,6 +11783,9 @@
             drop.hidden = true;
             processPanel.open = false;
             box.classList.remove('is-open');
+            // Запоминаем, что оператор свернул панель: при следующей загрузке
+            // страницы она не должна раскрываться сама.
+            if (!silent) procStoreOpen(false);
             return;
         }
 
@@ -11702,6 +11793,18 @@
         box.classList.add('is-open');
         drop.hidden = false;
         procRenderCard(drop, processPanel.data);
+        if (!silent) procStoreOpen(true);
+    }
+
+    /** Запоминание раскрытого состояния между перезагрузками. */
+    const PROC_OPEN_KEY = 'erpTpProcOpen';
+
+    function procStoreOpen(value) {
+        try { window.localStorage.setItem(PROC_OPEN_KEY, value ? '1' : '0'); } catch (e) { /* приватный режим */ }
+    }
+
+    function procReadOpen() {
+        try { return window.localStorage.getItem(PROC_OPEN_KEY) === '1'; } catch (e) { return false; }
     }
 
     /** Служебный контейнер не нужен: карточка живёт внутри панели. */
@@ -12008,38 +12111,34 @@
         // с ролью руководителя. Проверено: ЗАКРЫТЫЕ процессы отдают тот же
         // source с ролями (19414 → [1, 80]), поэтому они тоже годятся.
         if (!processPanel.roles) {
-            let anchor = '';
+            // Якоря собираем с РАЗНЫХ очередей: source отдаёт только роли
+            // своего направления, и по одному процессу вторая роль не видна.
+            const anchors = [];
 
             // 1) из адреса: оператор как раз смотрит карточку процесса
             const hashPid = (String(location.hash || '').match(/^#(\d+)$/) || [])[1] || '';
-            if (hashPid) anchor = hashPid;
+            if (hashPid) anchors.push(hashPid);
 
-            // 2) мои открытые, затем мои закрытые
-            if (!anchor) {
+            // 2) мои открытые и закрытые
+            try {
+                const mine = await ERP.myProcesses({ open: true });
+                if (mine.rows[0]) anchors.push(mine.rows[0].id);
+            } catch (e) { /* пробуем дальше */ }
+            try {
+                const mine = await ERP.myProcesses({ open: false, pageSize: 50 });
+                if (mine.rows[0]) anchors.push(mine.rows[0].id);
+            } catch (e) { /* пробуем дальше */ }
+
+            // 3) по одному процессу из КАЖДОЙ очереди — это и даёт обе роли.
+            //    Очередь может быть пуста по открытым, поэтому смотрим «все».
+            for (const qid of [PROC_QUEUE_B2C, PROC_QUEUE_B2B]) {
                 try {
-                    const mine = await ERP.myProcesses({ open: true });
-                    anchor = (mine.rows[0] || {}).id || '';
-                } catch (e) { /* пробуем дальше */ }
-            }
-            if (!anchor) {
-                try {
-                    const mine = await ERP.myProcesses({ open: false, pageSize: 50 });
-                    anchor = (mine.rows[0] || {}).id || '';
-                } catch (e) { /* пробуем дальше */ }
+                    const q = await ERP.queueRows(qid, { openClose: '', maxPages: 1 });
+                    if (q.rows[0]) anchors.push(q.rows[0].id);
+                } catch (e) { /* следующая очередь */ }
             }
 
-            // 3) любая доступная очередь
-            if (!anchor) {
-                for (const qid of [PROC_QUEUE_B2C, PROC_QUEUE_B2B]) {
-                    if (anchor) break;
-                    try {
-                        const q = await ERP.queueRows(qid, { maxPages: 1 });
-                        anchor = (q.rows[0] || {}).id || '';
-                    } catch (e) { /* следующая очередь */ }
-                }
-            }
-
-            processPanel.roles = await ERP.myRoles(anchor);
+            processPanel.roles = await ERP.myRoles(anchors);
         }
 
         let data = null;
@@ -12053,6 +12152,18 @@
         procRenderCounters(data);
 
         const drop = document.querySelector('.tp-proc-panel .tp-proc-drop');
+
+        // Первый запуск: если оператор оставлял панель раскрытой, раскрываем
+        // снова. Дальше состоянием управляет только клик — иначе закрытую
+        // панель открывало бы каждое автообновление.
+        if (!processPanel.open && !processPanel.openRestored) {
+            processPanel.openRestored = true;
+            if (procReadOpen()) {
+                const box = document.querySelector('.tp-proc-panel');
+                if (box) procTogglePanel(box, true);
+            }
+        }
+
         if (drop && processPanel.open) procRenderCard(drop, data);
 
         // Уведомления: только для руководителей, только по своей линии
