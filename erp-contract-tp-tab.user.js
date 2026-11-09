@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.22
+// @version      0.72.23
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.22';
+    const SELF_VERSION = '0.72.23';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11637,13 +11637,19 @@
             <div><b>${data.doneToday}</b><span>завершено сегодня</span></div>
         </div>`;
 
-        // Разбивка по операторам — только руководителям
-        const visible = roles.isHead
-            ? (data.queues || []).filter((q) => (q.id === PROC_QUEUE_B2C && roles.isHeadB2c)
+        // Разбивка по операторам — руководителям. Если роль определить не
+        // удалось (known=false), показываем то, что доступно: скрывать данные
+        // из-за неудачного запроса ролей — хуже, чем показать лишнее. Раньше
+        // оператор с ролью руководителя видел вместо списка подсказку
+        // «доступна руководителям», потому что якорный процесс не нашёлся.
+        const canSee = roles.isHead || !roles.known;
+        const visible = canSee
+            ? (data.queues || []).filter((q) => !roles.known
+                || (q.id === PROC_QUEUE_B2C && roles.isHeadB2c)
                 || (q.id === PROC_QUEUE_B2B && roles.isHeadB2b))
             : [];
 
-        if (!roles.isHead) {
+        if (!canSee) {
             html += '<div class="tp-proc-hint">Подробная разбивка доступна руководителям направления.</div>';
         } else if (!visible.length) {
             html += '<div class="tp-proc-hint">Нет доступных очередей второй линии.</div>';
@@ -11892,19 +11898,45 @@
         procMountHeadButton();
         procMountLayer();
 
-        // Роли читаем один раз за сессию: они не меняются без перелогина
+        // Роли читаем один раз за сессию: они не меняются без перелогина.
+        //
+        // Якорь (любой процесс, где виден редактор групп) ищем по цепочке,
+        // потому что открытых процессов у оператора может не быть вовсе —
+        // и панель показывала «разбивка доступна руководителям» человеку
+        // с ролью руководителя. Проверено: ЗАКРЫТЫЕ процессы отдают тот же
+        // source с ролями (19414 → [1, 80]), поэтому они тоже годятся.
         if (!processPanel.roles) {
             let anchor = '';
-            try {
-                const mine = await ERP.myProcesses({ open: true });
-                anchor = (mine.rows[0] || {}).id || '';
-            } catch (e) { /* ниже попробуем через очередь */ }
+
+            // 1) из адреса: оператор как раз смотрит карточку процесса
+            const hashPid = (String(location.hash || '').match(/^#(\d+)$/) || [])[1] || '';
+            if (hashPid) anchor = hashPid;
+
+            // 2) мои открытые, затем мои закрытые
             if (!anchor) {
                 try {
-                    const q = await ERP.queueRows(PROC_QUEUE_B2C, { maxPages: 1 });
-                    anchor = (q.rows[0] || {}).id || '';
-                } catch (e) { /* роли останутся неизвестными */ }
+                    const mine = await ERP.myProcesses({ open: true });
+                    anchor = (mine.rows[0] || {}).id || '';
+                } catch (e) { /* пробуем дальше */ }
             }
+            if (!anchor) {
+                try {
+                    const mine = await ERP.myProcesses({ open: false, pageSize: 50 });
+                    anchor = (mine.rows[0] || {}).id || '';
+                } catch (e) { /* пробуем дальше */ }
+            }
+
+            // 3) любая доступная очередь
+            if (!anchor) {
+                for (const qid of [PROC_QUEUE_B2C, PROC_QUEUE_B2B]) {
+                    if (anchor) break;
+                    try {
+                        const q = await ERP.queueRows(qid, { maxPages: 1 });
+                        anchor = (q.rows[0] || {}).id || '';
+                    } catch (e) { /* следующая очередь */ }
+                }
+            }
+
             processPanel.roles = await ERP.myRoles(anchor);
         }
 
