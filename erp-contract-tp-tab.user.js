@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.37
+// @version      0.72.38
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.37';
+    const SELF_VERSION = '0.72.38';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11802,6 +11802,14 @@
         return document.querySelector('.tp-pp-panel');
     }
 
+    /** Я ли исполнитель этой строки (ФИО из шапки ERP). */
+    function isMine(executor) {
+        const me = processPanel.myName || '';
+        if (!me) return false;
+        // У процесса бывает несколько исполнителей через запятую
+        return String(executor || '').split(/\s*,\s*/).some((n) => n.trim() === me);
+    }
+
     /** Содержимое выпадающего списка: сводка и разбивка по операторам. */
     function procRenderCard(card, data) {
         const body = card.querySelector('.tp-pp-drop-body');
@@ -11874,6 +11882,16 @@
                 ordered.slice(0, 30).forEach((r) => {
                     const free = !r.executor;
                     const isWork = /в работе/i.test(r.status || '');
+                    // «Принять в работу» нужно в двух случаях:
+                    //   • исполнителя нет — процесс висит в очереди;
+                    //   • исполнитель Я, но статус ещё «Новый» — процесс уже мой,
+                    //     однако в работу не взят. Раньше кнопка показывалась
+                    //     только для пустых «Исполнителей», и оператор, которого
+                    //     назначили заранее, оставался без кнопки: статус
+                    //     «Новый», а принять нечем.
+                    const mineNew = !free && !isWork && isMine(r.executor)
+                        && /нов(ый|ые)/i.test(r.status || '');
+                    const canTake = free || mineNew;
                     const stateCls = free ? ' is-free' : (isWork ? ' is-work' : ' is-wait');
                     const who = free ? 'не распределён' : r.executor;
                     html += `<div class="tp-pp-row${stateCls}">
@@ -11881,7 +11899,7 @@
                            title="Открыть процесс">#${esc(r.id)}</a>
                         <span class="tp-pp-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
                         <span class="tp-pp-who" title="${esc(who)}">${esc(who)}</span>
-                        ${free
+                        ${canTake
                             ? `<button type="button" class="tp-pp-take"
                                     data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
                             : `<span class="tp-pp-state">${esc(r.status || '')}</span>`}
