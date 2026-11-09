@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.38
+// @version      0.72.39
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.38';
+    const SELF_VERSION = '0.72.39';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11450,16 +11450,21 @@
     /**
      * Какие очереди нужны этому пользователю.
      *
-     * Руководитель B2C видит очередь 54, B2B — 55. Оператору очередь нужна
-     * только чтобы посчитать «не отработаны» по своей линии; если роли
-     * неизвестны (редактор групп недоступен), показываем обе — лишний запрос
-     * дешевле, чем пустая панель.
+     * Руководитель B2C видит очередь 54, B2B — 55.
+     *
+     * ОПЕРАТОРУ очередь не нужна вовсе: он работает только со своими
+     * процессами из «Моих процессов» и не должен видеть чужие. Пустой
+     * массив — значит «очередь не запрашиваем».
+     *
+     * Если роли неизвестны (редактор групп недоступен), показываем обе:
+     * лишний запрос дешевле, чем пустая панель у руководителя.
      */
     function procQueues(roles) {
         const r = roles || {};
         if (r.isHeadB2c && !r.isHeadB2b) return [PROC_QUEUE_B2C];
         if (r.isHeadB2b && !r.isHeadB2c) return [PROC_QUEUE_B2B];
-        if (r.known) return [PROC_QUEUE_B2C, PROC_QUEUE_B2B];
+        if (r.isHead) return [PROC_QUEUE_B2C, PROC_QUEUE_B2B];
+        if (r.known) return [];          // оператор — только «Мои процессы»
         return [PROC_QUEUE_B2C, PROC_QUEUE_B2B];
     }
 
@@ -11826,6 +11831,48 @@
         // высоты и мешало читать главное — кто что делает.
         let html = '';
 
+        // ОПЕРАТОР (erp_role_support_b2c / b2b) видит только СВОИ процессы
+        // из «Моих процессов» и не видит очередь вовсе. Очередь — инструмент
+        // руководителя: там чужие процессы и кнопка «Принять» для любого.
+        // Оператор принимает свои процессы, и после принятия его сразу
+        // перекидывает в карточку.
+        const isOperator = !roles.isHead && roles.known;
+
+        if (isOperator) {
+            const mine = (data.mine || []).filter((p) => !/заверш|закрыт/i.test(p.status || ''));
+            const working = mine.filter((p) => /в работе/i.test(p.status || ''));
+            const fresh = mine.filter((p) => !/в работе/i.test(p.status || ''));
+
+            html += '<div class="tp-pp-queue">';
+            html += '<div class="tp-pp-queue-head"><span class="tp-pp-queue-name">Мои процессы</span></div>';
+
+            if (mine.length) {
+                html += '<div class="tp-pp-unassigned">';
+                working.concat(fresh).forEach((p) => {
+                    const isWork = /в работе/i.test(p.status || '');
+                    const isNew = /нов(ый|ые)/i.test(p.status || '');
+                    html += `<div class="tp-pp-row ${isWork ? 'is-work' : 'is-wait'}">
+                        <a href="#" class="tp-pp-id" data-pid="${esc(p.id)}"
+                           title="Открыть процесс">#${esc(p.id)}</a>
+                        <span class="tp-pp-desc" title="${esc(p.name)}">${esc(p.name || '—')}</span>
+                        <span class="tp-pp-who">${esc(p.type || '')}</span>
+                        ${isNew
+                            ? `<button type="button" class="tp-pp-take"
+                                    data-qid="" data-pid="${esc(p.id)}">Принять</button>`
+                            : `<span class="tp-pp-state">${esc(p.status || '')}</span>`}
+                    </div>`;
+                });
+                html += '</div>';
+            } else {
+                html += '<div class="tp-pp-hint">Открытых процессов нет.</div>';
+            }
+            html += '</div>';
+
+            body.innerHTML = html;
+            procBindCard(body);
+            return;
+        }
+
         // Разбивка по операторам — руководителям. Если роль определить не
         // удалось (known=false), показываем то, что доступно: скрывать данные
         // из-за неудачного запроса ролей — хуже, чем показать лишнее. Раньше
@@ -11963,7 +12010,19 @@
                 btn.disabled = true;
                 const old = btn.textContent;
                 btn.textContent = '…';
-                const res = await ERP.acceptProcess(qid, pid);
+
+                // У оператора очередь не запрашивается, поэтому qid пуст:
+                // принимаем процесс через «Мои процессы» — тот же processAction,
+                // но очередь определяем по ТИПУ процесса. Проверено: «ТП B2C»
+                // всегда лежит в 54, «ТП B2B/Smart» — в 55.
+                let queueId = qid;
+                if (!queueId) {
+                    const row = btn.closest('.tp-pp-row');
+                    const type = row ? (row.querySelector('.tp-pp-who') || {}).textContent || '' : '';
+                    queueId = /b2b|smart/i.test(type) ? PROC_QUEUE_B2B : PROC_QUEUE_B2C;
+                }
+
+                const res = await ERP.acceptProcess(queueId, pid);
                 if (res.ok) {
                     btn.textContent = 'Принят';
                     // Оператор ждёт продолжения работы: «Принять» — это первый
