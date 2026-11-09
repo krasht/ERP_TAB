@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.31
+// @version      0.72.32
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.31';
+    const SELF_VERSION = '0.72.32';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10753,12 +10753,6 @@
             color: var(--hint-color, rgba(29,29,31,.5));
             white-space: nowrap;
         }
-        /* «моих N» — только когда цифры отдела и личные различаются */
-        .tp-pp-mine {
-            font-size: 8.5px; color: var(--hint-color, rgba(29,29,31,.45));
-            white-space: nowrap; line-height: 1;
-        }
-        .tp-pp-mine[hidden] { display: none; }
         /* Внимание требует акцентного цвета. В теме ERP переменной
            --warning-color нет, поэтому задаём свой: тёмный янтарный на светлом
            фоне и светлый на тёмном — иначе на #101b2d он проваливается. */
@@ -11665,17 +11659,14 @@
                 <span class="tp-pp-item" data-k="inwork">
                     <span class="tp-pp-num">0</span>
                     <span class="tp-pp-lbl">в работе</span>
-                    <span class="tp-pp-mine" hidden></span>
                 </span>
                 <span class="tp-pp-item" data-k="unhandled">
                     <span class="tp-pp-num">0</span>
                     <span class="tp-pp-lbl">не отработаны</span>
-                    <span class="tp-pp-mine" hidden></span>
                 </span>
                 <span class="tp-pp-item" data-k="done">
                     <span class="tp-pp-num">0</span>
                     <span class="tp-pp-lbl">завершено</span>
-                    <span class="tp-pp-mine" hidden></span>
                 </span>
             </button>
             <div class="tp-pp-drop" hidden>
@@ -11727,17 +11718,9 @@
             const bad = !!isBad && Number(value) > 0;
             if (item.classList.contains('is-on') !== bad) item.classList.toggle('is-on', bad);
 
-            // «из них моих» показываем только когда цифры различаются:
-            // у оператора они всегда совпадают, и подпись была бы шумом.
-            const mineEl = item.querySelector('.tp-pp-mine');
-            if (mineEl) {
-                const show = Number.isFinite(mine) && Number.isFinite(total)
-                    && mine !== total && total > 0;
-                const txt = show ? `моих ${mine}` : '';
-                if (mineEl.textContent !== txt) mineEl.textContent = txt;
-                if (mineEl.hidden !== !show) mineEl.hidden = !show;
-            }
-
+            // Подпись «моих N» не показываем: на кнопке нужна одна понятная
+            // цифра. Разделение «мои / отдела» осталось в title — там оно
+            // не мешает и видно по наведению.
             item.title = Number.isFinite(mine) && Number.isFinite(total)
                 ? `${totalTitle} · всего ${total}, из них моих ${mine}`
                 : totalTitle;
