@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.18
+// @version      0.72.19
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.18';
+    const SELF_VERSION = '0.72.19';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1513,9 +1513,12 @@
          * на этом подсчёт по операторам разъезжался: 250 строк вместо 106,
          * «не распределено» 240 вместо 103.
          *
-         * Исполнитель — 13-я колонка (индекс 13): имя оператора либо пусто.
-         * Пусто = в «Исполнителях» никого нет, процесс не распределён.
-         * Это проверено на процессах 19437/19438 (пусто) и 19399 (назначен).
+         * Исполнитель ищется ПО ЗАГОЛОВКУ, а не по индексу: набор колонок у
+         * очередей разный. В 54 «Исполнители» — 12-я (18 колонок), в 55 —
+         * 13-я (20 колонок, лишние «Необходимо выполнить работы» и «Стоимость
+         * работ»). С фиксированным индексом 13 в очереди 54 читалась колонка
+         * «Кем создан» — поэтому процесс 19437 с пустыми «Исполнителями»
+         * выглядел распределённым, и панель писала «все распределены».
          *
          * Возвращает { rows, total }, где total — «Записей: N» (реальное число).
          */
@@ -1526,6 +1529,8 @@
             const rows = [];
             const seen = new Set();
             let total = 0;
+            // Индексы колонок определяем по заголовку таблицы (первая страница)
+            let col = null;
 
             for (let page = 1; page <= maxPages; page += 1) {
                 const url = '/user/process/queue.do?method=queueShow'
@@ -1543,21 +1548,45 @@
 
                 Array.from(body.querySelectorAll('table.data tr')).forEach((tr) => {
                     const tds = Array.from(tr.querySelectorAll('td'));
-                    if (tds.length < 14) return;
+                    if (tds.length < 10) return;
                     const cells = tds.map((td) => td.innerText.replace(/\s+/g, ' ').trim());
-                    if (!/^\d+$/.test(cells[1])) return;
+
+                    // Заголовок: раскладываем названия колонок по индексам
+                    if (!col) {
+                        const idx = {};
+                        cells.forEach((name, i) => {
+                            const n = name.toLowerCase();
+                            if (n === 'id') idx.id = i;
+                            else if (n === 'тип') idx.type = i;
+                            else if (n === 'статус') idx.status = i;
+                            else if (n === 'описание') idx.desc = i;
+                            else if (n === 'создан') idx.created = i;
+                            else if (n === 'исполнители') idx.executor = i;
+                            else if (n === 'кем создан') idx.creator = i;
+                        });
+                        // Заголовок нашли — дальше строки разбираем по нему
+                        if (idx.id !== undefined) {
+                            col = idx;
+                            return;
+                        }
+                        // Не заголовок (его может не быть) — работаем по умолчанию
+                        col = { id: 1, type: 3, status: 4, desc: 5, created: 11, executor: 13, creator: 14 };
+                    }
+
+                    const pid = cells[col.id === undefined ? 1 : col.id];
+                    if (!/^\d+$/.test(pid || '')) return;
                     onPage += 1;
-                    if (seen.has(cells[1])) return;
-                    seen.add(cells[1]);
+                    if (seen.has(pid)) return;
+                    seen.add(pid);
                     rows.push({
-                        id: cells[1],
-                        type: cells[3] || '',
-                        status: cells[4] || '',
-                        desc: cells[5] || '',
-                        created: cells[11] || '',
+                        id: pid,
+                        type: cells[col.type] || '',
+                        status: cells[col.status] || '',
+                        desc: cells[col.desc] || '',
+                        created: cells[col.created] || '',
                         // Пустая ячейка = исполнителя нет
-                        executor: cells[13] || '',
-                        creator: cells[14] || '',
+                        executor: cells[col.executor] || '',
+                        creator: cells[col.creator] || '',
                     });
                 });
 
@@ -10648,40 +10677,52 @@
      * вкладки «Для ТП» в этот момент ещё не вставлены.
      */
     const PROC_CSS = `
-        /* --- панель в шапке --- */
+        /* --- панель в шапке ---
+           Оформление намеренно повторяет родные кнопки ERP (.btn-white,
+           .btn-small): та же высота 35.6px, скругление, отступы и шрифт.
+           Своя рамка с тенью выглядела чужеродно рядом с иконками темы. */
         .tp-proc-panel {
-            display: inline-flex; align-items: stretch; vertical-align: middle;
-            margin-right: 8px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+            position: relative; display: inline-flex; align-items: stretch;
+            vertical-align: middle; margin-right: 6px;
+            font-family: inherit;
         }
         .tp-proc-main {
             display: inline-flex; align-items: stretch; gap: 0;
-            padding: 0; border: 1px solid rgba(0,0,0,.12); border-radius: 7px;
-            background: rgba(255,255,255,.72); cursor: pointer;
-            font: inherit; color: #1d1d1f; overflow: hidden;
+            height: 35.6px; box-sizing: border-box;
+            padding: 0 2px; margin: 0;
+            border: 1px solid rgba(0,0,0,.12); border-radius: 4px;
+            background: #fff; cursor: pointer;
+            font-family: inherit; font-size: 12px; color: #1d1d1f;
             transition: background .12s ease, border-color .12s ease;
         }
-        .tp-proc-main:hover { background: #fff; border-color: rgba(0,0,0,.2); }
-        .tp-proc-panel.is-open .tp-proc-main { background: #fff; border-color: rgba(0,122,255,.5); }
+        .tp-proc-main:hover { background: #f7f9fc; }
+        .tp-proc-panel.is-open .tp-proc-main {
+            background: #f7f9fc; border-color: rgba(0,0,0,.22);
+        }
         .tp-proc-item {
             display: flex; flex-direction: column; align-items: center; justify-content: center;
-            min-width: 54px; padding: 3px 8px; line-height: 1.1;
-            border-right: 1px solid rgba(0,0,0,.08);
+            min-width: 52px; padding: 0 7px; line-height: 1.15;
+            border-right: 1px solid rgba(0,0,0,.07);
         }
         .tp-proc-item:last-child { border-right: 0; }
-        .tp-proc-num { font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
-        .tp-proc-lbl { font-size: 9.5px; letter-spacing: .02em; color: rgba(29,29,31,.55); white-space: nowrap; }
-        .tp-proc-item.is-on .tp-proc-num { color: #b25000; }
+        .tp-proc-num {
+            font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums;
+        }
+        .tp-proc-lbl {
+            font-size: 9px; letter-spacing: .01em; color: rgba(29,29,31,.5);
+            white-space: nowrap;
+        }
+        .tp-proc-item.is-on .tp-proc-num,
         .tp-proc-item.is-on .tp-proc-lbl { color: #b25000; }
 
         html[data-theme="dark"] .tp-proc-main,
         html[data-theme="modern-dark"] .tp-proc-main {
-            background: rgba(44,44,46,.82); border-color: rgba(255,255,255,.14); color: #f5f5f7;
+            background: rgba(44,44,46,.9); border-color: rgba(255,255,255,.14); color: #f5f5f7;
         }
         html[data-theme="dark"] .tp-proc-main:hover,
         html[data-theme="modern-dark"] .tp-proc-main:hover { background: #2c2c2e; }
         html[data-theme="dark"] .tp-proc-item,
-        html[data-theme="modern-dark"] .tp-proc-item { border-right-color: rgba(255,255,255,.1); }
+        html[data-theme="modern-dark"] .tp-proc-item { border-right-color: rgba(255,255,255,.09); }
         html[data-theme="dark"] .tp-proc-lbl,
         html[data-theme="modern-dark"] .tp-proc-lbl { color: rgba(245,245,247,.55); }
         html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-num,
@@ -10689,32 +10730,18 @@
         html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-lbl,
         html[data-theme="modern-dark"] .tp-proc-item.is-on .tp-proc-lbl { color: #ffb340; }
 
-        /* --- раскрывающаяся карточка --- */
-        #tp-proc-root {
-            position: fixed; inset: 0; z-index: 2147483001; pointer-events: none;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        /* --- выпадающий список под панелью --- */
+        .tp-proc-drop {
+            position: absolute; top: 100%; right: 0; margin-top: 4px;
+            width: 460px; max-height: 74vh; display: flex; flex-direction: column;
+            z-index: 2147483001;
+            background: #fff; border: 1px solid rgba(0,0,0,.12); border-radius: 4px;
+            box-shadow: 0 2px 6px rgba(0,0,0,.08), 0 12px 32px -8px rgba(0,0,0,.28);
+            overflow: hidden;
             font-size: 13px; line-height: 1.4; color: #1d1d1f; text-align: left;
         }
-        .tp-proc-card {
-            position: absolute; top: 52px; right: 12px; width: 480px; max-height: 74vh;
-            display: flex; flex-direction: column;
-            pointer-events: auto;
-            background: #fff; border: 1px solid rgba(0,0,0,.1); border-radius: 12px;
-            box-shadow: 0 4px 12px rgba(0,0,0,.08), 0 20px 48px -12px rgba(0,0,0,.3);
-            overflow: hidden;
-        }
-        .tp-proc-card[hidden] { display: none; }
-        .tp-proc-card-head {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 10px 14px; border-bottom: 1px solid rgba(0,0,0,.07);
-        }
-        .tp-proc-card-title { font-weight: 650; font-size: 13px; }
-        .tp-proc-refresh {
-            border: 1px solid rgba(0,0,0,.14); background: #fff; border-radius: 6px;
-            padding: 2px 8px; font: inherit; font-size: 11.5px; cursor: pointer; color: #1d1d1f;
-        }
-        .tp-proc-refresh:hover { background: rgba(0,0,0,.04); }
-        .tp-proc-card-body { overflow-y: auto; padding: 10px 14px 14px; }
+        .tp-proc-drop[hidden] { display: none; }
+        .tp-proc-drop-body { overflow-y: auto; padding: 10px 14px 14px; }
 
         .tp-proc-sum {
             display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
@@ -10764,20 +10791,12 @@
         .tp-proc-hint { font-size: 11.5px; color: rgba(29,29,31,.5); padding: 4px 0; }
 
         /* --- тёмная тема --- */
-        html[data-theme="dark"] #tp-proc-root,
-        html[data-theme="modern-dark"] #tp-proc-root { color: #f5f5f7; }
-        html[data-theme="dark"] .tp-proc-card,
-        html[data-theme="modern-dark"] .tp-proc-card {
-            background: #2c2c2e; border-color: rgba(255,255,255,.12);
+        html[data-theme="dark"] .tp-proc-drop,
+        html[data-theme="modern-dark"] .tp-proc-drop {
+            background: #2c2c2e; border-color: rgba(255,255,255,.12); color: #f5f5f7;
         }
-        html[data-theme="dark"] .tp-proc-card-head,
-        html[data-theme="modern-dark"] .tp-proc-card-head,
         html[data-theme="dark"] .tp-proc-sum,
         html[data-theme="modern-dark"] .tp-proc-sum { border-color: rgba(255,255,255,.1); }
-        html[data-theme="dark"] .tp-proc-refresh,
-        html[data-theme="modern-dark"] .tp-proc-refresh {
-            background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.14); color: #f5f5f7;
-        }
         html[data-theme="dark"] .tp-proc-sum span,
         html[data-theme="modern-dark"] .tp-proc-sum span,
         html[data-theme="dark"] .tp-proc-queue-sum,
@@ -11363,6 +11382,9 @@
         toastTimers: new Map(),
     };
 
+    /** Обработчик клика вне панели: один на документ, снимается в teardown. */
+    let procDocHandler = null;
+
     /** Сегодняшняя дата в формате ERP: «09.11.2026» — берём общий todayRu(). */
 
     /**
@@ -11483,7 +11505,10 @@
                     <span class="tp-proc-num">0</span>
                     <span class="tp-proc-lbl">завершено</span>
                 </span>
-            </button>`;
+            </button>
+            <div class="tp-proc-drop" hidden>
+                <div class="tp-proc-drop-body"></div>
+            </div>`;
 
         // Порядок в шапке: панель, потом «Автозаполнение», потом тема.
         if (authBtn && authBtn.parentNode === right) right.insertBefore(box, authBtn);
@@ -11495,6 +11520,24 @@
             e.stopPropagation();
             procTogglePanel(box);
         });
+
+        // Клик в любом другом месте закрывает список. Один обработчик на
+        // документ: панель пересоздаётся при смене шапки, а слушатель живёт
+        // отдельно и снимается в procTeardown.
+        if (!procDocHandler) {
+            procDocHandler = (e) => {
+                if (!processPanel.open) return;
+                const panel = document.querySelector('.tp-proc-panel');
+                if (panel && e.target.closest && e.target.closest('.tp-proc-panel')) return;
+                processPanel.open = false;
+                if (panel) {
+                    panel.classList.remove('is-open');
+                    const d = panel.querySelector('.tp-proc-drop');
+                    if (d) d.hidden = true;
+                }
+            };
+            document.addEventListener('mousedown', procDocHandler, true);
+        }
 
         return box;
     }
@@ -11520,15 +11563,20 @@
         set('done', data.doneToday, false);
     }
 
-    /** Раскрывающаяся карточка с разбивкой по операторам. */
+    /**
+     * Раскрытие панели.
+     *
+     * Список выпадает прямо под панелью, как меню ERP, а не отдельным окном
+     * сбоку: так оператор видит связь между счётчиками и содержимым.
+     * Карточка живёт внутри .tp-proc-panel, поэтому закрывается кликом
+     * в любом другом месте шапки.
+     */
     function procTogglePanel(box) {
-        const root = procMountLayer();
-        if (!root) return;
-        const card = root.querySelector('.tp-proc-card');
-        if (!card) return;
+        const drop = box.querySelector('.tp-proc-drop');
+        if (!drop) return;
 
         if (processPanel.open) {
-            card.hidden = true;
+            drop.hidden = true;
             processPanel.open = false;
             box.classList.remove('is-open');
             return;
@@ -11536,53 +11584,18 @@
 
         processPanel.open = true;
         box.classList.add('is-open');
-        card.hidden = false;
-        procRenderCard(card, processPanel.data);
+        drop.hidden = false;
+        procRenderCard(drop, processPanel.data);
     }
 
-    /** Подложка карточки — в body, чтобы overflow шапки её не срезал. */
+    /** Служебный контейнер не нужен: карточка живёт внутри панели. */
     function procMountLayer() {
-        if (!document.body) return null;
-        let root = document.getElementById('tp-proc-root');
-        if (root && root.isConnected) return root;
-        if (root) root.remove();
-
-        root = document.createElement('div');
-        root.id = 'tp-proc-root';
-        root.innerHTML = `
-            <div class="tp-proc-card" hidden>
-                <div class="tp-proc-card-head">
-                    <span class="tp-proc-card-title">Процессы</span>
-                    <button type="button" class="tp-proc-refresh" title="Обновить">Обновить</button>
-                </div>
-                <div class="tp-proc-card-body"></div>
-            </div>`;
-        document.body.appendChild(root);
-
-        const card = root.querySelector('.tp-proc-card');
-        card.querySelector('.tp-proc-refresh').addEventListener('click', () => {
-            procRefresh(true);
-        });
-
-        // Клик вне карточки закрывает её
-        const onDocDown = (e) => {
-            if (!processPanel.open) return;
-            if (e.target.closest && (e.target.closest('.tp-proc-panel')
-                || e.target.closest('#tp-proc-root'))) return;
-            processPanel.open = false;
-            card.hidden = true;
-            const box = document.querySelector('.tp-proc-panel');
-            if (box) box.classList.remove('is-open');
-        };
-        procMountLayer.docHandler = onDocDown;
-        document.addEventListener('mousedown', onDocDown, true);
-
-        return root;
+        return document.querySelector('.tp-proc-panel');
     }
 
-    /** Содержимое карточки: сводка и разбивка по операторам своей линии. */
+    /** Содержимое выпадающего списка: сводка и разбивка по операторам. */
     function procRenderCard(card, data) {
-        const body = card.querySelector('.tp-proc-card-body');
+        const body = card.querySelector('.tp-proc-drop-body');
         if (!body) return;
         if (!data) {
             body.innerHTML = '<div class="tp-proc-hint">Загрузка…</div>';
@@ -11858,8 +11871,8 @@
         processPanel.data = data;
         procRenderCounters(data);
 
-        const card = document.querySelector('#tp-proc-root .tp-proc-card');
-        if (card && processPanel.open) procRenderCard(card, data);
+        const drop = document.querySelector('.tp-proc-panel .tp-proc-drop');
+        if (drop && processPanel.open) procRenderCard(drop, data);
 
         // Уведомления: только для руководителей, только по своей линии
         if (!manual && processPanel.roles && processPanel.roles.isHead) {
@@ -11906,12 +11919,10 @@
         processPanel.toastTimers.forEach((t) => clearTimeout(t));
         processPanel.toastTimers.clear();
 
-        if (procMountLayer.docHandler) {
-            document.removeEventListener('mousedown', procMountLayer.docHandler, true);
-            procMountLayer.docHandler = null;
+        if (procDocHandler) {
+            document.removeEventListener('mousedown', procDocHandler, true);
+            procDocHandler = null;
         }
-        const root = document.getElementById('tp-proc-root');
-        if (root) root.remove();
         const toasts = document.getElementById('tp-proc-toasts');
         if (toasts) toasts.remove();
         document.querySelectorAll('.tp-proc-panel').forEach((el) => el.remove());
