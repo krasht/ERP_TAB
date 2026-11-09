@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.23
+// @version      0.72.24
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.23';
+    const SELF_VERSION = '0.72.24';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1526,6 +1526,9 @@
             const o = opts || {};
             const pageSize = o.pageSize || 25;
             const maxPages = o.maxPages || 40;
+            // openClose: 'open' — только открытые, '' — все (нужно, чтобы
+            // руководитель видел и закрытые процессы операторов за сегодня)
+            const openClose = o.openClose === undefined ? 'open' : o.openClose;
             const rows = [];
             const seen = new Set();
             let total = 0;
@@ -1534,7 +1537,7 @@
 
             for (let page = 1; page <= maxPages; page += 1) {
                 const url = '/user/process/queue.do?method=queueShow'
-                    + `&id=${encodeURIComponent(queueId)}&openClose=open`
+                    + `&id=${encodeURIComponent(queueId)}&openClose=${encodeURIComponent(openClose)}`
                     + `&page.pageIndex=${page}&page.pageSize=${pageSize}`;
                 // Без кэша: очередь меняется постоянно, а страницы нумерованные —
                 // кэш вернул бы устаревший срез и сбил подсчёт.
@@ -10832,6 +10835,18 @@
 
         .tp-proc-hint { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.5)); padding: 4px 0; }
 
+        /* Закрытые за сегодня по операторам: у руководителя должна быть
+           видна работа людей даже когда открытых процессов нет вовсе. */
+        .tp-proc-closed {
+            margin-top: 8px; padding-top: 6px;
+            border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
+        }
+        .tp-proc-closed-head {
+            font-size: 11px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: .04em; color: var(--hint-color, rgba(29,29,31,.5));
+            margin-bottom: 4px;
+        }
+
         /* --- всплывающие уведомления --- */
         #tp-proc-toasts {
             position: fixed; right: 16px; bottom: 16px; z-index: 2147483002;
@@ -11391,6 +11406,18 @@
     /** Сегодняшняя дата в формате ERP: «09.11.2026» — берём общий todayRu(). */
 
     /**
+     * Сегодня в коротком формате очередей: «09.11.26».
+     *
+     * В таблице очереди дата закрытия короче, чем в «Моих процессах»
+     * («09.11.26 11:50» против «09.11.2026 11:50»), поэтому сравнивать
+     * с todayRu() напрямую нельзя — ни одна строка не совпала бы.
+     */
+    function shortTodayRu() {
+        const full = todayRu();            // «09.11.2026»
+        return full.slice(0, 6) + full.slice(-2); // «09.11.26»
+    }
+
+    /**
      * Какие очереди нужны этому пользователю.
      *
      * Руководитель B2C видит очередь 54, B2B — 55. Оператору очередь нужна
@@ -11421,14 +11448,25 @@
         const queues = procQueues(roles);
         const today = todayRu();
 
-        // Один мой процесс нужен как «якорь» для чтения ролей и как образец
-        // для редактора групп. Берём из «Моих процессов», а если их нет —
-        // первый доступный из очереди.
-        const [openMine, closedMine, ...queueData] = await Promise.all([
+        // Для руководителя нужны и ЗАКРЫТЫЕ процессы за сегодня: очередь с
+        // openClose=open отдаёт только открытые, и при пустых очередях
+        // раскрывашка показывала «Открытых процессов нет» — оператор не видел
+        // работы своих людей. Берём «все» и фильтруем по дате закрытия сами:
+        // параметра «за сегодня» у очереди нет.
+        const wantClosed = roles.isHead || !roles.known;
+
+        const [openMine, closedMine, ...rest] = await Promise.all([
             ERP.myProcesses({ open: true }).catch(() => ({ rows: [], total: 0 })),
             ERP.myProcesses({ open: false }).catch(() => ({ rows: [], total: 0 })),
             ...queues.map((q) => ERP.queueRows(q).catch(() => ({ rows: [], total: 0 }))),
+            ...(wantClosed
+                ? queues.map((q) => ERP.queueRows(q, { openClose: '', maxPages: 6 })
+                    .catch(() => ({ rows: [], total: 0 })))
+                : []),
         ]);
+
+        const queueData = rest.slice(0, queues.length);
+        const allData = rest.slice(queues.length);
 
         const mineOpen = (openMine.rows || []);
 
@@ -11455,6 +11493,25 @@
                 else cur.waiting += 1;
                 byExecutor.set(r.executor, cur);
             });
+
+            // Закрытые за сегодня по этой очереди — с разбивкой по операторам.
+            // Именно этого не хватало: при пустых открытых очередях руководитель
+            // видел «Открытых процессов нет» и не понимал, кто что сделал.
+            const closedRows = ((allData[i] && allData[i].rows) || []).filter((r) => {
+                const d = String(r.closed || '').trim();
+                // В очереди дата короче: «09.11.26 11:50», а не «09.11.2026»
+                return d.startsWith(today) || d.startsWith(shortTodayRu());
+            });
+            const closedByExec = new Map();
+            closedRows.forEach((r) => {
+                // У процесса бывает несколько исполнителей через запятую —
+                // засчитываем каждому, иначе работа второго терялась.
+                const names = String(r.executor || '').split(/\s*,\s*/).filter(Boolean);
+                (names.length ? names : ['(без исполнителя)']).forEach((n) => {
+                    closedByExec.set(n, (closedByExec.get(n) || 0) + 1);
+                });
+            });
+
             return {
                 id,
                 name: id === PROC_QUEUE_B2C ? '2 Линия ТП (B2C)' : '2 Линия ТП (B2B/Smart)',
@@ -11463,6 +11520,10 @@
                 total: rows.length,
                 declared: (queueData[i] && queueData[i].total) || rows.length,
                 unassigned,
+                closedRows,
+                closedByExec: Array.from(closedByExec.entries())
+                    .map(([name, count]) => ({ name, count }))
+                    .sort((a, b) => b.count - a.count),
                 unassignedRows: rows.filter((r) => !r.executor),
                 byExecutor: Array.from(byExecutor.values())
                     .sort((a, b) => (b.inWork + b.waiting) - (a.inWork + a.waiting)),
@@ -11708,6 +11769,21 @@
                     html += '</div>';
                 } else {
                     html += '<div class="tp-proc-hint">Открытых процессов нет.</div>';
+                }
+
+                // Закрытые сегодня по операторам. Очередь с openClose=open
+                // отдаёт только открытые, поэтому при пустой очереди руководитель
+                // видел «Открытых процессов нет» и не понимал, кто работал.
+                if (q.closedByExec.length) {
+                    html += `<div class="tp-proc-closed">
+                        <div class="tp-proc-closed-head">Завершено сегодня: ${q.closedRows.length}</div>`;
+                    q.closedByExec.forEach((o) => {
+                        html += `<div class="tp-proc-op">
+                            <span class="tp-proc-op-name">${esc(o.name)}</span>
+                            <span class="tp-proc-op-num">${o.count}</span>
+                        </div>`;
+                    });
+                    html += '</div>';
                 }
 
                 html += '</div>';
