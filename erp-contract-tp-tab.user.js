@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.40
+// @version      0.72.41
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.40';
+    const SELF_VERSION = '0.72.41';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -12278,20 +12278,47 @@
         // только по явному клику; после F5 панель всегда свёрнута.
         if (drop && processPanel.open) procRenderCard(drop, data);
 
-        // Уведомления: только для руководителей, только по своей линии
-        if (!manual && processPanel.roles && processPanel.roles.isHead) {
-            const mineQueues = data.queues.filter((q) => (q.id === PROC_QUEUE_B2C && processPanel.roles.isHeadB2c)
-                || (q.id === PROC_QUEUE_B2B && processPanel.roles.isHeadB2b));
+        /*
+         * Уведомления — по роли:
+         *
+         *   ОПЕРАТОР (support_b2c / support_b2b) — только из «Моих процессов»:
+         *     ему падают процессы, назначенные лично, и очередь его не касается.
+         *
+         *   РУКОВОДИТЕЛЬ (head_support_b2c / b2b) — из очереди СВОЕЙ линии
+         *     И из «Моих процессов»: он должен знать и о новых процессах
+         *     в очереди, и о тех, что упали лично ему.
+         *
+         * Снимок общий (по ID): один процесс не может быть в двух источниках,
+         * поэтому повторных всплывашек не будет.
+         */
+        if (!manual && processPanel.roles) {
+            const r = processPanel.roles;
             const fresh = [];
-            mineQueues.forEach((q) => {
-                q.rows.forEach((r) => fresh.push(Object.assign({}, r, { queueId: q.id, queueName: q.name })));
+
+            // Мои процессы — всем ролям
+            (data.mine || []).forEach((p) => {
+                fresh.push({
+                    id: p.id,
+                    desc: p.name || '',
+                    queue: 'Мои процессы',
+                    // очередь по типу: нужна для «Принять» из уведомления
+                    queueId: /b2b|smart/i.test(p.type || '') ? PROC_QUEUE_B2B : PROC_QUEUE_B2C,
+                });
             });
-            if (fresh.length) {
-                // Снимок общий по всем очередям руководителя: сравнение по ID
-                // достаточно, один процесс не может лежать в двух очередях.
-                // Имя очереди каждый процесс несёт с собой (queueName).
-                procNotifyNew(fresh);
+
+            // Очередь — только руководителям, и только своя линия
+            if (r.isHead) {
+                const mineQueues = data.queues.filter((q) => (q.id === PROC_QUEUE_B2C && r.isHeadB2c)
+                    || (q.id === PROC_QUEUE_B2B && r.isHeadB2b));
+                mineQueues.forEach((q) => {
+                    q.rows.forEach((row) => fresh.push(Object.assign({}, row, {
+                        queueId: q.id,
+                        queueName: q.name,
+                    })));
+                });
             }
+
+            if (fresh.length) procNotifyNew(fresh);
         }
     }
 
