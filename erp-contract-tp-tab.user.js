@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.28
+// @version      0.72.29
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.28';
+    const SELF_VERSION = '0.72.29';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10715,12 +10715,12 @@
            значений: шапка ERP в тёмной теме тёмно-синяя (#101b2d), и любой
            свой серый (#2c2c2e, rgba(44,44,46)) выглядел серым пятном.
            Родные .btn-white в шапке красятся именно так — повторяем. */
-        .tp-proc-panel {
+        .tp-pp-panel {
             position: relative; display: inline-flex; align-items: stretch;
             vertical-align: middle; margin-right: 6px;
             font-family: inherit;
         }
-        .tp-proc-main {
+        .tp-pp-main {
             display: inline-flex; align-items: stretch; gap: 0;
             height: 35.6px; box-sizing: border-box;
             padding: 0 2px; margin: 0;
@@ -10733,46 +10733,46 @@
             color: var(--text-color, #1d1d1f);
             transition: background-color .12s ease, border-color .12s ease;
         }
-        .tp-proc-main:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
-        .tp-proc-panel.is-open .tp-proc-main {
+        .tp-pp-main:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
+        .tp-pp-panel.is-open .tp-pp-main {
             background-color: var(--table-head-bg-color, #f7f9fc);
             border-color: var(--link-color, rgba(0,0,0,.22));
         }
-        .tp-proc-item {
+        .tp-pp-item {
             display: flex; flex-direction: column; align-items: center; justify-content: center;
             min-width: 52px; padding: 0 7px; line-height: 1.15;
             border-right: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
         }
-        .tp-proc-item:last-child { border-right: 0; }
+        .tp-pp-item:last-child { border-right: 0; }
         .tp-pp-num {
             font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums;
             color: var(--text-color, #1d1d1f);
         }
-        .tp-proc-lbl {
+        .tp-pp-lbl {
             font-size: 9px; letter-spacing: .01em;
             color: var(--hint-color, rgba(29,29,31,.5));
             white-space: nowrap;
         }
         /* «моих N» — только когда цифры отдела и личные различаются */
-        .tp-proc-mine {
+        .tp-pp-mine {
             font-size: 8.5px; color: var(--hint-color, rgba(29,29,31,.45));
             white-space: nowrap; line-height: 1;
         }
-        .tp-proc-mine[hidden] { display: none; }
+        .tp-pp-mine[hidden] { display: none; }
         /* Внимание требует акцентного цвета. В теме ERP переменной
            --warning-color нет, поэтому задаём свой: тёмный янтарный на светлом
            фоне и светлый на тёмном — иначе на #101b2d он проваливается. */
-        .tp-proc-panel { --tp-proc-warn: #b25000; }
-        html[data-theme="dark"] .tp-proc-panel,
-        html[data-theme="modern-dark"] .tp-proc-panel { --tp-proc-warn: #ffb340; }
-        #tp-proc-toasts { --tp-proc-warn: #b25000; }
-        html[data-theme="dark"] #tp-proc-toasts,
-        html[data-theme="modern-dark"] #tp-proc-toasts { --tp-proc-warn: #ffb340; }
-        .tp-proc-item.is-on .tp-pp-num,
-        .tp-proc-item.is-on .tp-proc-lbl { color: var(--tp-proc-warn, #b25000); }
+        .tp-pp-panel { --tp-pp-warn: #b25000; }
+        html[data-theme="dark"] .tp-pp-panel,
+        html[data-theme="modern-dark"] .tp-pp-panel { --tp-pp-warn: #ffb340; }
+        #tp-pp-toasts { --tp-pp-warn: #b25000; }
+        html[data-theme="dark"] #tp-pp-toasts,
+        html[data-theme="modern-dark"] #tp-pp-toasts { --tp-pp-warn: #ffb340; }
+        .tp-pp-item.is-on .tp-pp-num,
+        .tp-pp-item.is-on .tp-pp-lbl { color: var(--tp-pp-warn, #b25000); }
 
         /* --- выпадающий список под панелью --- */
-        .tp-proc-drop {
+        .tp-pp-drop {
             position: absolute; top: 100%; right: 0; margin-top: 4px;
             width: 460px; max-height: 74vh; display: flex; flex-direction: column;
             z-index: 2147483001;
@@ -10785,46 +10785,46 @@
             font-size: 13px; line-height: 1.4;
             color: var(--text-color, #1d1d1f); text-align: left;
         }
-        .tp-proc-drop[hidden] { display: none; }
-        .tp-proc-drop-body { overflow-y: auto; padding: 10px 14px 14px; }
+        .tp-pp-drop[hidden] { display: none; }
+        .tp-pp-drop-body { overflow-y: auto; padding: 10px 14px 14px; }
 
-        .tp-proc-sum {
+        .tp-pp-sum {
             display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
             padding-bottom: 10px;
             border-bottom: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
             margin-bottom: 10px;
         }
-        .tp-proc-sum > div { display: flex; flex-direction: column; align-items: center; }
-        .tp-proc-sum b {
+        .tp-pp-sum > div { display: flex; flex-direction: column; align-items: center; }
+        .tp-pp-sum b {
             font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums;
             color: var(--text-color, #1d1d1f);
         }
-        .tp-proc-sum span { font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
-        .tp-proc-sum .is-bad b { color: var(--tp-proc-warn, #b25000); }
+        .tp-pp-sum span { font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
+        .tp-pp-sum .is-bad b { color: var(--tp-pp-warn, #b25000); }
 
-        .tp-proc-queue { margin-bottom: 14px; }
-        .tp-proc-queue-head {
+        .tp-pp-queue { margin-bottom: 14px; }
+        .tp-pp-queue-head {
             display: flex; align-items: baseline; justify-content: space-between;
             gap: 10px; margin-bottom: 6px;
         }
-        .tp-proc-queue-name {
+        .tp-pp-queue-name {
             font-weight: 650; font-size: 12.5px; color: var(--h2-color, var(--text-color, #1d1d1f));
         }
-        .tp-proc-queue-sum { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
-        .tp-proc-queue-sum.is-bad { color: var(--tp-proc-warn, #b25000); font-weight: 600; }
+        .tp-pp-queue-sum { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
+        .tp-pp-queue-sum.is-bad { color: var(--tp-pp-warn, #b25000); font-weight: 600; }
 
-        .tp-proc-ops { margin: 4px 0 8px; }
-        .tp-proc-op {
+        .tp-pp-ops { margin: 4px 0 8px; }
+        .tp-pp-op {
             display: flex; justify-content: space-between; gap: 10px;
             padding: 3px 0; font-size: 12px;
         }
-        .tp-proc-op-name { color: var(--text-color, #1d1d1f); }
-        .tp-proc-op-num {
+        .tp-pp-op-name { color: var(--text-color, #1d1d1f); }
+        .tp-pp-op-num {
             color: var(--hint-color, rgba(29,29,31,.6));
             font-variant-numeric: tabular-nums;
         }
 
-        .tp-proc-unassigned {
+        .tp-pp-unassigned {
             border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
             padding-top: 6px;
         }
@@ -10834,10 +10834,10 @@
         }
         /* Пометка состояния процесса в списке: свободный / в работе / ждёт.
            Цвет полосы слева — единственный признак, не мешающий читать строку. */
-        .tp-pp-row.is-free { border-left: 2px solid var(--tp-proc-warn, #b25000); padding-left: 6px; }
+        .tp-pp-row.is-free { border-left: 2px solid var(--tp-pp-warn, #b25000); padding-left: 6px; }
         .tp-pp-row.is-work { border-left: 2px solid var(--link-color, #007aff); padding-left: 6px; }
         .tp-pp-row.is-wait { border-left: 2px solid var(--separator-border-color, #ccc); padding-left: 6px; }
-        .tp-proc-who {
+        .tp-pp-who {
             color: var(--hint-color, rgba(29,29,31,.55)); font-size: 11px;
             max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
@@ -10850,45 +10850,45 @@
             font-variant-numeric: tabular-nums;
         }
         .tp-pp-id:hover { text-decoration: underline; }
-        .tp-proc-desc {
+        .tp-pp-desc {
             color: var(--p-color, var(--text-color, rgba(29,29,31,.8)));
             overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
-        .tp-proc-time {
+        .tp-pp-time {
             color: var(--hint-color, rgba(29,29,31,.45));
             font-size: 11px; white-space: nowrap;
         }
-        .tp-proc-take {
+        .tp-pp-take {
             border: 1px solid var(--input-border-color, rgba(0,122,255,.4));
             background-color: transparent; background-image: none;
             color: var(--link-color, #007aff);
             border-radius: 4px; padding: 1px 7px;
             font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap;
         }
-        .tp-proc-take:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.16)); }
-        .tp-proc-take:disabled { opacity: .6; cursor: default; }
+        .tp-pp-take:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.16)); }
+        .tp-pp-take:disabled { opacity: .6; cursor: default; }
 
-        .tp-proc-hint { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.5)); padding: 4px 0; }
+        .tp-pp-hint { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.5)); padding: 4px 0; }
 
         /* Закрытые за сегодня по операторам: у руководителя должна быть
            видна работа людей даже когда открытых процессов нет вовсе. */
-        .tp-proc-closed {
+        .tp-pp-closed {
             margin-top: 8px; padding-top: 6px;
             border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
         }
-        .tp-proc-closed-head {
+        .tp-pp-closed-head {
             font-size: 11px; font-weight: 600; text-transform: uppercase;
             letter-spacing: .04em; color: var(--hint-color, rgba(29,29,31,.5));
             margin-bottom: 4px;
         }
 
         /* --- всплывающие уведомления --- */
-        #tp-proc-toasts {
+        #tp-pp-toasts {
             position: fixed; right: 16px; bottom: 16px; z-index: 2147483002;
             display: flex; flex-direction: column; gap: 8px;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
         }
-        .tp-proc-toast {
+        .tp-pp-toast {
             width: 320px; padding: 10px 12px;
             background-color: var(--surface-color, #fff);
             background-image: none;
@@ -10898,28 +10898,28 @@
             box-shadow: 0 4px 16px rgba(0,0,0,.18), 0 16px 40px -16px rgba(0,0,0,.4);
             color: var(--text-color, #1d1d1f); font-size: 12.5px; line-height: 1.4;
         }
-        .tp-proc-toast-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-        .tp-proc-toast-title { font-weight: 650; }
-        .tp-proc-toast-close {
+        .tp-pp-toast-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+        .tp-pp-toast-title { font-weight: 650; }
+        .tp-pp-toast-close {
             border: 0; background: transparent; cursor: pointer; font-size: 16px; line-height: 1;
             color: var(--hint-color, rgba(29,29,31,.45)); padding: 0 2px;
         }
-        .tp-proc-toast-queue {
+        .tp-pp-toast-queue {
             font-size: 11px; color: var(--hint-color, rgba(29,29,31,.55)); margin-top: 2px;
         }
-        .tp-proc-toast-desc {
+        .tp-pp-toast-desc {
             margin-top: 4px; color: var(--p-color, var(--text-color, rgba(29,29,31,.85)));
         }
-        .tp-proc-toast-btns { display: flex; gap: 6px; margin-top: 8px; }
-        .tp-proc-toast-btns .tp-btn {
+        .tp-pp-toast-btns { display: flex; gap: 6px; margin-top: 8px; }
+        .tp-pp-toast-btns .tp-btn {
             flex: 1; padding: 4px 8px; border-radius: 4px;
             border: 1px solid var(--input-border-color, rgba(0,122,255,.4));
             background-color: transparent; background-image: none;
             color: var(--link-color, #007aff);
             font: inherit; font-size: 11.5px; cursor: pointer;
         }
-        .tp-proc-toast-btns .tp-btn:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.12)); }
-        .tp-proc-toast-btns .tp-btn.is-ghost {
+        .tp-pp-toast-btns .tp-btn:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.12)); }
+        .tp-pp-toast-btns .tp-btn.is-ghost {
             background: transparent;
             border-color: var(--input-border-color, rgba(0,0,0,.14));
             color: var(--text-color, #1d1d1f);
@@ -10928,11 +10928,11 @@
 
     /** Вставка стилей панели процессов (один <style> на страницу). */
     function procInjectStyle() {
-        if (document.getElementById('tp-proc-style')) return;
+        if (document.getElementById('tp-pp-style')) return;
         const host = document.head || document.documentElement;
         if (!host) return;
         const el = document.createElement('style');
-        el.id = 'tp-proc-style';
+        el.id = 'tp-pp-style';
         el.textContent = PROC_CSS;
         host.appendChild(el);
     }
@@ -11667,7 +11667,7 @@
         const head = document.querySelector('#head');
         if (!head) return null;
 
-        let box = head.querySelector('.tp-proc-panel');
+        let box = head.querySelector('.tp-pp-panel');
         if (box) return box;
 
         const right = head.querySelector('.right') || head;
@@ -11675,27 +11675,27 @@
         const themeSwitch = right.querySelector('.theme-switch');
 
         box = document.createElement('div');
-        box.className = 'tp-proc-panel';
+        box.className = 'tp-pp-panel';
         box.innerHTML = `
-            <button type="button" class="tp-proc-main" title="Процессы">
-                <span class="tp-proc-item" data-k="inwork">
+            <button type="button" class="tp-pp-main" title="Процессы">
+                <span class="tp-pp-item" data-k="inwork">
                     <span class="tp-pp-num">0</span>
-                    <span class="tp-proc-lbl">в работе</span>
-                    <span class="tp-proc-mine" hidden></span>
+                    <span class="tp-pp-lbl">в работе</span>
+                    <span class="tp-pp-mine" hidden></span>
                 </span>
-                <span class="tp-proc-item" data-k="unhandled">
+                <span class="tp-pp-item" data-k="unhandled">
                     <span class="tp-pp-num">0</span>
-                    <span class="tp-proc-lbl">не отработаны</span>
-                    <span class="tp-proc-mine" hidden></span>
+                    <span class="tp-pp-lbl">не отработаны</span>
+                    <span class="tp-pp-mine" hidden></span>
                 </span>
-                <span class="tp-proc-item" data-k="done">
+                <span class="tp-pp-item" data-k="done">
                     <span class="tp-pp-num">0</span>
-                    <span class="tp-proc-lbl">завершено</span>
-                    <span class="tp-proc-mine" hidden></span>
+                    <span class="tp-pp-lbl">завершено</span>
+                    <span class="tp-pp-mine" hidden></span>
                 </span>
             </button>
-            <div class="tp-proc-drop" hidden>
-                <div class="tp-proc-drop-body"></div>
+            <div class="tp-pp-drop" hidden>
+                <div class="tp-pp-drop-body"></div>
             </div>`;
 
         // Порядок в шапке: панель, потом «Автозаполнение», потом тема.
@@ -11703,7 +11703,7 @@
         else if (themeSwitch && themeSwitch.parentNode === right) right.insertBefore(box, themeSwitch);
         else right.appendChild(box);
 
-        box.querySelector('.tp-proc-main').addEventListener('click', (e) => {
+        box.querySelector('.tp-pp-main').addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
             procTogglePanel(box);
@@ -11715,12 +11715,12 @@
         if (!procDocHandler) {
             procDocHandler = (e) => {
                 if (!processPanel.open) return;
-                const panel = document.querySelector('.tp-proc-panel');
-                if (panel && e.target.closest && e.target.closest('.tp-proc-panel')) return;
+                const panel = document.querySelector('.tp-pp-panel');
+                if (panel && e.target.closest && e.target.closest('.tp-pp-panel')) return;
                 processPanel.open = false;
                 if (panel) {
                     panel.classList.remove('is-open');
-                    const d = panel.querySelector('.tp-proc-drop');
+                    const d = panel.querySelector('.tp-pp-drop');
                     if (d) d.hidden = true;
                 }
             };
@@ -11732,10 +11732,10 @@
 
     /** Обновление цифр на кнопке. */
     function procRenderCounters(data) {
-        const box = document.querySelector('.tp-proc-panel');
+        const box = document.querySelector('.tp-pp-panel');
         if (!box || !data) return;
         const set = (key, value, isBad, mine, total, mineTitle, totalTitle) => {
-            const item = box.querySelector(`.tp-proc-item[data-k="${key}"]`);
+            const item = box.querySelector(`.tp-pp-item[data-k="${key}"]`);
             if (!item) return;
             const num = item.querySelector('.tp-pp-num');
             const text = String(value);
@@ -11745,7 +11745,7 @@
 
             // «из них моих» показываем только когда цифры различаются:
             // у оператора они всегда совпадают, и подпись была бы шумом.
-            const mineEl = item.querySelector('.tp-proc-mine');
+            const mineEl = item.querySelector('.tp-pp-mine');
             if (mineEl) {
                 const show = Number.isFinite(mine) && Number.isFinite(total)
                     && mine !== total && total > 0;
@@ -11770,11 +11770,11 @@
      *
      * Список выпадает прямо под панелью, как меню ERP, а не отдельным окном
      * сбоку: так оператор видит связь между счётчиками и содержимым.
-     * Карточка живёт внутри .tp-proc-panel, поэтому закрывается кликом
+     * Карточка живёт внутри .tp-pp-panel, поэтому закрывается кликом
      * в любом другом месте шапки.
      */
     function procTogglePanel(box, silent) {
-        const drop = box.querySelector('.tp-proc-drop');
+        const drop = box.querySelector('.tp-pp-drop');
         if (!drop) return;
 
         if (processPanel.open) {
@@ -11807,20 +11807,20 @@
 
     /** Служебный контейнер не нужен: карточка живёт внутри панели. */
     function procMountLayer() {
-        return document.querySelector('.tp-proc-panel');
+        return document.querySelector('.tp-pp-panel');
     }
 
     /** Содержимое выпадающего списка: сводка и разбивка по операторам. */
     function procRenderCard(card, data) {
-        const body = card.querySelector('.tp-proc-drop-body');
+        const body = card.querySelector('.tp-pp-drop-body');
         if (!body) return;
         if (!data) {
-            body.innerHTML = '<div class="tp-proc-hint">Загрузка…</div>';
+            body.innerHTML = '<div class="tp-pp-hint">Загрузка…</div>';
             return;
         }
 
         const roles = data.roles || {};
-        let html = `<div class="tp-proc-sum">
+        let html = `<div class="tp-pp-sum">
             <div><b>${data.inWork}</b><span>в работе</span></div>
             <div class="${data.unhandled > 0 ? 'is-bad' : ''}"><b>${data.unhandled}</b><span>не отработаны</span></div>
             <div><b>${data.doneToday}</b><span>завершено сегодня</span></div>
@@ -11839,29 +11839,29 @@
             : [];
 
         if (!canSee) {
-            html += '<div class="tp-proc-hint">Подробная разбивка доступна руководителям направления.</div>';
+            html += '<div class="tp-pp-hint">Подробная разбивка доступна руководителям направления.</div>';
         } else if (!visible.length) {
-            html += '<div class="tp-proc-hint">Нет доступных очередей второй линии.</div>';
+            html += '<div class="tp-pp-hint">Нет доступных очередей второй линии.</div>';
         } else {
             visible.forEach((q) => {
-                html += `<div class="tp-proc-queue">
-                    <div class="tp-proc-queue-head">
-                        <span class="tp-proc-queue-name">${esc(q.name)}</span>
-                        <span class="tp-proc-queue-sum ${q.unassigned > 0 ? 'is-bad' : ''}">
+                html += `<div class="tp-pp-queue">
+                    <div class="tp-pp-queue-head">
+                        <span class="tp-pp-queue-name">${esc(q.name)}</span>
+                        <span class="tp-pp-queue-sum ${q.unassigned > 0 ? 'is-bad' : ''}">
                             Не распределено: ${q.unassigned} из ${q.total}
                         </span>
                     </div>`;
 
                 // Сводка по операторам: сколько у кого в работе и в ожидании
                 if (q.byExecutor.length) {
-                    html += '<div class="tp-proc-ops">';
+                    html += '<div class="tp-pp-ops">';
                     q.byExecutor.forEach((o) => {
                         const parts = [];
                         if (o.inWork) parts.push(`${o.inWork} в работе`);
                         if (o.waiting) parts.push(`${o.waiting} ждут`);
-                        html += `<div class="tp-proc-op">
-                            <span class="tp-proc-op-name">${esc(o.name)}</span>
-                            <span class="tp-proc-op-num">${esc(parts.join(' · ') || String(o.total))}</span>
+                        html += `<div class="tp-pp-op">
+                            <span class="tp-pp-op-name">${esc(o.name)}</span>
+                            <span class="tp-pp-op-num">${esc(parts.join(' · ') || String(o.total))}</span>
                         </div>`;
                     });
                     html += '</div>';
@@ -11874,7 +11874,7 @@
                 // и оставалось непонятно, какие именно это процессы.
                 const shown = q.rows.slice(0, 30);
                 if (shown.length) {
-                    html += '<div class="tp-proc-unassigned">';
+                    html += '<div class="tp-pp-unassigned">';
                     shown.forEach((r) => {
                         const free = !r.executor;
                         const working = /в работе/i.test(r.status || '');
@@ -11883,31 +11883,31 @@
                         html += `<div class="tp-pp-row${stateCls}">
                             <a href="#" class="tp-pp-id" data-pid="${esc(r.id)}"
                                title="Открыть процесс">#${esc(r.id)}</a>
-                            <span class="tp-proc-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
-                            <span class="tp-proc-who" title="${esc(who)}">${esc(who)}</span>
+                            <span class="tp-pp-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
+                            <span class="tp-pp-who" title="${esc(who)}">${esc(who)}</span>
                             ${free
-                                ? `<button type="button" class="tp-proc-take"
+                                ? `<button type="button" class="tp-pp-take"
                                         data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
                                 : `<span class="tp-pp-state">${esc(r.status || '')}</span>`}
                         </div>`;
                     });
                     if (q.rows.length > 30) {
-                        html += `<div class="tp-proc-hint">и ещё ${q.rows.length - 30}</div>`;
+                        html += `<div class="tp-pp-hint">и ещё ${q.rows.length - 30}</div>`;
                     }
                     html += '</div>';
                 } else {
-                    html += '<div class="tp-proc-hint">Открытых процессов нет.</div>';
+                    html += '<div class="tp-pp-hint">Открытых процессов нет.</div>';
                 }
                 // Закрытые сегодня по операторам. Очередь с openClose=open
                 // отдаёт только открытые, поэтому при пустой очереди руководитель
                 // видел «Открытых процессов нет» и не понимал, кто работал.
                 if (q.closedByExec.length) {
-                    html += `<div class="tp-proc-closed">
-                        <div class="tp-proc-closed-head">Завершено сегодня: ${q.closedRows.length}</div>`;
+                    html += `<div class="tp-pp-closed">
+                        <div class="tp-pp-closed-head">Завершено сегодня: ${q.closedRows.length}</div>`;
                     q.closedByExec.forEach((o) => {
-                        html += `<div class="tp-proc-op">
-                            <span class="tp-proc-op-name">${esc(o.name)}</span>
-                            <span class="tp-proc-op-num">${o.count}</span>
+                        html += `<div class="tp-pp-op">
+                            <span class="tp-pp-op-name">${esc(o.name)}</span>
+                            <span class="tp-pp-op-num">${o.count}</span>
                         </div>`;
                     });
                     html += '</div>';
@@ -11930,7 +11930,7 @@
                 procOpenProcess(a.dataset.pid);
             });
         });
-        body.querySelectorAll('.tp-proc-take').forEach((btn) => {
+        body.querySelectorAll('.tp-pp-take').forEach((btn) => {
             btn.addEventListener('click', async (e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -12000,25 +12000,25 @@
     /** Всплывающее уведомление в углу + системное, если разрешено. */
     function procToast(info) {
         if (!document.body) return;
-        let host = document.getElementById('tp-proc-toasts');
+        let host = document.getElementById('tp-pp-toasts');
         if (!host) {
             host = document.createElement('div');
-            host.id = 'tp-proc-toasts';
+            host.id = 'tp-pp-toasts';
             document.body.appendChild(host);
         }
 
         const el = document.createElement('div');
-        el.className = 'tp-proc-toast';
+        el.className = 'tp-pp-toast';
         el.innerHTML = `
-            <div class="tp-proc-toast-head">
-                <span class="tp-proc-toast-title">Новый процесс #${esc(info.id)}</span>
-                <button type="button" class="tp-proc-toast-close" title="Закрыть">×</button>
+            <div class="tp-pp-toast-head">
+                <span class="tp-pp-toast-title">Новый процесс #${esc(info.id)}</span>
+                <button type="button" class="tp-pp-toast-close" title="Закрыть">×</button>
             </div>
-            <div class="tp-proc-toast-queue">${esc(info.queue || '')}</div>
-            <div class="tp-proc-toast-desc">${esc(info.desc || '')}</div>
-            <div class="tp-proc-toast-btns">
-                <button type="button" class="tp-btn tp-proc-toast-open">Открыть</button>
-                <button type="button" class="tp-btn is-ghost tp-proc-toast-take">Принять в работу</button>
+            <div class="tp-pp-toast-queue">${esc(info.queue || '')}</div>
+            <div class="tp-pp-toast-desc">${esc(info.desc || '')}</div>
+            <div class="tp-pp-toast-btns">
+                <button type="button" class="tp-btn tp-pp-toast-open">Открыть</button>
+                <button type="button" class="tp-btn is-ghost tp-pp-toast-take">Принять в работу</button>
             </div>`;
         host.appendChild(el);
 
@@ -12030,12 +12030,12 @@
         };
         processPanel.toastTimers.set(el, setTimeout(close, PROC_TOAST_MS));
 
-        el.querySelector('.tp-proc-toast-close').addEventListener('click', close);
-        el.querySelector('.tp-proc-toast-open').addEventListener('click', () => {
+        el.querySelector('.tp-pp-toast-close').addEventListener('click', close);
+        el.querySelector('.tp-pp-toast-open').addEventListener('click', () => {
             close();
             procOpenProcess(info.id);
         });
-        el.querySelector('.tp-proc-toast-take').addEventListener('click', async (e) => {
+        el.querySelector('.tp-pp-toast-take').addEventListener('click', async (e) => {
             const btn = e.currentTarget;
             if (!info.queueId) {
                 // Очередь неизвестна — просто открываем процесс
@@ -12149,7 +12149,7 @@
         processPanel.data = data;
         procRenderCounters(data);
 
-        const drop = document.querySelector('.tp-proc-panel .tp-proc-drop');
+        const drop = document.querySelector('.tp-pp-panel .tp-pp-drop');
 
         // Первый запуск: если оператор оставлял панель раскрытой, раскрываем
         // снова. Дальше состоянием управляет только клик — иначе закрытую
@@ -12157,7 +12157,7 @@
         if (!processPanel.open && !processPanel.openRestored) {
             processPanel.openRestored = true;
             if (procReadOpen()) {
-                const box = document.querySelector('.tp-proc-panel');
+                const box = document.querySelector('.tp-pp-panel');
                 if (box) procTogglePanel(box, true);
             }
         }
@@ -12213,10 +12213,10 @@
             document.removeEventListener('mousedown', procDocHandler, true);
             procDocHandler = null;
         }
-        const toasts = document.getElementById('tp-proc-toasts');
+        const toasts = document.getElementById('tp-pp-toasts');
         if (toasts) toasts.remove();
-        document.querySelectorAll('.tp-proc-panel').forEach((el) => el.remove());
-        const style = document.getElementById('tp-proc-style');
+        document.querySelectorAll('.tp-pp-panel').forEach((el) => el.remove());
+        const style = document.getElementById('tp-pp-style');
         if (style) style.remove();
     }
 
