@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.27
+// @version      0.72.28
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.27';
+    const SELF_VERSION = '0.72.28';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10744,7 +10744,7 @@
             border-right: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
         }
         .tp-proc-item:last-child { border-right: 0; }
-        .tp-proc-num {
+        .tp-pp-num {
             font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums;
             color: var(--text-color, #1d1d1f);
         }
@@ -10768,7 +10768,7 @@
         #tp-proc-toasts { --tp-proc-warn: #b25000; }
         html[data-theme="dark"] #tp-proc-toasts,
         html[data-theme="modern-dark"] #tp-proc-toasts { --tp-proc-warn: #ffb340; }
-        .tp-proc-item.is-on .tp-proc-num,
+        .tp-proc-item.is-on .tp-pp-num,
         .tp-proc-item.is-on .tp-proc-lbl { color: var(--tp-proc-warn, #b25000); }
 
         /* --- выпадающий список под панелью --- */
@@ -10828,28 +10828,28 @@
             border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
             padding-top: 6px;
         }
-        .tp-proc-row {
+        .tp-pp-row {
             display: grid; grid-template-columns: auto 1fr auto auto;
             align-items: center; gap: 8px; padding: 3px 0; font-size: 12px;
         }
         /* Пометка состояния процесса в списке: свободный / в работе / ждёт.
            Цвет полосы слева — единственный признак, не мешающий читать строку. */
-        .tp-proc-row.is-free { border-left: 2px solid var(--tp-proc-warn, #b25000); padding-left: 6px; }
-        .tp-proc-row.is-work { border-left: 2px solid var(--link-color, #007aff); padding-left: 6px; }
-        .tp-proc-row.is-wait { border-left: 2px solid var(--separator-border-color, #ccc); padding-left: 6px; }
+        .tp-pp-row.is-free { border-left: 2px solid var(--tp-proc-warn, #b25000); padding-left: 6px; }
+        .tp-pp-row.is-work { border-left: 2px solid var(--link-color, #007aff); padding-left: 6px; }
+        .tp-pp-row.is-wait { border-left: 2px solid var(--separator-border-color, #ccc); padding-left: 6px; }
         .tp-proc-who {
             color: var(--hint-color, rgba(29,29,31,.55)); font-size: 11px;
             max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
-        .tp-proc-state {
+        .tp-pp-state {
             font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.5));
             white-space: nowrap;
         }
-        .tp-proc-id {
+        .tp-pp-id {
             color: var(--link-color, #007aff); text-decoration: none;
             font-variant-numeric: tabular-nums;
         }
-        .tp-proc-id:hover { text-decoration: underline; }
+        .tp-pp-id:hover { text-decoration: underline; }
         .tp-proc-desc {
             color: var(--p-color, var(--text-color, rgba(29,29,31,.8)));
             overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -11679,17 +11679,17 @@
         box.innerHTML = `
             <button type="button" class="tp-proc-main" title="Процессы">
                 <span class="tp-proc-item" data-k="inwork">
-                    <span class="tp-proc-num">0</span>
+                    <span class="tp-pp-num">0</span>
                     <span class="tp-proc-lbl">в работе</span>
                     <span class="tp-proc-mine" hidden></span>
                 </span>
                 <span class="tp-proc-item" data-k="unhandled">
-                    <span class="tp-proc-num">0</span>
+                    <span class="tp-pp-num">0</span>
                     <span class="tp-proc-lbl">не отработаны</span>
                     <span class="tp-proc-mine" hidden></span>
                 </span>
                 <span class="tp-proc-item" data-k="done">
-                    <span class="tp-proc-num">0</span>
+                    <span class="tp-pp-num">0</span>
                     <span class="tp-proc-lbl">завершено</span>
                     <span class="tp-proc-mine" hidden></span>
                 </span>
@@ -11737,7 +11737,7 @@
         const set = (key, value, isBad, mine, total, mineTitle, totalTitle) => {
             const item = box.querySelector(`.tp-proc-item[data-k="${key}"]`);
             if (!item) return;
-            const num = item.querySelector('.tp-proc-num');
+            const num = item.querySelector('.tp-pp-num');
             const text = String(value);
             if (num.textContent !== text) num.textContent = text;
             const bad = !!isBad && Number(value) > 0;
@@ -11880,15 +11880,15 @@
                         const working = /в работе/i.test(r.status || '');
                         const stateCls = free ? ' is-free' : (working ? ' is-work' : ' is-wait');
                         const who = free ? 'не распределён' : r.executor;
-                        html += `<div class="tp-proc-row${stateCls}">
-                            <a href="#" class="tp-proc-id" data-pid="${esc(r.id)}"
+                        html += `<div class="tp-pp-row${stateCls}">
+                            <a href="#" class="tp-pp-id" data-pid="${esc(r.id)}"
                                title="Открыть процесс">#${esc(r.id)}</a>
                             <span class="tp-proc-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
                             <span class="tp-proc-who" title="${esc(who)}">${esc(who)}</span>
                             ${free
                                 ? `<button type="button" class="tp-proc-take"
                                         data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
-                                : `<span class="tp-proc-state">${esc(r.status || '')}</span>`}
+                                : `<span class="tp-pp-state">${esc(r.status || '')}</span>`}
                         </div>`;
                     });
                     if (q.rows.length > 30) {
@@ -11923,7 +11923,7 @@
 
     /** Обработчики карточки: открыть процесс и «Принять». */
     function procBindCard(body) {
-        body.querySelectorAll('.tp-proc-id').forEach((a) => {
+        body.querySelectorAll('.tp-pp-id').forEach((a) => {
             a.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
