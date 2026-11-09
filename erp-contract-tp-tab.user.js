@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.29
+// @version      0.72.30
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.29';
+    const SELF_VERSION = '0.72.30';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10786,21 +10786,7 @@
             color: var(--text-color, #1d1d1f); text-align: left;
         }
         .tp-pp-drop[hidden] { display: none; }
-        .tp-pp-drop-body { overflow-y: auto; padding: 10px 14px 14px; }
-
-        .tp-pp-sum {
-            display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
-            margin-bottom: 10px;
-        }
-        .tp-pp-sum > div { display: flex; flex-direction: column; align-items: center; }
-        .tp-pp-sum b {
-            font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums;
-            color: var(--text-color, #1d1d1f);
-        }
-        .tp-pp-sum span { font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
-        .tp-pp-sum .is-bad b { color: var(--tp-pp-warn, #b25000); }
+        .tp-pp-drop-body { overflow-y: auto; padding: 12px 14px 14px; }
 
         .tp-pp-queue { margin-bottom: 14px; }
         .tp-pp-queue-head {
@@ -11432,8 +11418,6 @@
         seenIds: null,
         data: null,
         open: false,
-        // Раскрытое состояние восстановлено из localStorage (один раз)
-        openRestored: false,
         // ФИО текущего пользователя из шапки ERP — для «мои / отдела»
         myName: '',
         toastTimers: new Map(),
@@ -11773,7 +11757,7 @@
      * Карточка живёт внутри .tp-pp-panel, поэтому закрывается кликом
      * в любом другом месте шапки.
      */
-    function procTogglePanel(box, silent) {
+    function procTogglePanel(box) {
         const drop = box.querySelector('.tp-pp-drop');
         if (!drop) return;
 
@@ -11781,9 +11765,6 @@
             drop.hidden = true;
             processPanel.open = false;
             box.classList.remove('is-open');
-            // Запоминаем, что оператор свернул панель: при следующей загрузке
-            // страницы она не должна раскрываться сама.
-            if (!silent) procStoreOpen(false);
             return;
         }
 
@@ -11791,18 +11772,6 @@
         box.classList.add('is-open');
         drop.hidden = false;
         procRenderCard(drop, processPanel.data);
-        if (!silent) procStoreOpen(true);
-    }
-
-    /** Запоминание раскрытого состояния между перезагрузками. */
-    const PROC_OPEN_KEY = 'erpTpProcOpen';
-
-    function procStoreOpen(value) {
-        try { window.localStorage.setItem(PROC_OPEN_KEY, value ? '1' : '0'); } catch (e) { /* приватный режим */ }
-    }
-
-    function procReadOpen() {
-        try { return window.localStorage.getItem(PROC_OPEN_KEY) === '1'; } catch (e) { return false; }
     }
 
     /** Служебный контейнер не нужен: карточка живёт внутри панели. */
@@ -11820,11 +11789,11 @@
         }
 
         const roles = data.roles || {};
-        let html = `<div class="tp-pp-sum">
-            <div><b>${data.inWork}</b><span>в работе</span></div>
-            <div class="${data.unhandled > 0 ? 'is-bad' : ''}"><b>${data.unhandled}</b><span>не отработаны</span></div>
-            <div><b>${data.doneToday}</b><span>завершено сегодня</span></div>
-        </div>`;
+
+        // Сводку из трёх цифр ВНУТРИ списка не повторяем: они уже на кнопке
+        // в шапке, прямо над раскрытым списком. Дублирование занимало треть
+        // высоты и мешало читать главное — кто что делает.
+        let html = '';
 
         // Разбивка по операторам — руководителям. Если роль определить не
         // удалось (known=false), показываем то, что доступно: скрывать данные
@@ -12151,17 +12120,12 @@
 
         const drop = document.querySelector('.tp-pp-panel .tp-pp-drop');
 
-        // Первый запуск: если оператор оставлял панель раскрытой, раскрываем
-        // снова. Дальше состоянием управляет только клик — иначе закрытую
-        // панель открывало бы каждое автообновление.
-        if (!processPanel.open && !processPanel.openRestored) {
-            processPanel.openRestored = true;
-            if (procReadOpen()) {
-                const box = document.querySelector('.tp-pp-panel');
-                if (box) procTogglePanel(box, true);
-            }
-        }
-
+        // Панель НИКОГДА не раскрывается сама.
+        //
+        // Раньше состояние восстанавливалось из localStorage, и после каждой
+        // перезагрузки страницы список выезжал поверх интерфейса — оператор
+        // не просил его открывать, а он закрывал обзор. Теперь раскрытие —
+        // только по явному клику; после F5 панель всегда свёрнута.
         if (drop && processPanel.open) procRenderCard(drop, data);
 
         // Уведомления: только для руководителей, только по своей линии
