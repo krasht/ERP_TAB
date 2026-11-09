@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.26
+// @version      0.72.27
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.26';
+    const SELF_VERSION = '0.72.27';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11636,16 +11636,14 @@
             const d = String(p.closed || '').trim();
             if (d.startsWith(today)) myDoneIds.add(String(p.id));
         });
-        // Процессы из очереди, где я в исполнителях
+        // Процессы из очереди, где я в исполнителях.
+        //
+        // ВАЖНО: сюда добавляем ТОЛЬКО закрытые. Раньше в этот же набор
+        // попадали и процессы «в работе» — и счётчик «завершено сегодня»
+        // считал незакрытые процессы. Проверка на closed обязательна.
         const myName = processPanel.myName || '';
         if (myName) {
             queueInfo.forEach((q) => {
-                q.rows.forEach((r) => {
-                    if (/в работе/i.test(r.status || '')
-                        && String(r.executor || '').includes(myName)) {
-                        myDoneIds.add(String(r.id));
-                    }
-                });
                 (q.closedRows || []).forEach((r) => {
                     if (String(r.executor || '').includes(myName)) myDoneIds.add(String(r.id));
                 });
