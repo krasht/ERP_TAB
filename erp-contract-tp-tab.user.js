@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.30
+// @version      0.72.31
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.30';
+    const SELF_VERSION = '0.72.31';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10859,7 +10859,7 @@
         /* Закрытые за сегодня по операторам: у руководителя должна быть
            видна работа людей даже когда открытых процессов нет вовсе. */
         .tp-pp-closed {
-            margin-top: 8px; padding-top: 6px;
+            margin-top: 4px; padding-top: 8px;
             border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
         }
         .tp-pp-closed-head {
@@ -11812,7 +11812,33 @@
         } else if (!visible.length) {
             html += '<div class="tp-pp-hint">Нет доступных очередей второй линии.</div>';
         } else {
+            /*
+             * Порядок блоков:
+             *   1) очереди, где есть открытые процессы — сначала «в работе»,
+             *      потом ожидающие, потому что это текущая работа;
+             *   2) завершённые за сегодня — ОДНИМ общим списком по операторам,
+             *      без повтора под каждой очередью: иначе фамилии дублировались
+             *      в двух блоках и приходилось складывать цифры в уме;
+             *   3) пустые очереди — одной строкой в самом низу.
+             *
+             * Раньше первым делом бросалось в глаза «Открытых процессов нет»,
+             * хотя это наименее важное сообщение.
+             */
+            const busy = [];
+            const idle = [];
             visible.forEach((q) => {
+                const openRows = q.rows.filter((r) => !/заверш|закрыт/i.test(r.status || ''));
+                if (openRows.length) busy.push({ q, rows: openRows });
+                else idle.push(q);
+            });
+
+            // ---- открытые процессы
+            busy.forEach(({ q, rows }) => {
+                // В работе — первыми: это то, чем занимаются прямо сейчас
+                const working = rows.filter((r) => /в работе/i.test(r.status || ''));
+                const waiting = rows.filter((r) => !/в работе/i.test(r.status || ''));
+                const ordered = working.concat(waiting);
+
                 html += `<div class="tp-pp-queue">
                     <div class="tp-pp-queue-head">
                         <span class="tp-pp-queue-name">${esc(q.name)}</span>
@@ -11821,69 +11847,57 @@
                         </span>
                     </div>`;
 
-                // Сводка по операторам: сколько у кого в работе и в ожидании
-                if (q.byExecutor.length) {
-                    html += '<div class="tp-pp-ops">';
-                    q.byExecutor.forEach((o) => {
-                        const parts = [];
-                        if (o.inWork) parts.push(`${o.inWork} в работе`);
-                        if (o.waiting) parts.push(`${o.waiting} ждут`);
-                        html += `<div class="tp-pp-op">
-                            <span class="tp-pp-op-name">${esc(o.name)}</span>
-                            <span class="tp-pp-op-num">${esc(parts.join(' · ') || String(o.total))}</span>
-                        </div>`;
-                    });
-                    html += '</div>';
+                html += '<div class="tp-pp-unassigned">';
+                ordered.slice(0, 30).forEach((r) => {
+                    const free = !r.executor;
+                    const isWork = /в работе/i.test(r.status || '');
+                    const stateCls = free ? ' is-free' : (isWork ? ' is-work' : ' is-wait');
+                    const who = free ? 'не распределён' : r.executor;
+                    html += `<div class="tp-pp-row${stateCls}">
+                        <a href="#" class="tp-pp-id" data-pid="${esc(r.id)}"
+                           title="Открыть процесс">#${esc(r.id)}</a>
+                        <span class="tp-pp-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
+                        <span class="tp-pp-who" title="${esc(who)}">${esc(who)}</span>
+                        ${free
+                            ? `<button type="button" class="tp-pp-take"
+                                    data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
+                            : `<span class="tp-pp-state">${esc(r.status || '')}</span>`}
+                    </div>`;
+                });
+                if (ordered.length > 30) {
+                    html += `<div class="tp-pp-hint">и ещё ${ordered.length - 30}</div>`;
                 }
-
-                // САМИ ПРОЦЕССЫ: показываем ВСЕ открытые, а не только
-                // нераспределённые. Раньше в списке были лишь процессы без
-                // исполнителя, и оператор не мог перейти к тому, что уже
-                // в работе: счётчик показывал «2 в работе», а списка не было —
-                // и оставалось непонятно, какие именно это процессы.
-                const shown = q.rows.slice(0, 30);
-                if (shown.length) {
-                    html += '<div class="tp-pp-unassigned">';
-                    shown.forEach((r) => {
-                        const free = !r.executor;
-                        const working = /в работе/i.test(r.status || '');
-                        const stateCls = free ? ' is-free' : (working ? ' is-work' : ' is-wait');
-                        const who = free ? 'не распределён' : r.executor;
-                        html += `<div class="tp-pp-row${stateCls}">
-                            <a href="#" class="tp-pp-id" data-pid="${esc(r.id)}"
-                               title="Открыть процесс">#${esc(r.id)}</a>
-                            <span class="tp-pp-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
-                            <span class="tp-pp-who" title="${esc(who)}">${esc(who)}</span>
-                            ${free
-                                ? `<button type="button" class="tp-pp-take"
-                                        data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
-                                : `<span class="tp-pp-state">${esc(r.status || '')}</span>`}
-                        </div>`;
-                    });
-                    if (q.rows.length > 30) {
-                        html += `<div class="tp-pp-hint">и ещё ${q.rows.length - 30}</div>`;
-                    }
-                    html += '</div>';
-                } else {
-                    html += '<div class="tp-pp-hint">Открытых процессов нет.</div>';
-                }
-                // Закрытые сегодня по операторам. Очередь с openClose=open
-                // отдаёт только открытые, поэтому при пустой очереди руководитель
-                // видел «Открытых процессов нет» и не понимал, кто работал.
-                if (q.closedByExec.length) {
-                    html += `<div class="tp-pp-closed">
-                        <div class="tp-pp-closed-head">Завершено сегодня: ${q.closedRows.length}</div>`;
-                    q.closedByExec.forEach((o) => {
-                        html += `<div class="tp-pp-op">
-                            <span class="tp-pp-op-name">${esc(o.name)}</span>
-                            <span class="tp-pp-op-num">${o.count}</span>
-                        </div>`;
-                    });
-                    html += '</div>';
-                }
-
-                html += '</div>';
+                html += '</div></div>';
             });
+
+            // ---- завершено сегодня: один список, фамилии не повторяются
+            const closedAll = new Map();
+            let closedTotal = 0;
+            visible.forEach((q) => {
+                closedTotal += q.closedRows.length;
+                (q.closedByExec || []).forEach((o) => {
+                    closedAll.set(o.name, (closedAll.get(o.name) || 0) + o.count);
+                });
+            });
+            if (closedTotal) {
+                html += `<div class="tp-pp-closed">
+                    <div class="tp-pp-closed-head">Завершено сегодня: ${closedTotal}</div>`;
+                Array.from(closedAll.entries())
+                    .sort((a, b) => b[1] - a[1])
+                    .forEach(([name, count]) => {
+                        html += `<div class="tp-pp-op">
+                            <span class="tp-pp-op-name">${esc(name)}</span>
+                            <span class="tp-pp-op-num">${count}</span>
+                        </div>`;
+                    });
+                html += '</div>';
+            }
+
+            // ---- пустые очереди одной строкой
+            if (idle.length) {
+                const names = idle.map((q) => q.name).join(', ');
+                html += `<div class="tp-pp-hint">Открытых процессов нет: ${esc(names)}.</div>`;
+            }
         }
 
         body.innerHTML = html;
