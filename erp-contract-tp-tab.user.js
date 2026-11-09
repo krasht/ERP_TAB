@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.19
+// @version      0.72.20
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.19';
+    const SELF_VERSION = '0.72.20';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10678,9 +10678,11 @@
      */
     const PROC_CSS = `
         /* --- панель в шапке ---
-           Оформление намеренно повторяет родные кнопки ERP (.btn-white,
-           .btn-small): та же высота 35.6px, скругление, отступы и шрифт.
-           Своя рамка с тенью выглядела чужеродно рядом с иконками темы. */
+           Цвета берём из переменных темы ERP (--surface-color, --text-color,
+           --input-border-color, --link-color, --hint-color), а не из своих
+           значений: шапка ERP в тёмной теме тёмно-синяя (#101b2d), и любой
+           свой серый (#2c2c2e, rgba(44,44,46)) выглядел серым пятном.
+           Родные .btn-white в шапке красятся именно так — повторяем. */
         .tp-proc-panel {
             position: relative; display: inline-flex; align-items: stretch;
             vertical-align: middle; margin-right: 6px;
@@ -10690,139 +10692,132 @@
             display: inline-flex; align-items: stretch; gap: 0;
             height: 35.6px; box-sizing: border-box;
             padding: 0 2px; margin: 0;
-            border: 1px solid rgba(0,0,0,.12); border-radius: 4px;
-            background: #fff; cursor: pointer;
-            font-family: inherit; font-size: 12px; color: #1d1d1f;
-            transition: background .12s ease, border-color .12s ease;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 4px;
+            background-color: var(--surface-color, #fff);
+            background-image: none;
+            cursor: pointer;
+            font-family: inherit; font-size: 12px;
+            color: var(--text-color, #1d1d1f);
+            transition: background-color .12s ease, border-color .12s ease;
         }
-        .tp-proc-main:hover { background: #f7f9fc; }
+        .tp-proc-main:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
         .tp-proc-panel.is-open .tp-proc-main {
-            background: #f7f9fc; border-color: rgba(0,0,0,.22);
+            background-color: var(--table-head-bg-color, #f7f9fc);
+            border-color: var(--link-color, rgba(0,0,0,.22));
         }
         .tp-proc-item {
             display: flex; flex-direction: column; align-items: center; justify-content: center;
             min-width: 52px; padding: 0 7px; line-height: 1.15;
-            border-right: 1px solid rgba(0,0,0,.07);
+            border-right: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
         }
         .tp-proc-item:last-child { border-right: 0; }
         .tp-proc-num {
             font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums;
+            color: var(--text-color, #1d1d1f);
         }
         .tp-proc-lbl {
-            font-size: 9px; letter-spacing: .01em; color: rgba(29,29,31,.5);
+            font-size: 9px; letter-spacing: .01em;
+            color: var(--hint-color, rgba(29,29,31,.5));
             white-space: nowrap;
         }
+        /* Внимание требует акцентного цвета. В теме ERP переменной
+           --warning-color нет, поэтому задаём свой: тёмный янтарный на светлом
+           фоне и светлый на тёмном — иначе на #101b2d он проваливается. */
+        .tp-proc-panel { --tp-proc-warn: #b25000; }
+        html[data-theme="dark"] .tp-proc-panel,
+        html[data-theme="modern-dark"] .tp-proc-panel { --tp-proc-warn: #ffb340; }
+        #tp-proc-toasts { --tp-proc-warn: #b25000; }
+        html[data-theme="dark"] #tp-proc-toasts,
+        html[data-theme="modern-dark"] #tp-proc-toasts { --tp-proc-warn: #ffb340; }
         .tp-proc-item.is-on .tp-proc-num,
-        .tp-proc-item.is-on .tp-proc-lbl { color: #b25000; }
-
-        html[data-theme="dark"] .tp-proc-main,
-        html[data-theme="modern-dark"] .tp-proc-main {
-            background: rgba(44,44,46,.9); border-color: rgba(255,255,255,.14); color: #f5f5f7;
-        }
-        html[data-theme="dark"] .tp-proc-main:hover,
-        html[data-theme="modern-dark"] .tp-proc-main:hover { background: #2c2c2e; }
-        html[data-theme="dark"] .tp-proc-item,
-        html[data-theme="modern-dark"] .tp-proc-item { border-right-color: rgba(255,255,255,.09); }
-        html[data-theme="dark"] .tp-proc-lbl,
-        html[data-theme="modern-dark"] .tp-proc-lbl { color: rgba(245,245,247,.55); }
-        html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-num,
-        html[data-theme="modern-dark"] .tp-proc-item.is-on .tp-proc-num,
-        html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-lbl,
-        html[data-theme="modern-dark"] .tp-proc-item.is-on .tp-proc-lbl { color: #ffb340; }
+        .tp-proc-item.is-on .tp-proc-lbl { color: var(--tp-proc-warn, #b25000); }
 
         /* --- выпадающий список под панелью --- */
         .tp-proc-drop {
             position: absolute; top: 100%; right: 0; margin-top: 4px;
             width: 460px; max-height: 74vh; display: flex; flex-direction: column;
             z-index: 2147483001;
-            background: #fff; border: 1px solid rgba(0,0,0,.12); border-radius: 4px;
-            box-shadow: 0 2px 6px rgba(0,0,0,.08), 0 12px 32px -8px rgba(0,0,0,.28);
+            background-color: var(--surface-color, #fff);
+            background-image: none;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 4px;
+            box-shadow: 0 2px 6px rgba(0,0,0,.12), 0 12px 32px -8px rgba(0,0,0,.35);
             overflow: hidden;
-            font-size: 13px; line-height: 1.4; color: #1d1d1f; text-align: left;
+            font-size: 13px; line-height: 1.4;
+            color: var(--text-color, #1d1d1f); text-align: left;
         }
         .tp-proc-drop[hidden] { display: none; }
         .tp-proc-drop-body { overflow-y: auto; padding: 10px 14px 14px; }
 
         .tp-proc-sum {
             display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-            padding-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,.07); margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--separator-border-color, rgba(0,0,0,.07));
+            margin-bottom: 10px;
         }
         .tp-proc-sum > div { display: flex; flex-direction: column; align-items: center; }
-        .tp-proc-sum b { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
-        .tp-proc-sum span { font-size: 10.5px; color: rgba(29,29,31,.55); }
-        .tp-proc-sum .is-bad b { color: #b25000; }
+        .tp-proc-sum b {
+            font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums;
+            color: var(--text-color, #1d1d1f);
+        }
+        .tp-proc-sum span { font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
+        .tp-proc-sum .is-bad b { color: var(--tp-proc-warn, #b25000); }
 
         .tp-proc-queue { margin-bottom: 14px; }
         .tp-proc-queue-head {
             display: flex; align-items: baseline; justify-content: space-between;
             gap: 10px; margin-bottom: 6px;
         }
-        .tp-proc-queue-name { font-weight: 650; font-size: 12.5px; }
-        .tp-proc-queue-sum { font-size: 11.5px; color: rgba(29,29,31,.55); }
-        .tp-proc-queue-sum.is-bad { color: #b25000; font-weight: 600; }
+        .tp-proc-queue-name {
+            font-weight: 650; font-size: 12.5px; color: var(--h2-color, var(--text-color, #1d1d1f));
+        }
+        .tp-proc-queue-sum { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.55)); }
+        .tp-proc-queue-sum.is-bad { color: var(--tp-proc-warn, #b25000); font-weight: 600; }
 
         .tp-proc-ops { margin: 4px 0 8px; }
         .tp-proc-op {
             display: flex; justify-content: space-between; gap: 10px;
             padding: 3px 0; font-size: 12px;
         }
-        .tp-proc-op-name { color: #1d1d1f; }
-        .tp-proc-op-num { color: rgba(29,29,31,.6); font-variant-numeric: tabular-nums; }
+        .tp-proc-op-name { color: var(--text-color, #1d1d1f); }
+        .tp-proc-op-num {
+            color: var(--hint-color, rgba(29,29,31,.6));
+            font-variant-numeric: tabular-nums;
+        }
 
-        .tp-proc-unassigned { border-top: 1px dashed rgba(0,0,0,.1); padding-top: 6px; }
+        .tp-proc-unassigned {
+            border-top: 1px dashed var(--separator-border-color, rgba(0,0,0,.1));
+            padding-top: 6px;
+        }
         .tp-proc-row {
             display: grid; grid-template-columns: auto 1fr auto auto;
             align-items: center; gap: 8px; padding: 3px 0; font-size: 12px;
         }
-        .tp-proc-id { color: #007aff; text-decoration: none; font-variant-numeric: tabular-nums; }
+        .tp-proc-id {
+            color: var(--link-color, #007aff); text-decoration: none;
+            font-variant-numeric: tabular-nums;
+        }
         .tp-proc-id:hover { text-decoration: underline; }
         .tp-proc-desc {
-            color: rgba(29,29,31,.8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            color: var(--p-color, var(--text-color, rgba(29,29,31,.8)));
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
-        .tp-proc-time { color: rgba(29,29,31,.45); font-size: 11px; white-space: nowrap; }
+        .tp-proc-time {
+            color: var(--hint-color, rgba(29,29,31,.45));
+            font-size: 11px; white-space: nowrap;
+        }
         .tp-proc-take {
-            border: 1px solid rgba(0,122,255,.4); background: rgba(0,122,255,.08);
-            color: #007aff; border-radius: 5px; padding: 1px 7px;
+            border: 1px solid var(--input-border-color, rgba(0,122,255,.4));
+            background-color: transparent; background-image: none;
+            color: var(--link-color, #007aff);
+            border-radius: 4px; padding: 1px 7px;
             font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap;
         }
-        .tp-proc-take:hover { background: rgba(0,122,255,.16); }
+        .tp-proc-take:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.16)); }
         .tp-proc-take:disabled { opacity: .6; cursor: default; }
 
-        .tp-proc-hint { font-size: 11.5px; color: rgba(29,29,31,.5); padding: 4px 0; }
-
-        /* --- тёмная тема --- */
-        html[data-theme="dark"] .tp-proc-drop,
-        html[data-theme="modern-dark"] .tp-proc-drop {
-            background: #2c2c2e; border-color: rgba(255,255,255,.12); color: #f5f5f7;
-        }
-        html[data-theme="dark"] .tp-proc-sum,
-        html[data-theme="modern-dark"] .tp-proc-sum { border-color: rgba(255,255,255,.1); }
-        html[data-theme="dark"] .tp-proc-sum span,
-        html[data-theme="modern-dark"] .tp-proc-sum span,
-        html[data-theme="dark"] .tp-proc-queue-sum,
-        html[data-theme="modern-dark"] .tp-proc-queue-sum,
-        html[data-theme="dark"] .tp-proc-op-num,
-        html[data-theme="modern-dark"] .tp-proc-op-num,
-        html[data-theme="dark"] .tp-proc-time,
-        html[data-theme="modern-dark"] .tp-proc-time,
-        html[data-theme="dark"] .tp-proc-hint,
-        html[data-theme="modern-dark"] .tp-proc-hint { color: rgba(245,245,247,.55); }
-        html[data-theme="dark"] .tp-proc-op-name,
-        html[data-theme="modern-dark"] .tp-proc-op-name { color: #f5f5f7; }
-        html[data-theme="dark"] .tp-proc-desc,
-        html[data-theme="modern-dark"] .tp-proc-desc { color: rgba(245,245,247,.8); }
-        html[data-theme="dark"] .tp-proc-sum .is-bad b,
-        html[data-theme="modern-dark"] .tp-proc-sum .is-bad b,
-        html[data-theme="dark"] .tp-proc-queue-sum.is-bad,
-        html[data-theme="modern-dark"] .tp-proc-queue-sum.is-bad { color: #ffb340; }
-        html[data-theme="dark"] .tp-proc-unassigned,
-        html[data-theme="modern-dark"] .tp-proc-unassigned { border-color: rgba(255,255,255,.12); }
-        html[data-theme="dark"] .tp-proc-id,
-        html[data-theme="modern-dark"] .tp-proc-id { color: #4da3ff; }
-        html[data-theme="dark"] .tp-proc-take,
-        html[data-theme="modern-dark"] .tp-proc-take {
-            border-color: rgba(77,163,255,.45); background: rgba(77,163,255,.12); color: #4da3ff;
-        }
+        .tp-proc-hint { font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.5)); padding: 4px 0; }
 
         /* --- всплывающие уведомления --- */
         #tp-proc-toasts {
@@ -10832,44 +10827,39 @@
         }
         .tp-proc-toast {
             width: 320px; padding: 10px 12px;
-            background: #fff; border: 1px solid rgba(0,0,0,.1); border-left: 3px solid #007aff;
-            border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,.12), 0 16px 40px -16px rgba(0,0,0,.35);
-            color: #1d1d1f; font-size: 12.5px; line-height: 1.4;
+            background-color: var(--surface-color, #fff);
+            background-image: none;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.1));
+            border-left: 3px solid var(--link-color, #007aff);
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0,0,0,.18), 0 16px 40px -16px rgba(0,0,0,.4);
+            color: var(--text-color, #1d1d1f); font-size: 12.5px; line-height: 1.4;
         }
         .tp-proc-toast-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
         .tp-proc-toast-title { font-weight: 650; }
         .tp-proc-toast-close {
             border: 0; background: transparent; cursor: pointer; font-size: 16px; line-height: 1;
-            color: rgba(29,29,31,.45); padding: 0 2px;
+            color: var(--hint-color, rgba(29,29,31,.45)); padding: 0 2px;
         }
-        .tp-proc-toast-queue { font-size: 11px; color: rgba(29,29,31,.55); margin-top: 2px; }
-        .tp-proc-toast-desc { margin-top: 4px; color: rgba(29,29,31,.85); }
+        .tp-proc-toast-queue {
+            font-size: 11px; color: var(--hint-color, rgba(29,29,31,.55)); margin-top: 2px;
+        }
+        .tp-proc-toast-desc {
+            margin-top: 4px; color: var(--p-color, var(--text-color, rgba(29,29,31,.85)));
+        }
         .tp-proc-toast-btns { display: flex; gap: 6px; margin-top: 8px; }
         .tp-proc-toast-btns .tp-btn {
-            flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(0,122,255,.4);
-            background: rgba(0,122,255,.08); color: #007aff; font: inherit; font-size: 11.5px; cursor: pointer;
+            flex: 1; padding: 4px 8px; border-radius: 4px;
+            border: 1px solid var(--input-border-color, rgba(0,122,255,.4));
+            background-color: transparent; background-image: none;
+            color: var(--link-color, #007aff);
+            font: inherit; font-size: 11.5px; cursor: pointer;
         }
+        .tp-proc-toast-btns .tp-btn:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.12)); }
         .tp-proc-toast-btns .tp-btn.is-ghost {
-            background: transparent; border-color: rgba(0,0,0,.14); color: #1d1d1f;
-        }
-        html[data-theme="dark"] .tp-proc-toast,
-        html[data-theme="modern-dark"] .tp-proc-toast {
-            background: #2c2c2e; border-color: rgba(255,255,255,.12); border-left-color: #4da3ff;
-            color: #f5f5f7;
-        }
-        html[data-theme="dark"] .tp-proc-toast-queue,
-        html[data-theme="modern-dark"] .tp-proc-toast-queue,
-        html[data-theme="dark"] .tp-proc-toast-close,
-        html[data-theme="modern-dark"] .tp-proc-toast-close { color: rgba(245,245,247,.55); }
-        html[data-theme="dark"] .tp-proc-toast-desc,
-        html[data-theme="modern-dark"] .tp-proc-toast-desc { color: rgba(245,245,247,.85); }
-        html[data-theme="dark"] .tp-proc-toast-btns .tp-btn,
-        html[data-theme="modern-dark"] .tp-proc-toast-btns .tp-btn {
-            border-color: rgba(77,163,255,.45); background: rgba(77,163,255,.12); color: #4da3ff;
-        }
-        html[data-theme="dark"] .tp-proc-toast-btns .tp-btn.is-ghost,
-        html[data-theme="modern-dark"] .tp-proc-toast-btns .tp-btn.is-ghost {
-            background: transparent; border-color: rgba(255,255,255,.16); color: #f5f5f7;
+            background: transparent;
+            border-color: var(--input-border-color, rgba(0,0,0,.14));
+            color: var(--text-color, #1d1d1f);
         }
     `;
 
