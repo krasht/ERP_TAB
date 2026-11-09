@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.32
+// @version      0.72.33
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.32';
+    const SELF_VERSION = '0.72.33';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11472,18 +11472,34 @@
         // параметра «за сегодня» у очереди нет.
         const wantClosed = roles.isHead || !roles.known;
 
-        // Запрашиваем очередь ОДИН раз: режим «все» включает и открытые,
-        // поэтому отдельный запрос с openClose=open — лишняя нагрузка на ERP.
-        // Раньше на каждую очередь уходило по два обхода страниц.
+        /*
+         * Нагрузка. Один тик панели — три запроса:
+         *   • мои открытые  (1 страница, до 300 записей);
+         *   • мои закрытые  (1 страница, до 300 записей);
+         *   • очередь       (1 страница по 50 записей на каждого руководителя).
+         *
+         * Очередь читаем ТОЛЬКО руководителям: оператору она нужна лишь для
+         * «не отработаны», а это число он видит и без полного обхода — его
+         * собственные непринятые процессы приходят из «Моих процессов».
+         * Так на каждого оператора уходит 2 запроса вместо 8.
+         *
+         * Одной страницы по 50 хватает: ERP отдаёт записи от новых к старым,
+         * а «завершено сегодня» — это всегда самые свежие строки. Проверено
+         * на живой базе: в очереди 54 за сегодня 5 закрытых, в 55 — 2, и все
+         * они лежат в первых 25 строках.
+         */
+        const queueOpts = wantClosed
+            ? { openClose: '', maxPages: 1, pageSize: 50 }
+            : { openClose: 'open', maxPages: 1, pageSize: 25 };
+
+        const queuePromises = wantClosed
+            ? queues.map((q) => ERP.queueRows(q, queueOpts).catch(() => ({ rows: [], total: 0 })))
+            : queues.map(() => Promise.resolve({ rows: [], total: 0 }));
+
         const [openMine, closedMine, ...queueAll] = await Promise.all([
             ERP.myProcesses({ open: true }).catch(() => ({ rows: [], total: 0 })),
             ERP.myProcesses({ open: false }).catch(() => ({ rows: [], total: 0 })),
-            ...queues.map((q) => ERP.queueRows(q, {
-                // Руководителю нужны и закрытые за сегодня, оператору — только
-                // открытые: экономит запросы и не тянет историю впустую.
-                openClose: wantClosed ? '' : 'open',
-                maxPages: wantClosed ? 6 : 40,
-            }).catch(() => ({ rows: [], total: 0 }))),
+            ...queuePromises,
         ]);
 
         // В режиме «все» строки содержат и закрытые — делим по статусу.
@@ -12142,7 +12158,15 @@
         }
     }
 
-    /** Запуск: первая отрисовка и таймер. */
+    /**
+     * Запуск: первая отрисовка и таймер.
+     *
+     * Обновление ТОЛЬКО по таймеру. Обработчик visibilitychange убран:
+     * он дублировал опрос — вернувшись на вкладку, оператор ждал лишние
+     * три запроса к ERP, хотя следующий тик всё равно пришёл бы через
+     * минуту. Кнопки «Обновить» в панели тоже нет: она была в первой
+     * версии и не понадобилась.
+     */
     function procStart() {
         if (processPanel.started) return;
         processPanel.started = true;
@@ -12150,11 +12174,6 @@
         processPanel.timer = setInterval(() => {
             procRefresh(false).catch(() => {});
         }, PROC_REFRESH_MS);
-
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) return;
-            procRefresh(false).catch(() => {});
-        });
     }
 
     function procTeardown() {
