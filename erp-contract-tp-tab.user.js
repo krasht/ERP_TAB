@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.17
+// @version      0.72.18
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.17';
+    const SELF_VERSION = '0.72.18';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -541,28 +541,34 @@
      * а любой таймаут на клиенте обрывает запрос раньше, чем сервер ответит.
      * Сборка запросов через эту функцию оставлена ради единой точки и удобных заголовков.
      */
-    function fetchText(url) {
+    function fetchText(url, opts) {
         const key = String(url);
         const now = Date.now();
+        // noCache — для данных, которые меняются постоянно: очередь процессов
+        // (панель процессов опрашивает её раз в минуту) и подобное. Без этого
+        // общий TTL 30 с отдавал бы устаревший срез, и цифры «замирали».
+        const noCache = !!(opts && opts.noCache);
 
         // Свежий ответ из кэша — без обращения к сети.
         // Попадание ПЕРЕНОСИТ запись в конец: Map хранит порядок вставки,
         // и без переноса вытеснялась самая старая по вставке запись, а не
         // самая давно использованная. Справочник устройств с TTL 5 минут
         // мог быть выброшен ради случайного ответа, который больше не нужен.
-        const hit = NET.cache.get(key);
-        if (hit && hit.until > now) {
-            NET.cache.delete(key);
-            NET.cache.set(key, hit);
-            return Promise.resolve(hit.text);
+        if (!noCache) {
+            const hit = NET.cache.get(key);
+            if (hit && hit.until > now) {
+                NET.cache.delete(key);
+                NET.cache.set(key, hit);
+                return Promise.resolve(hit.text);
+            }
+            if (hit) NET.cache.delete(key);
         }
-        if (hit) NET.cache.delete(key);
 
         // Такой же запрос уже в пути — ждём его, а не дублируем
         const pending = NET.inflight.get(key);
         if (pending) return pending;
 
-        const ttl = ttlFor(key);
+        const ttl = noCache ? 0 : ttlFor(key);
         const promise = netRun(() => fetch(key, { credentials: 'same-origin' })
             .then((r) => r.text())
             .then((t) => {
@@ -1447,6 +1453,205 @@
 
             const totalMatch = html.match(/Записей:\s*<b>(\d+)<\/b>/);
             return { rows, total: totalMatch ? Number(totalMatch[1]) : rows.length };
+        },
+
+        /**
+         * «Мои процессы» — те, что назначены на текущего оператора.
+         *
+         * ERP: POST /user/process.do, method=userProcessList.
+         * Колонки таблицы: Процесс | Тип | Создан | Статус | Закрыт.
+         *
+         * filter.open: true — только открытые, false — только закрытые,
+         * null/undefined — все. typeId — фильтр по типу процесса.
+         *
+         * Возвращает { rows, total }, где total — «Записей: N» из ответа:
+         * список ERP режет по pageSize, и длина массива не равна реальному
+         * количеству.
+         */
+        async myProcesses(filter) {
+            const f = filter || {};
+            const params = new URLSearchParams({
+                method: 'userProcessList',
+                open: f.open == null ? '' : String(f.open),
+                typeId: f.typeId == null ? '' : String(f.typeId),
+                pageIndex: '1',
+                pageSize: String(f.pageSize || 300),
+            });
+            const html = await fetchText('/user/process.do?' + params.toString());
+            const body = parseHtml(html);
+
+            const rows = [];
+            Array.from(body.querySelectorAll('table.data tr')).forEach((tr) => {
+                const tds = Array.from(tr.querySelectorAll('td'));
+                if (tds.length < 4) return;
+                const cells = tds.map((td) => td.innerText.replace(/\s+/g, ' ').trim());
+                if (/^Процесс$/i.test(cells[0])) return;
+                // «#18652 Из обращения #18651 …» → id 18652
+                const pid = (cells[0].match(/#(\d+)/) || [])[1] || '';
+                if (!pid) return;
+                rows.push({
+                    id: pid,
+                    name: cells[0].replace(/^#?\d+\s*/, '').trim(),
+                    type: cells[1] || '',
+                    created: cells[2] || '',
+                    status: cells[3] || '',
+                    closed: cells[4] || '',
+                });
+            });
+
+            const totalMatch = html.match(/Записей:\s*<b>(\d+)<\/b>/);
+            return { rows, total: totalMatch ? Number(totalMatch[1]) : rows.length };
+        },
+
+        /**
+         * Открытые процессы очереди со всеми страницами.
+         *
+         * ERP: /user/process/queue.do?method=queueShow&id=<queueId>&openClose=open
+         *
+         * Постраничность работает ТОЛЬКО через page.pageIndex / page.pageSize.
+         * С параметром pageIndex сервер молча отдаёт первую страницу каждый раз —
+         * на этом подсчёт по операторам разъезжался: 250 строк вместо 106,
+         * «не распределено» 240 вместо 103.
+         *
+         * Исполнитель — 13-я колонка (индекс 13): имя оператора либо пусто.
+         * Пусто = в «Исполнителях» никого нет, процесс не распределён.
+         * Это проверено на процессах 19437/19438 (пусто) и 19399 (назначен).
+         *
+         * Возвращает { rows, total }, где total — «Записей: N» (реальное число).
+         */
+        async queueRows(queueId, opts) {
+            const o = opts || {};
+            const pageSize = o.pageSize || 25;
+            const maxPages = o.maxPages || 40;
+            const rows = [];
+            const seen = new Set();
+            let total = 0;
+
+            for (let page = 1; page <= maxPages; page += 1) {
+                const url = '/user/process/queue.do?method=queueShow'
+                    + `&id=${encodeURIComponent(queueId)}&openClose=open`
+                    + `&page.pageIndex=${page}&page.pageSize=${pageSize}`;
+                // Без кэша: очередь меняется постоянно, а страницы нумерованные —
+                // кэш вернул бы устаревший срез и сбил подсчёт.
+                const html = await fetchText(url, { noCache: true });
+                if (page === 1) {
+                    const m = html.match(/Записей:\s*<b>(\d+)<\/b>/);
+                    total = m ? Number(m[1]) : 0;
+                }
+                const body = parseHtml(html);
+                let onPage = 0;
+
+                Array.from(body.querySelectorAll('table.data tr')).forEach((tr) => {
+                    const tds = Array.from(tr.querySelectorAll('td'));
+                    if (tds.length < 14) return;
+                    const cells = tds.map((td) => td.innerText.replace(/\s+/g, ' ').trim());
+                    if (!/^\d+$/.test(cells[1])) return;
+                    onPage += 1;
+                    if (seen.has(cells[1])) return;
+                    seen.add(cells[1]);
+                    rows.push({
+                        id: cells[1],
+                        type: cells[3] || '',
+                        status: cells[4] || '',
+                        desc: cells[5] || '',
+                        created: cells[11] || '',
+                        // Пустая ячейка = исполнителя нет
+                        executor: cells[13] || '',
+                        creator: cells[14] || '',
+                    });
+                });
+
+                if (!onPage) break;
+            }
+
+            return { rows, total: total || rows.length };
+        },
+
+        /**
+         * «Принять в работу» — то же действие, что кнопка в очереди ERP.
+         *
+         * ERP вешает на кнопку $$.ajax.post('/user/process/queue.do?method=processAction
+         * &id=<queueId>&index=0&processId=<pid>'). После него текущий оператор
+         * становится исполнителем, и процесс уходит из «не распределённых».
+         *
+         * Возвращает { ok, message }.
+         */
+        async acceptProcess(queueId, processId) {
+            if (!queueId || !processId) return { ok: false, message: 'нет очереди или процесса' };
+            const url = '/user/process/queue.do?method=processAction'
+                + `&id=${encodeURIComponent(queueId)}&index=0&processId=${encodeURIComponent(processId)}`;
+            try {
+                const res = await fetch(url, { method: 'POST', credentials: 'same-origin' });
+                const text = await res.text();
+                // Ответ обычно пустой/JSON; ошибки приходят текстом или 500
+                if (!res.ok) {
+                    const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+                    return { ok: false, message: (plain || 'код ' + res.status).slice(0, 140) };
+                }
+                if (/Exception|не найден|запрещено/i.test(text)) {
+                    const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+                    return { ok: false, message: plain.slice(0, 140) };
+                }
+                // Очередь изменилась — кэш её срезов больше не годится
+                netDrop(/process\.do|queue\.do/i);
+                return { ok: true, message: '' };
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Роли текущего пользователя.
+         *
+         * Прямого способа ERP не даёт: /admin/user.do?method=groupList отвечает
+         * «Действие запрещено», в $$.pers и kernel.js ролей нет. Зато в редакторе
+         * групп процесса приходит массив source — роли, которые ТЕКУЩИЙ
+         * пользователь может назначать. Это ровно его набор ролей.
+         *
+         * Проверено: на процессе типа «ТП B2C» source = admin + head_support_b2c,
+         * на «ТП B2B/Smart» — admin + head_support_b2b.
+         *
+         * ID групп: 1 admin, 52 support_b2b, 59 support_b2c,
+         *           79 head_support_b2b, 80 head_support_b2c.
+         *
+         * Возвращает { ids:Set<number>, isHead, isHeadB2c, isHeadB2b, isSupport, known }.
+         */
+        async myRoles(processId) {
+            const empty = {
+                ids: new Set(), isHead: false, isHeadB2c: false, isHeadB2b: false,
+                isSupport: false, isAdmin: false, known: false,
+            };
+            if (!processId) return empty;
+            let html = '';
+            try {
+                html = await fetchText('/user/process.do?method=processGroupsEdit'
+                    + `&id=${encodeURIComponent(processId)}`);
+            } catch (e) {
+                return empty;
+            }
+            const m = html.match(/const source = (\[[\s\S]*?\]);/);
+            if (!m) return empty;
+
+            const ids = new Set();
+            try {
+                (JSON.parse(m[1]) || []).forEach((o) => {
+                    // id вида «80:0» — группа и роль через двоеточие
+                    const gid = String((o && o.id) || '').split(':')[0];
+                    if (/^\d+$/.test(gid)) ids.add(Number(gid));
+                });
+            } catch (e) { /* разметка изменилась — считаем роли неизвестными */ }
+
+            if (!ids.size) return empty;
+            const has = (n) => ids.has(n);
+            return {
+                ids,
+                isAdmin: has(1),
+                isSupport: has(52) || has(59),
+                isHeadB2c: has(80),
+                isHeadB2b: has(79),
+                isHead: has(80) || has(79),
+                known: true,
+            };
         },
 
         /**
@@ -10080,6 +10285,8 @@
         // Стили вынесены из панели в отдельный <style> — убираем вместе с остальным
         const authStyle = document.getElementById('tp-auth-style');
         if (authStyle) authStyle.remove();
+        // Мини-панель процессов в шапке: таймер, всплывашки и карточка
+        try { procTeardown(); } catch (e) { /* модуль не успел подняться */ }
         // Стили самой панели тоже снимаем: иначе при переинъекции (обновление
         // скрипта, отладка) injectStyle видит старый <style> и выходит по
         // раннему return — новая копия работает с прежним CSS, и правки
@@ -10432,6 +10639,231 @@
     // получить бесконечный цикл «отправил > ошибка > отправил». Пауза короткая:
     // длинная превращается в «скрипт сломался, ничего не заполняется».
     const AUTH_RETRY_BLOCK_MS = 15000;
+
+    /**
+     * Стили мини-панели процессов.
+     *
+     * Отдельный <style>, как у «Автозаполнения»: панель живёт в шапке, которая
+     * есть на любой странице ERP, а не только в карточке договора. Стили самой
+     * вкладки «Для ТП» в этот момент ещё не вставлены.
+     */
+    const PROC_CSS = `
+        /* --- панель в шапке --- */
+        .tp-proc-panel {
+            display: inline-flex; align-items: stretch; vertical-align: middle;
+            margin-right: 8px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        }
+        .tp-proc-main {
+            display: inline-flex; align-items: stretch; gap: 0;
+            padding: 0; border: 1px solid rgba(0,0,0,.12); border-radius: 7px;
+            background: rgba(255,255,255,.72); cursor: pointer;
+            font: inherit; color: #1d1d1f; overflow: hidden;
+            transition: background .12s ease, border-color .12s ease;
+        }
+        .tp-proc-main:hover { background: #fff; border-color: rgba(0,0,0,.2); }
+        .tp-proc-panel.is-open .tp-proc-main { background: #fff; border-color: rgba(0,122,255,.5); }
+        .tp-proc-item {
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            min-width: 54px; padding: 3px 8px; line-height: 1.1;
+            border-right: 1px solid rgba(0,0,0,.08);
+        }
+        .tp-proc-item:last-child { border-right: 0; }
+        .tp-proc-num { font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
+        .tp-proc-lbl { font-size: 9.5px; letter-spacing: .02em; color: rgba(29,29,31,.55); white-space: nowrap; }
+        .tp-proc-item.is-on .tp-proc-num { color: #b25000; }
+        .tp-proc-item.is-on .tp-proc-lbl { color: #b25000; }
+
+        html[data-theme="dark"] .tp-proc-main,
+        html[data-theme="modern-dark"] .tp-proc-main {
+            background: rgba(44,44,46,.82); border-color: rgba(255,255,255,.14); color: #f5f5f7;
+        }
+        html[data-theme="dark"] .tp-proc-main:hover,
+        html[data-theme="modern-dark"] .tp-proc-main:hover { background: #2c2c2e; }
+        html[data-theme="dark"] .tp-proc-item,
+        html[data-theme="modern-dark"] .tp-proc-item { border-right-color: rgba(255,255,255,.1); }
+        html[data-theme="dark"] .tp-proc-lbl,
+        html[data-theme="modern-dark"] .tp-proc-lbl { color: rgba(245,245,247,.55); }
+        html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-num,
+        html[data-theme="modern-dark"] .tp-proc-item.is-on .tp-proc-num,
+        html[data-theme="dark"] .tp-proc-item.is-on .tp-proc-lbl,
+        html[data-theme="modern-dark"] .tp-proc-item.is-on .tp-proc-lbl { color: #ffb340; }
+
+        /* --- раскрывающаяся карточка --- */
+        #tp-proc-root {
+            position: fixed; inset: 0; z-index: 2147483001; pointer-events: none;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+            font-size: 13px; line-height: 1.4; color: #1d1d1f; text-align: left;
+        }
+        .tp-proc-card {
+            position: absolute; top: 52px; right: 12px; width: 480px; max-height: 74vh;
+            display: flex; flex-direction: column;
+            pointer-events: auto;
+            background: #fff; border: 1px solid rgba(0,0,0,.1); border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,.08), 0 20px 48px -12px rgba(0,0,0,.3);
+            overflow: hidden;
+        }
+        .tp-proc-card[hidden] { display: none; }
+        .tp-proc-card-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 14px; border-bottom: 1px solid rgba(0,0,0,.07);
+        }
+        .tp-proc-card-title { font-weight: 650; font-size: 13px; }
+        .tp-proc-refresh {
+            border: 1px solid rgba(0,0,0,.14); background: #fff; border-radius: 6px;
+            padding: 2px 8px; font: inherit; font-size: 11.5px; cursor: pointer; color: #1d1d1f;
+        }
+        .tp-proc-refresh:hover { background: rgba(0,0,0,.04); }
+        .tp-proc-card-body { overflow-y: auto; padding: 10px 14px 14px; }
+
+        .tp-proc-sum {
+            display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+            padding-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,.07); margin-bottom: 10px;
+        }
+        .tp-proc-sum > div { display: flex; flex-direction: column; align-items: center; }
+        .tp-proc-sum b { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+        .tp-proc-sum span { font-size: 10.5px; color: rgba(29,29,31,.55); }
+        .tp-proc-sum .is-bad b { color: #b25000; }
+
+        .tp-proc-queue { margin-bottom: 14px; }
+        .tp-proc-queue-head {
+            display: flex; align-items: baseline; justify-content: space-between;
+            gap: 10px; margin-bottom: 6px;
+        }
+        .tp-proc-queue-name { font-weight: 650; font-size: 12.5px; }
+        .tp-proc-queue-sum { font-size: 11.5px; color: rgba(29,29,31,.55); }
+        .tp-proc-queue-sum.is-bad { color: #b25000; font-weight: 600; }
+
+        .tp-proc-ops { margin: 4px 0 8px; }
+        .tp-proc-op {
+            display: flex; justify-content: space-between; gap: 10px;
+            padding: 3px 0; font-size: 12px;
+        }
+        .tp-proc-op-name { color: #1d1d1f; }
+        .tp-proc-op-num { color: rgba(29,29,31,.6); font-variant-numeric: tabular-nums; }
+
+        .tp-proc-unassigned { border-top: 1px dashed rgba(0,0,0,.1); padding-top: 6px; }
+        .tp-proc-row {
+            display: grid; grid-template-columns: auto 1fr auto auto;
+            align-items: center; gap: 8px; padding: 3px 0; font-size: 12px;
+        }
+        .tp-proc-id { color: #007aff; text-decoration: none; font-variant-numeric: tabular-nums; }
+        .tp-proc-id:hover { text-decoration: underline; }
+        .tp-proc-desc {
+            color: rgba(29,29,31,.8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tp-proc-time { color: rgba(29,29,31,.45); font-size: 11px; white-space: nowrap; }
+        .tp-proc-take {
+            border: 1px solid rgba(0,122,255,.4); background: rgba(0,122,255,.08);
+            color: #007aff; border-radius: 5px; padding: 1px 7px;
+            font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap;
+        }
+        .tp-proc-take:hover { background: rgba(0,122,255,.16); }
+        .tp-proc-take:disabled { opacity: .6; cursor: default; }
+
+        .tp-proc-hint { font-size: 11.5px; color: rgba(29,29,31,.5); padding: 4px 0; }
+
+        /* --- тёмная тема --- */
+        html[data-theme="dark"] #tp-proc-root,
+        html[data-theme="modern-dark"] #tp-proc-root { color: #f5f5f7; }
+        html[data-theme="dark"] .tp-proc-card,
+        html[data-theme="modern-dark"] .tp-proc-card {
+            background: #2c2c2e; border-color: rgba(255,255,255,.12);
+        }
+        html[data-theme="dark"] .tp-proc-card-head,
+        html[data-theme="modern-dark"] .tp-proc-card-head,
+        html[data-theme="dark"] .tp-proc-sum,
+        html[data-theme="modern-dark"] .tp-proc-sum { border-color: rgba(255,255,255,.1); }
+        html[data-theme="dark"] .tp-proc-refresh,
+        html[data-theme="modern-dark"] .tp-proc-refresh {
+            background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.14); color: #f5f5f7;
+        }
+        html[data-theme="dark"] .tp-proc-sum span,
+        html[data-theme="modern-dark"] .tp-proc-sum span,
+        html[data-theme="dark"] .tp-proc-queue-sum,
+        html[data-theme="modern-dark"] .tp-proc-queue-sum,
+        html[data-theme="dark"] .tp-proc-op-num,
+        html[data-theme="modern-dark"] .tp-proc-op-num,
+        html[data-theme="dark"] .tp-proc-time,
+        html[data-theme="modern-dark"] .tp-proc-time,
+        html[data-theme="dark"] .tp-proc-hint,
+        html[data-theme="modern-dark"] .tp-proc-hint { color: rgba(245,245,247,.55); }
+        html[data-theme="dark"] .tp-proc-op-name,
+        html[data-theme="modern-dark"] .tp-proc-op-name { color: #f5f5f7; }
+        html[data-theme="dark"] .tp-proc-desc,
+        html[data-theme="modern-dark"] .tp-proc-desc { color: rgba(245,245,247,.8); }
+        html[data-theme="dark"] .tp-proc-sum .is-bad b,
+        html[data-theme="modern-dark"] .tp-proc-sum .is-bad b,
+        html[data-theme="dark"] .tp-proc-queue-sum.is-bad,
+        html[data-theme="modern-dark"] .tp-proc-queue-sum.is-bad { color: #ffb340; }
+        html[data-theme="dark"] .tp-proc-unassigned,
+        html[data-theme="modern-dark"] .tp-proc-unassigned { border-color: rgba(255,255,255,.12); }
+        html[data-theme="dark"] .tp-proc-id,
+        html[data-theme="modern-dark"] .tp-proc-id { color: #4da3ff; }
+        html[data-theme="dark"] .tp-proc-take,
+        html[data-theme="modern-dark"] .tp-proc-take {
+            border-color: rgba(77,163,255,.45); background: rgba(77,163,255,.12); color: #4da3ff;
+        }
+
+        /* --- всплывающие уведомления --- */
+        #tp-proc-toasts {
+            position: fixed; right: 16px; bottom: 16px; z-index: 2147483002;
+            display: flex; flex-direction: column; gap: 8px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        }
+        .tp-proc-toast {
+            width: 320px; padding: 10px 12px;
+            background: #fff; border: 1px solid rgba(0,0,0,.1); border-left: 3px solid #007aff;
+            border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,.12), 0 16px 40px -16px rgba(0,0,0,.35);
+            color: #1d1d1f; font-size: 12.5px; line-height: 1.4;
+        }
+        .tp-proc-toast-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+        .tp-proc-toast-title { font-weight: 650; }
+        .tp-proc-toast-close {
+            border: 0; background: transparent; cursor: pointer; font-size: 16px; line-height: 1;
+            color: rgba(29,29,31,.45); padding: 0 2px;
+        }
+        .tp-proc-toast-queue { font-size: 11px; color: rgba(29,29,31,.55); margin-top: 2px; }
+        .tp-proc-toast-desc { margin-top: 4px; color: rgba(29,29,31,.85); }
+        .tp-proc-toast-btns { display: flex; gap: 6px; margin-top: 8px; }
+        .tp-proc-toast-btns .tp-btn {
+            flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(0,122,255,.4);
+            background: rgba(0,122,255,.08); color: #007aff; font: inherit; font-size: 11.5px; cursor: pointer;
+        }
+        .tp-proc-toast-btns .tp-btn.is-ghost {
+            background: transparent; border-color: rgba(0,0,0,.14); color: #1d1d1f;
+        }
+        html[data-theme="dark"] .tp-proc-toast,
+        html[data-theme="modern-dark"] .tp-proc-toast {
+            background: #2c2c2e; border-color: rgba(255,255,255,.12); border-left-color: #4da3ff;
+            color: #f5f5f7;
+        }
+        html[data-theme="dark"] .tp-proc-toast-queue,
+        html[data-theme="modern-dark"] .tp-proc-toast-queue,
+        html[data-theme="dark"] .tp-proc-toast-close,
+        html[data-theme="modern-dark"] .tp-proc-toast-close { color: rgba(245,245,247,.55); }
+        html[data-theme="dark"] .tp-proc-toast-desc,
+        html[data-theme="modern-dark"] .tp-proc-toast-desc { color: rgba(245,245,247,.85); }
+        html[data-theme="dark"] .tp-proc-toast-btns .tp-btn,
+        html[data-theme="modern-dark"] .tp-proc-toast-btns .tp-btn {
+            border-color: rgba(77,163,255,.45); background: rgba(77,163,255,.12); color: #4da3ff;
+        }
+        html[data-theme="dark"] .tp-proc-toast-btns .tp-btn.is-ghost,
+        html[data-theme="modern-dark"] .tp-proc-toast-btns .tp-btn.is-ghost {
+            background: transparent; border-color: rgba(255,255,255,.16); color: #f5f5f7;
+        }
+    `;
+
+    /** Вставка стилей панели процессов (один <style> на страницу). */
+    function procInjectStyle() {
+        if (document.getElementById('tp-proc-style')) return;
+        const host = document.head || document.documentElement;
+        if (!host) return;
+        const el = document.createElement('style');
+        el.id = 'tp-proc-style';
+        el.textContent = PROC_CSS;
+        host.appendChild(el);
+    }
 
     const AUTH_CSS = `
         /* Слой-подложка для поповера. Сам он кликов не ловит, чтобы не мешать
@@ -10893,6 +11325,598 @@
             return true;
         }
         return false;
+    }
+
+    /* --- мини-панель процессов в шапке --- */
+
+    /*
+     * Три счётчика рядом с «Автозаполнением входа»: в работе, не отработаны,
+     * завершено сегодня. У руководителей (erp_role_head_support_b2c/b2b) клик
+     * по панели раскрывает разбивку по операторам и список нераспределённых
+     * процессов очереди своей линии.
+     *
+     * Почему именно так:
+     *  • «не отработаны» — это процессы с ПУСТЫМИ «Исполнителями» в очереди
+     *    своей линии (54 для B2C, 55 для B2B). Роль в группах процесса даёт
+     *    доступ, но исполнителем человека не делает — пока его нет, процесс
+     *    лежит в очереди нераспределённым;
+     *  • очередь читается с обходом всех страниц через page.pageIndex:
+     *    с обычным pageIndex сервер всегда отдаёт первую страницу, и подсчёт
+     *    разъезжается (250 строк вместо 106);
+     *  • «завершено сегодня» считаем по дате закрытия, а не по названию
+     *    статуса: в ERP дата проставляется раньше, чем меняется статус.
+     */
+    const PROC_QUEUE_B2C = 54;
+    const PROC_QUEUE_B2B = 55;
+    const PROC_REFRESH_MS = 60000;
+    /** Сколько живёт всплывающее уведомление. */
+    const PROC_TOAST_MS = 30000;
+
+    const processPanel = {
+        timer: null,
+        started: false,
+        roles: null,
+        // Прошлый снимок ID — чтобы понять, какие процессы новые
+        seenIds: null,
+        data: null,
+        open: false,
+        toastTimers: new Map(),
+    };
+
+    /** Сегодняшняя дата в формате ERP: «09.11.2026» — берём общий todayRu(). */
+
+    /**
+     * Какие очереди нужны этому пользователю.
+     *
+     * Руководитель B2C видит очередь 54, B2B — 55. Оператору очередь нужна
+     * только чтобы посчитать «не отработаны» по своей линии; если роли
+     * неизвестны (редактор групп недоступен), показываем обе — лишний запрос
+     * дешевле, чем пустая панель.
+     */
+    function procQueues(roles) {
+        const r = roles || {};
+        if (r.isHeadB2c && !r.isHeadB2b) return [PROC_QUEUE_B2C];
+        if (r.isHeadB2b && !r.isHeadB2c) return [PROC_QUEUE_B2B];
+        if (r.known) return [PROC_QUEUE_B2C, PROC_QUEUE_B2B];
+        return [PROC_QUEUE_B2C, PROC_QUEUE_B2B];
+    }
+
+    /**
+     * Сбор всех цифр панели.
+     *
+     * Возвращает:
+     *   inWork      — открытые процессы на мне со статусом «В работе»
+     *   unhandled   — нераспределённые (пустые «Исполнители») в очередях + мои непринятые
+     *   doneToday   — закрытые мной сегодня
+     *   queues      — [{ id, name, rows, unassigned, byExecutor }]
+     *   mine        — мои открытые процессы
+     */
+    async function loadProcessPanel() {
+        const roles = processPanel.roles || { known: false };
+        const queues = procQueues(roles);
+        const today = todayRu();
+
+        // Один мой процесс нужен как «якорь» для чтения ролей и как образец
+        // для редактора групп. Берём из «Моих процессов», а если их нет —
+        // первый доступный из очереди.
+        const [openMine, closedMine, ...queueData] = await Promise.all([
+            ERP.myProcesses({ open: true }).catch(() => ({ rows: [], total: 0 })),
+            ERP.myProcesses({ open: false }).catch(() => ({ rows: [], total: 0 })),
+            ...queues.map((q) => ERP.queueRows(q).catch(() => ({ rows: [], total: 0 }))),
+        ]);
+
+        const mineOpen = (openMine.rows || []);
+        const inWork = mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
+
+        // Закрытые сегодня — по дате закрытия, а не по статусу
+        const doneToday = (closedMine.rows || []).filter((p) => {
+            const d = String(p.closed || '').trim();
+            return d.startsWith(today);
+        }).length;
+
+        const queueInfo = queues.map((id, i) => {
+            const rows = (queueData[i] && queueData[i].rows) || [];
+            const byExecutor = new Map();
+            let unassigned = 0;
+            rows.forEach((r) => {
+                if (!r.executor) {
+                    unassigned += 1;
+                    return;
+                }
+                const cur = byExecutor.get(r.executor) || { name: r.executor, inWork: 0, waiting: 0, total: 0 };
+                cur.total += 1;
+                if (/в работе/i.test(r.status || '')) cur.inWork += 1;
+                else cur.waiting += 1;
+                byExecutor.set(r.executor, cur);
+            });
+            return {
+                id,
+                name: id === PROC_QUEUE_B2C ? '2 Линия ТП (B2C)' : '2 Линия ТП (B2B/Smart)',
+                rows,
+                total: rows.length,
+                declared: (queueData[i] && queueData[i].total) || rows.length,
+                unassigned,
+                unassignedRows: rows.filter((r) => !r.executor),
+                byExecutor: Array.from(byExecutor.values())
+                    .sort((a, b) => (b.inWork + b.waiting) - (a.inWork + a.waiting)),
+            };
+        });
+
+        // Мои непринятые: открытые процессы на мне, которые ещё «Новый»
+        const mineNew = mineOpen.filter((p) => /нов(ый|ые)/i.test(p.status || '')).length;
+
+        return {
+            inWork,
+            unhandled: queueInfo.reduce((s, q) => s + q.unassigned, 0) + mineNew,
+            doneToday,
+            queues: queueInfo,
+            mine: mineOpen,
+            roles,
+        };
+    }
+
+    /** Кнопка-панель в шапке: три счётчика и раскрытие. */
+    function procMountHeadButton() {
+        const head = document.querySelector('#head');
+        if (!head) return null;
+
+        let box = head.querySelector('.tp-proc-panel');
+        if (box) return box;
+
+        const right = head.querySelector('.right') || head;
+        const authBtn = right.querySelector('.tp-auth-head-btn');
+        const themeSwitch = right.querySelector('.theme-switch');
+
+        box = document.createElement('div');
+        box.className = 'tp-proc-panel';
+        box.innerHTML = `
+            <button type="button" class="tp-proc-main" title="Процессы">
+                <span class="tp-proc-item" data-k="inwork">
+                    <span class="tp-proc-num">0</span>
+                    <span class="tp-proc-lbl">в работе</span>
+                </span>
+                <span class="tp-proc-item" data-k="unhandled">
+                    <span class="tp-proc-num">0</span>
+                    <span class="tp-proc-lbl">не отработаны</span>
+                </span>
+                <span class="tp-proc-item" data-k="done">
+                    <span class="tp-proc-num">0</span>
+                    <span class="tp-proc-lbl">завершено</span>
+                </span>
+            </button>`;
+
+        // Порядок в шапке: панель, потом «Автозаполнение», потом тема.
+        if (authBtn && authBtn.parentNode === right) right.insertBefore(box, authBtn);
+        else if (themeSwitch && themeSwitch.parentNode === right) right.insertBefore(box, themeSwitch);
+        else right.appendChild(box);
+
+        box.querySelector('.tp-proc-main').addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            procTogglePanel(box);
+        });
+
+        return box;
+    }
+
+    /** Обновление цифр на кнопке. */
+    function procRenderCounters(data) {
+        const box = document.querySelector('.tp-proc-panel');
+        if (!box || !data) return;
+        const set = (key, value, isBad) => {
+            const item = box.querySelector(`.tp-proc-item[data-k="${key}"]`);
+            if (!item) return;
+            const num = item.querySelector('.tp-proc-num');
+            const text = String(value);
+            if (num.textContent !== text) num.textContent = text;
+            const bad = !!isBad && Number(value) > 0;
+            if (item.classList.contains('is-on') !== bad) item.classList.toggle('is-on', bad);
+            item.title = key === 'inwork' ? 'В работе у меня'
+                : key === 'unhandled' ? 'Не распределено в очередях + мои непринятые'
+                    : 'Завершено мной сегодня';
+        };
+        set('inwork', data.inWork, false);
+        set('unhandled', data.unhandled, true);
+        set('done', data.doneToday, false);
+    }
+
+    /** Раскрывающаяся карточка с разбивкой по операторам. */
+    function procTogglePanel(box) {
+        const root = procMountLayer();
+        if (!root) return;
+        const card = root.querySelector('.tp-proc-card');
+        if (!card) return;
+
+        if (processPanel.open) {
+            card.hidden = true;
+            processPanel.open = false;
+            box.classList.remove('is-open');
+            return;
+        }
+
+        processPanel.open = true;
+        box.classList.add('is-open');
+        card.hidden = false;
+        procRenderCard(card, processPanel.data);
+    }
+
+    /** Подложка карточки — в body, чтобы overflow шапки её не срезал. */
+    function procMountLayer() {
+        if (!document.body) return null;
+        let root = document.getElementById('tp-proc-root');
+        if (root && root.isConnected) return root;
+        if (root) root.remove();
+
+        root = document.createElement('div');
+        root.id = 'tp-proc-root';
+        root.innerHTML = `
+            <div class="tp-proc-card" hidden>
+                <div class="tp-proc-card-head">
+                    <span class="tp-proc-card-title">Процессы</span>
+                    <button type="button" class="tp-proc-refresh" title="Обновить">Обновить</button>
+                </div>
+                <div class="tp-proc-card-body"></div>
+            </div>`;
+        document.body.appendChild(root);
+
+        const card = root.querySelector('.tp-proc-card');
+        card.querySelector('.tp-proc-refresh').addEventListener('click', () => {
+            procRefresh(true);
+        });
+
+        // Клик вне карточки закрывает её
+        const onDocDown = (e) => {
+            if (!processPanel.open) return;
+            if (e.target.closest && (e.target.closest('.tp-proc-panel')
+                || e.target.closest('#tp-proc-root'))) return;
+            processPanel.open = false;
+            card.hidden = true;
+            const box = document.querySelector('.tp-proc-panel');
+            if (box) box.classList.remove('is-open');
+        };
+        procMountLayer.docHandler = onDocDown;
+        document.addEventListener('mousedown', onDocDown, true);
+
+        return root;
+    }
+
+    /** Содержимое карточки: сводка и разбивка по операторам своей линии. */
+    function procRenderCard(card, data) {
+        const body = card.querySelector('.tp-proc-card-body');
+        if (!body) return;
+        if (!data) {
+            body.innerHTML = '<div class="tp-proc-hint">Загрузка…</div>';
+            return;
+        }
+
+        const roles = data.roles || {};
+        let html = `<div class="tp-proc-sum">
+            <div><b>${data.inWork}</b><span>в работе</span></div>
+            <div class="${data.unhandled > 0 ? 'is-bad' : ''}"><b>${data.unhandled}</b><span>не отработаны</span></div>
+            <div><b>${data.doneToday}</b><span>завершено сегодня</span></div>
+        </div>`;
+
+        // Разбивка по операторам — только руководителям
+        const visible = roles.isHead
+            ? (data.queues || []).filter((q) => (q.id === PROC_QUEUE_B2C && roles.isHeadB2c)
+                || (q.id === PROC_QUEUE_B2B && roles.isHeadB2b))
+            : [];
+
+        if (!roles.isHead) {
+            html += '<div class="tp-proc-hint">Подробная разбивка доступна руководителям направления.</div>';
+        } else if (!visible.length) {
+            html += '<div class="tp-proc-hint">Нет доступных очередей второй линии.</div>';
+        } else {
+            visible.forEach((q) => {
+                html += `<div class="tp-proc-queue">
+                    <div class="tp-proc-queue-head">
+                        <span class="tp-proc-queue-name">${esc(q.name)}</span>
+                        <span class="tp-proc-queue-sum ${q.unassigned > 0 ? 'is-bad' : ''}">
+                            Не распределено: ${q.unassigned} из ${q.total}
+                        </span>
+                    </div>`;
+
+                if (q.byExecutor.length) {
+                    html += '<div class="tp-proc-ops">';
+                    q.byExecutor.forEach((o) => {
+                        const parts = [];
+                        if (o.inWork) parts.push(`${o.inWork} в работе`);
+                        if (o.waiting) parts.push(`${o.waiting} ждут`);
+                        html += `<div class="tp-proc-op">
+                            <span class="tp-proc-op-name">${esc(o.name)}</span>
+                            <span class="tp-proc-op-num">${esc(parts.join(' · ') || String(o.total))}</span>
+                        </div>`;
+                    });
+                    html += '</div>';
+                }
+
+                if (q.unassignedRows.length) {
+                    html += '<div class="tp-proc-unassigned">';
+                    q.unassignedRows.slice(0, 20).forEach((r) => {
+                        html += `<div class="tp-proc-row">
+                            <a href="#" class="tp-proc-id" data-pid="${esc(r.id)}"
+                               title="Открыть процесс">#${esc(r.id)}</a>
+                            <span class="tp-proc-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
+                            <span class="tp-proc-time">${esc(r.created || '')}</span>
+                            <button type="button" class="tp-proc-take"
+                                    data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>
+                        </div>`;
+                    });
+                    if (q.unassignedRows.length > 20) {
+                        html += `<div class="tp-proc-hint">и ещё ${q.unassignedRows.length - 20}</div>`;
+                    }
+                    html += '</div>';
+                } else {
+                    html += '<div class="tp-proc-hint">Все процессы распределены.</div>';
+                }
+
+                html += '</div>';
+            });
+        }
+
+        body.innerHTML = html;
+        procBindCard(body);
+    }
+
+    /** Обработчики карточки: открыть процесс и «Принять». */
+    function procBindCard(body) {
+        body.querySelectorAll('.tp-proc-id').forEach((a) => {
+            a.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                procOpenProcess(a.dataset.pid);
+            });
+        });
+        body.querySelectorAll('.tp-proc-take').forEach((btn) => {
+            btn.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const qid = btn.dataset.qid;
+                const pid = btn.dataset.pid;
+                btn.disabled = true;
+                const old = btn.textContent;
+                btn.textContent = '…';
+                const res = await ERP.acceptProcess(qid, pid);
+                if (res.ok) {
+                    btn.textContent = 'Принят';
+                    // Данные изменились — перечитываем, чтобы цифры сошлись
+                    setTimeout(() => { procRefresh(true); }, 600);
+                } else {
+                    btn.textContent = old;
+                    btn.disabled = false;
+                    btn.title = res.message || 'Не удалось принять';
+                }
+            });
+        });
+    }
+
+    /** Открыть карточку процесса средствами ERP, с запасным путём. */
+    function procOpenProcess(pid) {
+        if (!pid) return;
+        try {
+            if (typeof $$ !== 'undefined' && $$ && $$.process
+                && typeof $$.process.open === 'function') {
+                $$.process.open(Number(pid));
+                return;
+            }
+        } catch (e) { /* ядро ещё не готово */ }
+        window.location.href = '/user/process#' + encodeURIComponent(pid);
+    }
+
+    /**
+     * Уведомления о новых процессах в очереди.
+     *
+     * Сравниваем с прошлым снимком по ID: что появилось — о том и сообщаем.
+     * Первый опрос снимок только создаёт, иначе после каждой перезагрузки
+     * страницы прилетал бы залп уведомлений обо всех старых процессах.
+     */
+    function procNotifyNew(rows) {
+        const ids = new Set(rows.map((r) => r.id));
+        if (!processPanel.seenIds) {
+            processPanel.seenIds = ids;
+            return;
+        }
+        const fresh = rows.filter((r) => !processPanel.seenIds.has(r.id));
+        processPanel.seenIds = ids;
+        if (!fresh.length) return;
+        fresh.slice(0, 3).forEach((r) => {
+            procToast({
+                id: r.id,
+                queue: r.queueName || '',
+                queueId: r.queueId,
+                desc: r.desc || 'Новый процесс',
+                created: r.created || '',
+            });
+        });
+    }
+
+    /** Всплывающее уведомление в углу + системное, если разрешено. */
+    function procToast(info) {
+        if (!document.body) return;
+        let host = document.getElementById('tp-proc-toasts');
+        if (!host) {
+            host = document.createElement('div');
+            host.id = 'tp-proc-toasts';
+            document.body.appendChild(host);
+        }
+
+        const el = document.createElement('div');
+        el.className = 'tp-proc-toast';
+        el.innerHTML = `
+            <div class="tp-proc-toast-head">
+                <span class="tp-proc-toast-title">Новый процесс #${esc(info.id)}</span>
+                <button type="button" class="tp-proc-toast-close" title="Закрыть">×</button>
+            </div>
+            <div class="tp-proc-toast-queue">${esc(info.queue || '')}</div>
+            <div class="tp-proc-toast-desc">${esc(info.desc || '')}</div>
+            <div class="tp-proc-toast-btns">
+                <button type="button" class="tp-btn tp-proc-toast-open">Открыть</button>
+                <button type="button" class="tp-btn is-ghost tp-proc-toast-take">Принять в работу</button>
+            </div>`;
+        host.appendChild(el);
+
+        const close = () => {
+            const t = processPanel.toastTimers.get(el);
+            if (t) clearTimeout(t);
+            processPanel.toastTimers.delete(el);
+            el.remove();
+        };
+        processPanel.toastTimers.set(el, setTimeout(close, PROC_TOAST_MS));
+
+        el.querySelector('.tp-proc-toast-close').addEventListener('click', close);
+        el.querySelector('.tp-proc-toast-open').addEventListener('click', () => {
+            close();
+            procOpenProcess(info.id);
+        });
+        el.querySelector('.tp-proc-toast-take').addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            if (!info.queueId) {
+                // Очередь неизвестна — просто открываем процесс
+                close();
+                procOpenProcess(info.id);
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = '…';
+            const res = await ERP.acceptProcess(info.queueId, info.id);
+            if (res.ok) {
+                close();
+                procRefresh(true);
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Принять в работу';
+                btn.title = res.message || '';
+            }
+        });
+
+        // Системное уведомление — работает при свёрнутой вкладке
+        procSystemNotify(info);
+    }
+
+    /**
+     * Системное уведомление браузера.
+     *
+     * Разрешение спрашиваем один раз и молча, если пользователь отказал:
+     * навязчивый повторный запрос раздражает и браузеры его блокируют.
+     */
+    function procSystemNotify(info) {
+        if (typeof Notification === 'undefined') return;
+        if (Notification.permission === 'default') {
+            try { Notification.requestPermission(); } catch (e) { return; }
+        }
+        if (Notification.permission !== 'granted') return;
+        try {
+            const n = new Notification('Новый процесс #' + info.id, {
+                body: [info.queue, info.desc].filter(Boolean).join(' · '),
+                tag: 'erp-proc-' + info.id,
+            });
+            n.onclick = () => {
+                window.focus();
+                procOpenProcess(info.id);
+                n.close();
+            };
+        } catch (e) { /* уведомления запрещены политикой */ }
+    }
+
+    /**
+     * Полное обновление панели: роли, цифры, уведомления.
+     *
+     * manual — нажатие «Обновить»: уведомления в этом случае не шлём,
+     * иначе оператор получал бы всплывашку о процессе, который сам же
+     * только что и увидел.
+     */
+    async function procRefresh(manual) {
+        if (document.hidden && !manual) return;
+
+        procInjectStyle();
+        procMountHeadButton();
+        procMountLayer();
+
+        // Роли читаем один раз за сессию: они не меняются без перелогина
+        if (!processPanel.roles) {
+            let anchor = '';
+            try {
+                const mine = await ERP.myProcesses({ open: true });
+                anchor = (mine.rows[0] || {}).id || '';
+            } catch (e) { /* ниже попробуем через очередь */ }
+            if (!anchor) {
+                try {
+                    const q = await ERP.queueRows(PROC_QUEUE_B2C, { maxPages: 1 });
+                    anchor = (q.rows[0] || {}).id || '';
+                } catch (e) { /* роли останутся неизвестными */ }
+            }
+            processPanel.roles = await ERP.myRoles(anchor);
+        }
+
+        let data = null;
+        try {
+            data = await loadProcessPanel();
+        } catch (e) {
+            data = null;
+        }
+        if (!data) return;
+        processPanel.data = data;
+        procRenderCounters(data);
+
+        const card = document.querySelector('#tp-proc-root .tp-proc-card');
+        if (card && processPanel.open) procRenderCard(card, data);
+
+        // Уведомления: только для руководителей, только по своей линии
+        if (!manual && processPanel.roles && processPanel.roles.isHead) {
+            const mineQueues = data.queues.filter((q) => (q.id === PROC_QUEUE_B2C && processPanel.roles.isHeadB2c)
+                || (q.id === PROC_QUEUE_B2B && processPanel.roles.isHeadB2b));
+            const fresh = [];
+            mineQueues.forEach((q) => {
+                q.rows.forEach((r) => fresh.push(Object.assign({}, r, { queueId: q.id, queueName: q.name })));
+            });
+            if (fresh.length) {
+                // Снимок общий по всем очередям руководителя: сравнение по ID
+                // достаточно, один процесс не может лежать в двух очередях.
+                // Имя очереди каждый процесс несёт с собой (queueName).
+                procNotifyNew(fresh);
+            }
+        }
+    }
+
+    /** Запуск: первая отрисовка и таймер. */
+    function procStart() {
+        if (processPanel.started) return;
+        processPanel.started = true;
+        procRefresh(false).catch(() => { /* панель просто останется с нулями */ });
+        processPanel.timer = setInterval(() => {
+            procRefresh(false).catch(() => {});
+        }, PROC_REFRESH_MS);
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            procRefresh(false).catch(() => {});
+        });
+    }
+
+    function procTeardown() {
+        if (processPanel.timer) {
+            clearInterval(processPanel.timer);
+            processPanel.timer = null;
+        }
+        processPanel.started = false;
+        processPanel.seenIds = null;
+        processPanel.data = null;
+        processPanel.open = false;
+        processPanel.roles = null;
+        processPanel.toastTimers.forEach((t) => clearTimeout(t));
+        processPanel.toastTimers.clear();
+
+        if (procMountLayer.docHandler) {
+            document.removeEventListener('mousedown', procMountLayer.docHandler, true);
+            procMountLayer.docHandler = null;
+        }
+        const root = document.getElementById('tp-proc-root');
+        if (root) root.remove();
+        const toasts = document.getElementById('tp-proc-toasts');
+        if (toasts) toasts.remove();
+        document.querySelectorAll('.tp-proc-panel').forEach((el) => el.remove());
+        const style = document.getElementById('tp-proc-style');
+        if (style) style.remove();
     }
 
     /* --- кнопка «Автозаполнение» и её панель --- */
@@ -11610,6 +12634,11 @@
         watch();
 
         dropLegacyTaskTabs();
+
+        // Мини-панель процессов в шапке. Ставим сразу, не дожидаясь карточки
+        // договора: шапка есть на любой странице ERP, и счётчики нужны в том
+        // числе на «Моих процессах».
+        try { procStart(); } catch (e) { /* без панели остальное работает */ }
 
         // Отметка могла остаться с прошлой загрузки: оператор нажал «Обновить»,
         // ушёл ставить версию и вернулся уже через F5. Тогда перезагружать не
