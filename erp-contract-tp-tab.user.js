@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.39
+// @version      0.72.40
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.39';
+    const SELF_VERSION = '0.72.40';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1644,62 +1644,84 @@
          * Роли текущего пользователя.
          *
          * Прямого способа ERP не даёт: /admin/user.do?method=groupList отвечает
-         * «Действие запрещено», в $$.pers и kernel.js ролей нет. Зато в редакторе
-         * групп процесса приходит массив source — роли, которые ТЕКУЩИЙ
-         * пользователь может назначать. Это ровно его набор ролей.
+         * «Действие запрещено», в $$.pers и kernel.js ролей нет.
          *
-         * Проверено: на процессе типа «ТП B2C» source = admin + head_support_b2c,
-         * на «ТП B2B/Smart» — admin + head_support_b2b.
+         * Раньше роли читались из редактора ГРУПП (processGroupsEdit, массив
+         * source) — и это было ошибкой. source перечисляет роли, которые можно
+         * НАЗНАЧИТЬ процессу, то есть набор прав на назначение, а не членство
+         * пользователя. Из-за этого оператор Мышленников Г.А. (только
+         * erp_role_support_b2c) получал isHead и видел чужой нераспределённый
+         * процесс.
+         *
+         * Правильный источник — редактор ИСПОЛНИТЕЛЕЙ (processExecutorsEdit).
+         * В нём для каждой группы процесса приходит source со списком людей,
+         * которых МОЖНО поставить исполнителем. Если в списке группы 80
+         * (head_support_b2c) есть текущий пользователь — у него эта роль.
+         * Проверено: в группе 59 (support_b2c) 15 человек, в 80 — трое, и
+         * Мышленникова там нет.
          *
          * ID групп: 1 admin, 52 support_b2b, 59 support_b2c,
          *           79 head_support_b2b, 80 head_support_b2c.
          *
          * Возвращает { ids:Set<number>, isHead, isHeadB2c, isHeadB2b, isSupport, known }.
          */
-        async myRoles(processIds) {
+        async myRoles(processIds, myName) {
             const empty = {
                 ids: new Set(), isHead: false, isHeadB2c: false, isHeadB2b: false,
                 isSupport: false, isAdmin: false, known: false,
             };
 
-            // Принимаем и один id, и массив: роли нужно читать с процессов
-            // РАЗНЫХ типов, см. ниже.
             const list = (Array.isArray(processIds) ? processIds : [processIds])
                 .map((v) => String(v || '').trim())
                 .filter((v) => /^\d+$/.test(v));
             if (!list.length) return empty;
 
-            /*
-             * ВАЖНО: source зависит от ТИПА процесса, а не только от прав.
-             *
-             * Проверено на живой базе: у пользователя с обеими ролями
-             * руководителя процесс «ТП B2C» (19437) отдаёт [1, 80], а
-             * «ТП B2B/Smart» (19438) — [1, 79, 52]. То есть один процесс
-             * показывает только роли СВОЕГО направления, и по одному процессу
-             * нельзя понять, есть ли вторая роль.
-             *
-             * Поэтому читаем роли с процессов разных типов и объединяем.
-             * Панель передаёт сюда по одному процессу из каждой доступной
-             * очереди (54 и 55) — тогда видны обе роли.
-             */
+            const me = String(myName || '').trim();
             const ids = new Set();
+
             for (let i = 0; i < list.length; i += 1) {
                 let html = '';
                 try {
-                    html = await fetchText('/user/process.do?method=processGroupsEdit'
+                    html = await fetchText('/user/process.do?method=processExecutorsEdit'
                         + `&id=${encodeURIComponent(list[i])}`);
                 } catch (e) {
                     continue; // процесс недоступен — пробуем следующий
                 }
-                const m = html.match(/const source = (\[[\s\S]*?\]);/);
-                if (!m) continue;
-                try {
-                    (JSON.parse(m[1]) || []).forEach((o) => {
-                        // id вида «80:0» — группа и роль через двоеточие
-                        const gid = String((o && o.id) || '').split(':')[0];
-                        if (/^\d+$/.test(gid)) ids.add(Number(gid));
-                    });
-                } catch (e) { /* разметка изменилась — пропускаем процесс */ }
+
+                /*
+                 * Разметка: на каждую группу процесса приходит свой блок
+                 *   <input type="hidden" name="group" value="80:0"/>
+                 *   <h2>erp_role_head_support_b2c</h2>
+                 *   ... const source = [{"value":"ФИО","id":"12:80:0"}, ...]
+                 *
+                 * ВАЖНО: split по тегу group оставляет value="80:0" в ПРЕДЫДУЩЕМ
+                 * куске — тег и его атрибуты попадают в конец предыдущего.
+                 * Поэтому идём не через split, а находим каждое объявление
+                 * группы и смотрим кусок до следующего объявления.
+                 */
+                const groupRe = /name="group"\s+value="(\d+):[^"]*"/gi;
+                const marks = [];
+                let gm;
+                while ((gm = groupRe.exec(html))) {
+                    marks.push({ gid: Number(gm[1]), at: gm.index });
+                }
+                marks.forEach((mark, idx) => {
+                    const end = idx + 1 < marks.length ? marks[idx + 1].at : html.length;
+                    const chunk = html.slice(mark.at, end);
+
+                    const src = chunk.match(/const source = (\[[\s\S]*?\]);/);
+                    if (!src) return;
+
+                    let people = [];
+                    try {
+                        people = (JSON.parse(src[1]) || []).map((o) => String((o && o.value) || ''));
+                    } catch (e) {
+                        return; // разметка изменилась — группу пропускаем
+                    }
+                    // «[Вы]» — служебная пометка ERP рядом с моим именем
+                    const found = me && people.some((p) => p.replace(/\s*\[Вы\]\s*$/, '').trim() === me);
+                    if (found) ids.add(mark.gid);
+                });
             }
 
             if (!ids.size) return empty;
@@ -12224,7 +12246,16 @@
                 } catch (e) { /* следующая очередь */ }
             }
 
-            processPanel.roles = await ERP.myRoles(anchors);
+            // Имя берём ДО чтения ролей: myRoles сравнивает его со списком
+            // людей в группах процесса. Раньше имя читалось внутри
+            // loadProcessPanel, то есть уже после — и роли определялись вслепую.
+            if (!processPanel.myName) {
+                const prof = document.querySelector('#head .profile');
+                const name = prof ? prof.textContent.replace(/\s+/g, ' ').trim() : '';
+                if (name) processPanel.myName = name;
+            }
+
+            processPanel.roles = await ERP.myRoles(anchors, processPanel.myName);
         }
 
         let data = null;
