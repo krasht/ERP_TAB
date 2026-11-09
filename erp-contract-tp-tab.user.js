@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.43
+// @version      0.72.44
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.43';
+    const SELF_VERSION = '0.72.44';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11531,23 +11531,44 @@
             : { openClose: 'open', maxPages: 1, pageSize: 25 };
 
         const queuePromises = wantClosed
-            ? queues.map((q) => ERP.queueRows(q, queueOpts).catch(() => ({ rows: [], total: 0 })))
-            : queues.map(() => Promise.resolve({ rows: [], total: 0 }));
+            ? queues.map((q) => ERP.queueRows(q, queueOpts).catch(() => null))
+            : queues.map(() => Promise.resolve(null));
 
         const [openMine, closedMine, ...queueAll] = await Promise.all([
-            ERP.myProcesses({ open: true }).catch(() => ({ rows: [], total: 0 })),
-            ERP.myProcesses({ open: false }).catch(() => ({ rows: [], total: 0 })),
+            ERP.myProcesses({ open: true }).catch(() => null),
+            ERP.myProcesses({ open: false }).catch(() => null),
             ...queuePromises,
         ]);
 
+        /*
+         * Сбой запроса НЕ должен обнулять панель.
+         *
+         * Раньше на ошибке подставлялся пустой результат, и счётчики на один
+         * тик падали в нули — оператор видел, что «всё пропало», хотя процесс
+         * никуда не делся. Теперь при неудаче берём прошлое значение: лучше
+         * показать данные 15-секундной давности, чем ложный ноль.
+         */
+        const prev = processPanel.data || {};
+        const prevQueues = prev.queues || [];
+
+        const queueAllSafe = queueAll.map((d, i) => {
+            if (d) return d;
+            const old = prevQueues[i];
+            return old ? { rows: old.rows || [], total: old.total || 0 } : { rows: [], total: 0 };
+        });
+
         // В режиме «все» строки содержат и закрытые — делим по статусу.
-        const queueData = queueAll.map((d) => ({
+        const queueData = queueAllSafe.map((d) => ({
             total: (d.rows || []).filter((r) => !/заверш|закрыт/i.test(r.status || '')).length,
             rows: (d.rows || []).filter((r) => !/заверш|закрыт/i.test(r.status || '')),
         }));
-        const allData = queueAll;
+        const allData = queueAllSafe;
 
-        const mineOpen = (openMine.rows || []);
+        // Открытые процессы на мне: при сбое — прошлый список
+        const mineOpen = openMine
+            ? (openMine.rows || [])
+            : (prev.mine || []);
+        const mineClosed = closedMine ? (closedMine.rows || []) : (prev.mineClosed || []);
 
         // Имя текущего пользователя — нужно, чтобы отделить «мои» процессы
         // от «отдела»: в очереди исполнитель записан строкой, ID там нет.
@@ -11650,7 +11671,7 @@
         queueInfo.forEach((q) => {
             (q.closedRows || []).forEach((r) => doneIds.add(String(r.id)));
         });
-        (closedMine.rows || []).forEach((p) => {
+        mineClosed.forEach((p) => {
             const d = String(p.closed || '').trim();
             if (d.startsWith(today)) doneIds.add(String(p.id));
         });
@@ -11666,7 +11687,7 @@
         // только когда они различаются — лишний шум не нужен.
         const myInWork = mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
         const myDoneIds = new Set();
-        (closedMine.rows || []).forEach((p) => {
+        mineClosed.forEach((p) => {
             const d = String(p.closed || '').trim();
             if (d.startsWith(today)) myDoneIds.add(String(p.id));
         });
@@ -11692,6 +11713,8 @@
             myDone: myDoneIds.size,
             queues: queueInfo,
             mine: mineOpen,
+            // Закрытые на мне — для следующего тика при сбое сети
+            mineClosed,
             roles,
         };
     }
@@ -12317,7 +12340,11 @@
                 });
             }
 
-            if (fresh.length) procNotifyNew(fresh);
+            // Вызываем ВСЕГДА, даже при пустом списке: procNotifyNew внутри
+            // создаёт первый снимок. Раньше стояло `if (fresh.length)`, и когда
+            // на старте процессов не было, снимок оставался null — следующий
+            // новый процесс считался «первым опросом» и уведомление молчало.
+            procNotifyNew(fresh);
         }
     }
 
