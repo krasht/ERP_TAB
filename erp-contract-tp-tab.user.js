@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.21
+// @version      0.72.22
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.21';
+    const SELF_VERSION = '0.72.22';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -10794,6 +10794,19 @@
             display: grid; grid-template-columns: auto 1fr auto auto;
             align-items: center; gap: 8px; padding: 3px 0; font-size: 12px;
         }
+        /* Пометка состояния процесса в списке: свободный / в работе / ждёт.
+           Цвет полосы слева — единственный признак, не мешающий читать строку. */
+        .tp-proc-row.is-free { border-left: 2px solid var(--tp-proc-warn, #b25000); padding-left: 6px; }
+        .tp-proc-row.is-work { border-left: 2px solid var(--link-color, #007aff); padding-left: 6px; }
+        .tp-proc-row.is-wait { border-left: 2px solid var(--separator-border-color, #ccc); padding-left: 6px; }
+        .tp-proc-who {
+            color: var(--hint-color, rgba(29,29,31,.55)); font-size: 11px;
+            max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tp-proc-state {
+            font-size: 10.5px; color: var(--hint-color, rgba(29,29,31,.5));
+            white-space: nowrap;
+        }
         .tp-proc-id {
             color: var(--link-color, #007aff); text-decoration: none;
             font-variant-numeric: tabular-nums;
@@ -11463,8 +11476,21 @@
         // в «Моих процессах» его нет, и счётчик показывал 0 — при живом
         // процессе в работе у коллеги по отделу. Руководителю нужна картина
         // отдела, а не только личная.
-        const inWork = queueInfo.reduce((s, q) => s + q.inWork, 0)
-            + mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
+        //
+        // Считаем ПО ID, а не суммой двух источников: процесс, назначенный на
+        // меня, приходит и в очередь, и в «Мои процессы». При простом сложении
+        // получалось «2 в работе» при одном реальном процессе — именно это
+        // видел оператор после того, как принял 19437.
+        const inWorkIds = new Set();
+        queueInfo.forEach((q) => {
+            q.rows.forEach((r) => {
+                if (/в работе/i.test(r.status || '')) inWorkIds.add(String(r.id));
+            });
+        });
+        mineOpen.forEach((p) => {
+            if (/в работе/i.test(p.status || '')) inWorkIds.add(String(p.id));
+        });
+        const inWork = inWorkIds.size;
 
         // Мои непринятые: открытые процессы на мне, которые ещё «Новый»
         const mineNew = mineOpen.filter((p) => /нов(ый|ые)/i.test(p.status || '')).length;
@@ -11631,6 +11657,7 @@
                         </span>
                     </div>`;
 
+                // Сводка по операторам: сколько у кого в работе и в ожидании
                 if (q.byExecutor.length) {
                     html += '<div class="tp-proc-ops">';
                     q.byExecutor.forEach((o) => {
@@ -11645,24 +11672,36 @@
                     html += '</div>';
                 }
 
-                if (q.unassignedRows.length) {
+                // САМИ ПРОЦЕССЫ: показываем ВСЕ открытые, а не только
+                // нераспределённые. Раньше в списке были лишь процессы без
+                // исполнителя, и оператор не мог перейти к тому, что уже
+                // в работе: счётчик показывал «2 в работе», а списка не было —
+                // и оставалось непонятно, какие именно это процессы.
+                const shown = q.rows.slice(0, 30);
+                if (shown.length) {
                     html += '<div class="tp-proc-unassigned">';
-                    q.unassignedRows.slice(0, 20).forEach((r) => {
-                        html += `<div class="tp-proc-row">
+                    shown.forEach((r) => {
+                        const free = !r.executor;
+                        const working = /в работе/i.test(r.status || '');
+                        const stateCls = free ? ' is-free' : (working ? ' is-work' : ' is-wait');
+                        const who = free ? 'не распределён' : r.executor;
+                        html += `<div class="tp-proc-row${stateCls}">
                             <a href="#" class="tp-proc-id" data-pid="${esc(r.id)}"
                                title="Открыть процесс">#${esc(r.id)}</a>
                             <span class="tp-proc-desc" title="${esc(r.desc)}">${esc(r.desc || '—')}</span>
-                            <span class="tp-proc-time">${esc(r.created || '')}</span>
-                            <button type="button" class="tp-proc-take"
-                                    data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>
+                            <span class="tp-proc-who" title="${esc(who)}">${esc(who)}</span>
+                            ${free
+                                ? `<button type="button" class="tp-proc-take"
+                                        data-qid="${esc(q.id)}" data-pid="${esc(r.id)}">Принять</button>`
+                                : `<span class="tp-proc-state">${esc(r.status || '')}</span>`}
                         </div>`;
                     });
-                    if (q.unassignedRows.length > 20) {
-                        html += `<div class="tp-proc-hint">и ещё ${q.unassignedRows.length - 20}</div>`;
+                    if (q.rows.length > 30) {
+                        html += `<div class="tp-proc-hint">и ещё ${q.rows.length - 30}</div>`;
                     }
                     html += '</div>';
                 } else {
-                    html += '<div class="tp-proc-hint">Все процессы распределены.</div>';
+                    html += '<div class="tp-proc-hint">Открытых процессов нет.</div>';
                 }
 
                 html += '</div>';
