@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.20
+// @version      0.72.21
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.20';
+    const SELF_VERSION = '0.72.21';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11418,7 +11418,6 @@
         ]);
 
         const mineOpen = (openMine.rows || []);
-        const inWork = mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
 
         // Закрытые сегодня — по дате закрытия, а не по статусу
         const doneToday = (closedMine.rows || []).filter((p) => {
@@ -11430,7 +11429,9 @@
             const rows = (queueData[i] && queueData[i].rows) || [];
             const byExecutor = new Map();
             let unassigned = 0;
+            let inWork = 0;
             rows.forEach((r) => {
+                if (/в работе/i.test(r.status || '')) inWork += 1;
                 if (!r.executor) {
                     unassigned += 1;
                     return;
@@ -11445,6 +11446,7 @@
                 id,
                 name: id === PROC_QUEUE_B2C ? '2 Линия ТП (B2C)' : '2 Линия ТП (B2B/Smart)',
                 rows,
+                inWork,
                 total: rows.length,
                 declared: (queueData[i] && queueData[i].total) || rows.length,
                 unassigned,
@@ -11453,6 +11455,16 @@
                     .sort((a, b) => (b.inWork + b.waiting) - (a.inWork + a.waiting)),
             };
         });
+
+        // «В работе» считаем по очередям своей линии, а не по «Моим процессам».
+        //
+        // «Мои процессы» (userProcessList) отдаёт только то, где я ИСПОЛНИТЕЛЬ.
+        // Процесс 19437 в статусе «В работе» назначен на Найдыша А.В., поэтому
+        // в «Моих процессах» его нет, и счётчик показывал 0 — при живом
+        // процессе в работе у коллеги по отделу. Руководителю нужна картина
+        // отдела, а не только личная.
+        const inWork = queueInfo.reduce((s, q) => s + q.inWork, 0)
+            + mineOpen.filter((p) => /в работе/i.test(p.status || '')).length;
 
         // Мои непринятые: открытые процессы на мне, которые ещё «Новый»
         const mineNew = mineOpen.filter((p) => /нов(ый|ые)/i.test(p.status || '')).length;
@@ -11682,6 +11694,10 @@
                 const res = await ERP.acceptProcess(qid, pid);
                 if (res.ok) {
                     btn.textContent = 'Принят';
+                    // Оператор ждёт продолжения работы: «Принять» — это первый
+                    // шаг, а не самоцель. Открываем карточку процесса, чтобы
+                    // не искать его потом в очереди вручную.
+                    procOpenProcess(pid);
                     // Данные изменились — перечитываем, чтобы цифры сошлись
                     setTimeout(() => { procRefresh(true); }, 600);
                 } else {
@@ -11784,6 +11800,8 @@
             const res = await ERP.acceptProcess(info.queueId, info.id);
             if (res.ok) {
                 close();
+                // Принял — значит собирается работать: открываем процесс сразу
+                procOpenProcess(info.id);
                 procRefresh(true);
             } else {
                 btn.disabled = false;
