@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.51
+// @version      0.72.52
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.51';
+    const SELF_VERSION = '0.72.52';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11895,6 +11895,16 @@
         seenIds: null,
         data: null,
         open: false,
+        // Признак «опрос уже идёт». Без него проходы накладывались друг на
+        // друга: таймер тикал раз в 10 с, а первый проход (чтение ролей по
+        // четырём якорям) мог идти дольше. Старый проход записывал seenIds
+        // ПОСЛЕ нового, снимок откатывался назад — и процесс, который уже
+        // был показан, объявлялся новым ещё раз.
+        busy: false,
+        // Снимок живёт дольше одной инъекции скрипта: при обновлении
+        // Tampermonkey procTeardown обнулял его, и процессы, пришедшие
+        // в этот момент, не объявлялись никогда.
+        seenKey: 'erpTpProcSeen',
         // ФИО текущего пользователя из шапки ERP — для «мои / отдела»
         myName: '',
         toastTimers: new Map(),
@@ -12556,16 +12566,50 @@
      * Первый опрос снимок только создаёт, иначе после каждой перезагрузки
      * страницы прилетал бы залп уведомлений обо всех старых процессах.
      */
-    function procNotifyNew(rows) {
+    function procNotifyNew(rows, silent) {
         const ids = new Set(rows.map((r) => r.id));
+
+        // Снимок восстанавливаем из localStorage: переинъекция скрипта
+        // (обновление Tampermonkey, отладка) не должна заставлять объявлять
+        // заново всё, что уже было показано.
+        if (!processPanel.seenIds) {
+            processPanel.seenIds = procSeenLoad();
+        }
+
+        // Первый опрос за сессию — только снимок, без всплывашек: иначе после
+        // каждой перезагрузки страницы прилетал бы залп обо всех процессах.
         if (!processPanel.seenIds) {
             processPanel.seenIds = ids;
+            procSeenSave(ids);
             return;
         }
+
         const fresh = rows.filter((r) => !processPanel.seenIds.has(r.id));
         processPanel.seenIds = ids;
-        if (!fresh.length) return;
-        fresh.slice(0, 3).forEach((r) => {
+        procSeenSave(ids);
+
+        // silent — ручное обновление: оператор сам открыл панель и всё видит.
+        // Раньше в этом случае procNotifyNew не вызывался ВООБЩЕ, и снимок
+        // не обновлялся: на следующем тике те же процессы считались новыми,
+        // и оператор получал тосты о том, что только что смотрел.
+        if (silent || !fresh.length) return;
+
+        // Раньше стояло fresh.slice(0, 3): при залпе остальные отбрасывались,
+        // но в снимок уже попадали — и больше не объявлялись никогда.
+        // Показываем все, а если их много — одним сводным тостом.
+        if (fresh.length > 3) {
+            procToast({
+                id: fresh[0].id,
+                queue: fresh[0].queueName || fresh[0].queue || '',
+                queueId: fresh[0].queueId,
+                desc: `и ещё ${fresh.length - 1} новых процессов`,
+                created: '',
+                bulk: true,
+            });
+            return;
+        }
+
+        fresh.forEach((r) => {
             procToast({
                 id: r.id,
                 // queueName приходит из очереди, queue — из «Моих процессов».
@@ -12577,6 +12621,47 @@
                 created: r.created || '',
             });
         });
+    }
+
+    /** Снимок ID — в localStorage, чтобы пережить переинъекцию скрипта. */
+    function procSeenLoad() {        try {
+            const raw = window.localStorage.getItem(processPanel.seenKey) || '';
+            const list = raw.split(',').filter((x) => /^\d+$/.test(x));
+            return list.length ? new Set(list) : null;
+        } catch (e) { return null; }
+    }
+
+    function procSeenSave(ids) {
+        try {
+            // Держим последние 500: старые процессы уже не всплывут, а снимок
+            // не должен расти бесконечно.
+            const list = Array.from(ids).slice(-500);
+            window.localStorage.setItem(processPanel.seenKey, list.join(','));
+        } catch (e) { /* приватный режим */ }
+    }
+
+    /**
+     * В какую очередь отправлять «Принять» для процесса из «Моих процессов».
+     *
+     * По типу процесса линию определить нельзя: тип «Требуется подтверждение»
+     * не содержит ни b2b, ни smart, и раньше кнопка угадывала B2C — а для
+     * B2B-процесса это чужая очередь, и accept либо падал, либо принимал
+     * не тот процесс.
+     *
+     * Источник истины — роли: если пользователь руководитель только одной
+     * линии, берём её. Если обе или ни одной — возвращаем пусто: procToast
+     * в этом случае просто откроет процесс, а не сделает неверное действие.
+     */
+    function procQueueForMine(p, roles) {
+        const r = roles || {};
+        if (r.isHeadB2c && !r.isHeadB2b) return PROC_QUEUE_B2C;
+        if (r.isHeadB2b && !r.isHeadB2c) return PROC_QUEUE_B2B;
+        // Оператор без роли руководителя: линию берём из типа, но только если
+        // он её явно называет. Иначе — пусто (только открыть процесс).
+        const t = String((p && p.type) || '');
+        if (/b2b|smart/i.test(t)) return PROC_QUEUE_B2B;
+        if (/b2c/i.test(t)) return PROC_QUEUE_B2C;
+        return '';
     }
 
     /** Всплывающее уведомление в углу + системное, если разрешено. */
@@ -12591,17 +12676,22 @@
 
         const el = document.createElement('div');
         el.className = 'tp-pp-toast';
+        // bulk — сводный тост «и ещё N новых процессов»: у него нет одного
+        // процесса, поэтому заголовок без номера, а кнопки не нужны.
+        const title = info.bulk
+            ? `Новые процессы #${esc(info.id)}`
+            : `Новый процесс #${esc(info.id)}`;
         el.innerHTML = `
             <div class="tp-pp-toast-head">
-                <span class="tp-pp-toast-title">Новый процесс #${esc(info.id)}</span>
+                <span class="tp-pp-toast-title">${title}</span>
                 <button type="button" class="tp-pp-toast-close" title="Закрыть">×</button>
             </div>
             <div class="tp-pp-toast-queue">${esc(info.queue || '')}</div>
             <div class="tp-pp-toast-desc">${esc(info.desc || '')}</div>
-            <div class="tp-pp-toast-btns">
+            ${info.bulk ? '' : `<div class="tp-pp-toast-btns">
                 <button type="button" class="tp-btn tp-pp-toast-open">Открыть</button>
                 <button type="button" class="tp-btn is-ghost tp-pp-toast-take">Принять в работу</button>
-            </div>`;
+            </div>`}`;
         host.appendChild(el);
 
         const close = () => {
@@ -12613,11 +12703,18 @@
         processPanel.toastTimers.set(el, setTimeout(close, PROC_TOAST_MS));
 
         el.querySelector('.tp-pp-toast-close').addEventListener('click', close);
-        el.querySelector('.tp-pp-toast-open').addEventListener('click', () => {
-            close();
-            procOpenProcess(info.id);
-        });
-        el.querySelector('.tp-pp-toast-take').addEventListener('click', async (e) => {
+
+        // У сводного тоста кнопок нет — обработчики вешаем только если они есть
+        const openBtn = el.querySelector('.tp-pp-toast-open');
+        if (openBtn) {
+            openBtn.addEventListener('click', () => {
+                close();
+                procOpenProcess(info.id);
+            });
+        }
+
+        const takeBtn = el.querySelector('.tp-pp-toast-take');
+        if (takeBtn) takeBtn.addEventListener('click', async (e) => {
             const btn = e.currentTarget;
             if (!info.queueId) {
                 // Очередь неизвестна — просто открываем процесс
@@ -12652,8 +12749,23 @@
      */
     function procSystemNotify(info) {
         if (typeof Notification === 'undefined') return;
+
+        // Разрешение запрашиваем, только если ещё не спрашивали.
+        //
+        // Раньше проверка `permission !== 'granted'` шла СРАЗУ после
+        // requestPermission() — а он асинхронный, разрешение в этот момент
+        // ещё 'default'. Поэтому первое системное уведомление за всё время
+        // гарантированно терялось, даже если пользователь нажимал «Разрешить».
+        // Теперь: спросили — выходим, следующее уведомление пройдёт проверку.
         if (Notification.permission === 'default') {
-            try { Notification.requestPermission(); } catch (e) { return; }
+            try {
+                Notification.requestPermission().then((perm) => {
+                    // Разрешили только что — показываем это же уведомление,
+                    // иначе оно потеряется так же, как раньше.
+                    if (perm === 'granted') procSystemNotify(info);
+                }).catch(() => { /* браузер не поддерживает промис */ });
+            } catch (e) { /* старый API без промиса */ }
+            return;
         }
         if (Notification.permission !== 'granted') return;
         try {
@@ -12687,6 +12799,38 @@
         procInjectStyle();
         procMountHeadButton();
         procMountLayer();
+
+        /*
+         * Один проход за раз.
+         *
+         * Вызовов несколько: таймер (10 с), раскрытие панели, «Принять»,
+         * возврат на вкладку. Первый проход читает роли по четырём якорям
+         * и легко занимает больше периода опроса. Два прохода шли
+         * параллельно, и более старый записывал снимок последним — seenIds
+         * откатывался, и уже показанный процесс объявлялся новым снова.
+         *
+         * Ручной вызов (раскрытие, «Принять») не выбрасываем: он нужен
+         * оператору сразу. Вместо этого ставим флаг «ещё раз» — текущий
+         * проход закончится и запустит повторный.
+         */
+        if (processPanel.busy) {
+            if (manual) processPanel.busyAgain = true;
+            return;
+        }
+        processPanel.busy = true;
+
+        try {
+            await procRefreshInner(manual);
+        } finally {
+            processPanel.busy = false;
+            if (processPanel.busyAgain) {
+                processPanel.busyAgain = false;
+                procRefresh(false).catch(() => { /* следующий тик попробует */ });
+            }
+        }
+    }
+
+    async function procRefreshInner(manual) {
 
         // Роли читаем один раз за сессию: они не меняются без перелогина.
         //
@@ -12768,7 +12912,7 @@
          * Снимок общий (по ID): один процесс не может быть в двух источниках,
          * поэтому повторных всплывашек не будет.
          */
-        if (!manual && processPanel.roles) {
+        if (processPanel.roles) {
             const r = processPanel.roles;
             const fresh = [];
 
@@ -12778,8 +12922,15 @@
                     id: p.id,
                     desc: p.name || '',
                     queue: 'Мои процессы',
-                    // очередь по типу: нужна для «Принять» из уведомления
-                    queueId: /b2b|smart/i.test(p.type || '') ? PROC_QUEUE_B2B : PROC_QUEUE_B2C,
+                    // Очередь для «Принять» из уведомления.
+                    //
+                    // По типу процесса её угадывать нельзя: тип вида
+                    // «Требуется подтверждение» не содержит ни b2b, ни smart,
+                    // и кнопка отправляла бы accept в чужую очередь.
+                    // Берём линию из ролей пользователя, а если роли обе —
+                    // оставляем пусто: тогда кнопка просто откроет процесс,
+                    // а не сделает неверное действие.
+                    queueId: procQueueForMine(p, r),
                 });
             });
 
@@ -12799,7 +12950,12 @@
             // создаёт первый снимок. Раньше стояло `if (fresh.length)`, и когда
             // на старте процессов не было, снимок оставался null — следующий
             // новый процесс считался «первым опросом» и уведомление молчало.
-            procNotifyNew(fresh);
+            //
+            // manual — раскрытие панели или «Принять»: снимок обновляем, но
+            // всплывашек не показываем. Раньше procNotifyNew в этом случае
+            // не вызывался вовсе, снимок отставал, и следующий тик объявлял
+            // новыми процессы, которые оператор только что видел в списке.
+            procNotifyNew(fresh, !!manual);
         }
     }
 
@@ -12839,10 +12995,15 @@
             processPanel.timer = null;
         }
         processPanel.started = false;
-        processPanel.seenIds = null;
+        // Снимок НЕ обнуляем: он лежит в localStorage и должен пережить
+        // переинъекцию скрипта. Иначе после обновления Tampermonkey всё,
+        // что пришло за эти секунды, объявилось бы новым заново — или,
+        // наоборот, потерялось бы.
         processPanel.data = null;
         processPanel.open = false;
         processPanel.roles = null;
+        processPanel.busy = false;
+        processPanel.busyAgain = false;
         processPanel.toastTimers.forEach((t) => clearTimeout(t));
         processPanel.toastTimers.clear();
 
