@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.48
+// @version      0.72.49
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.48';
+    const SELF_VERSION = '0.72.49';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -2026,6 +2026,55 @@
             });
 
             return { map, list };
+        },
+
+        /**
+         * Адреса сервисов Интернета: { [serviceId]: '10.128.0.158' }.
+         *
+         * В дереве сервисов (serviceTree) адреса нет вовсе — там только имя,
+         * тип, период и состояние. Адрес лежит в форме сервиса (serviceGet,
+         * поля addrFrom/addrTo), и раньше блок «Сервисы в биллинге» искал его
+         * в ИМЕНИ. Для PPPoE это работало: шаблон имени — `<логин> <addrFrom>`,
+         * поэтому в дереве видно «BILL0022504 10.100.92.7». Для IPoE шаблон
+         * имени адрес не содержит — там «Интернет (IPoE(DHCP))», и блок писал
+         * «без адреса» даже когда адрес выдан. На договоре 56933 у сервиса
+         * 78197 в форме стоит addrFrom=10.128.0.158, а панель показывала
+         * «IPoE без адреса».
+         *
+         * Запрашиваем только для ДЕЙСТВУЮЩИХ сервисов: у истории адреса давно
+         * неактуальны, а каждая форма — это отдельный ответ на 15 КБ.
+         * Ответы кэшируются общим кэшем fetchText (TTL 90 с по serviceGet).
+         */
+        async serviceAddresses(cid, list) {
+            const id = cid || this.contractId();
+            if (!id) return {};
+
+            const alive = (list || []).filter((s) => s && s.id && isAliveService(s));
+            if (!alive.length) return {};
+
+            const out = {};
+            await Promise.all(alive.map(async (s) => {
+                try {
+                    const html = await fetchText(
+                        `/user/plugin/bgbilling/proto/inet.do?method=serviceGet`
+                        + `&id=${encodeURIComponent(s.id)}&contractId=${encodeURIComponent(id)}`
+                        + '&billingId=bill&moduleId=1'
+                    );
+                    const form = parseHtml(html).querySelector('form');
+                    const val = (n) => {
+                        const el = form && form.elements[n];
+                        return el ? String(el.value || '').trim() : '';
+                    };
+                    // 0.0.0.0 — «адрес не выдан», а не адрес
+                    const from = val('addrFrom');
+                    const to = val('addrTo');
+                    const real = (v) => (v && v !== '0.0.0.0' ? v : '');
+                    out[s.id] = real(from) || real(to);
+                } catch (e) {
+                    out[s.id] = '';
+                }
+            }));
+            return out;
         },
 
         /**
@@ -7586,10 +7635,19 @@
             // 07.11 сервис стоял в одной строке с действующим, и оператор читал
             // это как два работающих подключения. Полный список со статусами
             // уходит в title — там же видно, что именно закрыто.
+            //
+            // Для строки со статистикой запасной вариант «все имена» не годится:
+            // на договоре 56933 пароль статистики 943686 остался только у
+            // УДАЛЁННОГО IPoE-сервиса (у нового пароля нет — он на DHCP),
+            // и подпись получалась «Статистика · IPoE Интернет (IPoE(DHCP))»
+            // со статусом «удалён». Кабинет при этом работает, а имя мёртвого
+            // сервиса в строке читается как «доступ удалён».
             const stat = r.labels.filter((l) => l.rank === Infinity);
             const alive = r.labels.filter((l) => l.rank === 0);
             const dead = r.labels.filter((l) => l.rank !== Infinity && l.rank !== 0);
-            const shown = (alive.length ? stat.concat(alive) : r.labels.slice())
+            const shown = (stat.length
+                ? stat.concat(alive)
+                : (alive.length ? alive : r.labels))
                 .map((l) => l.name).filter(Boolean);
 
             const title = r.labels
@@ -7597,11 +7655,18 @@
                 .map((l) => (l.rank === Infinity ? l.name : `${l.name} — ${rankState(l.rank)}`))
                 .join('\n');
 
+            // Статус строки со статистикой описывает ДОСТУП К КАБИНЕТУ, а он
+            // не удаляется вместе с сервисом. Показываем «действует», только
+            // если этим же паролем живёт сервис; иначе статуса нет вовсе.
+            // Раньше сюда попадал ранг мёртвого сервиса, и получалось
+            // «Статистика … удалён» при рабочем личном кабинете.
+            const stateRank = r.isStat && !r.alive ? Infinity : r.rank;
+
             return {
                 name: shown.join(' · '),
                 title: dead.length || alive.length > 1 ? title : '',
-                state: rankState(r.rank),
-                good: r.rank === 0,
+                state: stateRank === Infinity ? '' : rankState(stateRank),
+                good: r.isStat ? r.alive > 0 : r.rank === 0,
                 // Пароль статистики помечаем явно: по значению его не отличить
                 // от пароля PPPoE (в биллинге они часто совпадают), а блоку
                 // «Отправить на почту» нужно взять именно его.
@@ -8520,14 +8585,18 @@
         });
 
         // Сервисы в биллинге: тип, период, статус и устройство.
+        //
+        // Адрес сервиса в дереве не приходит — его надо дочитать из формы
+        // каждого ДЕЙСТВУЮЩЕГО сервиса. Делаем это здесь, а не внутри
+        // renderServices: рендер синхронный и сеть в нём ждать нельзя.
         alive('services', servicesOnce(), (data) => {
-            fillLazy(panel, 'services', renderServices((data && data.list) || []));
+            const svcList = (data && data.list) || [];
 
             // Состояние сервиса — самый точный признак блокировки: «отключен
             // [Недостаточно средств]» приходит от биллинга и не зависит от
             // того, сходятся ли цифры в отчёте. Без этого панель писала
             // «Блокировки нет» договору с уже отключённой услугой.
-            const disabled = disabledServices((data && data.list) || []);
+            const disabled = disabledServices(svcList);
             if (panel._tpCtx) {
                 panel._tpCtx.disabled = disabled.length ? disabled : null;
                 refreshMoney(panel);
@@ -8536,12 +8605,27 @@
             // Раскрытие истории сервисов переживает перерисовку: автообновление
             // перерисовывает блок каждые 42 секунды, и без восстановления
             // открытый оператором список закрывался бы сам.
-            const box = panel.querySelector('.tp-lazy[data-lazy="services"]');
-            const more = box && box.querySelector('[data-svc-more]');
-            if (more) {
+            const restoreMore = () => {
+                const box = panel.querySelector('.tp-lazy[data-lazy="services"]');
+                const more = box && box.querySelector('[data-svc-more]');
+                if (!more) return;
                 if (panel._tpSvcMoreOpen) more.open = true;
                 more.addEventListener('toggle', () => { panel._tpSvcMoreOpen = more.open; });
-            }
+            };
+
+            erpOnce(panel, 'serviceAddrs', () => ERP.serviceAddresses(id, svcList).catch(() => ({})))
+                .then((addrs) => {
+                    if (genOf(panel) !== generation) return;
+                    if (!document.contains(panel)) return;
+                    fillLazy(panel, 'services', renderServices(svcList, addrs));
+                    restoreMore();
+                })
+                .catch(() => {
+                    if (genOf(panel) !== generation) return;
+                    if (!document.contains(panel)) return;
+                    fillLazy(panel, 'services', renderServices(svcList));
+                    restoreMore();
+                });
         });
 
         // Примечания — тот же узел, что в дереве карточки BGBilling.
@@ -8793,9 +8877,11 @@
      * такие записи в дереве выглядят открытыми, но в биллинге их уже нет —
      * именно они ломали создание нового сервиса с тем же логином.
      */
-    function renderServices(list) {
+    function renderServices(list, addrMap) {
         const arr = (list || []).slice();
         if (!arr.length) return '<div class="tp-hint">Сервисов нет.</div>';
+
+        const addrs = addrMap || {};
 
         // Действующие показываем всегда, закрытые и удалённые — под раскрытием.
         // На AV0000001 в дереве 28 записей, из них 27 удалённых: если рисовать
@@ -8812,18 +8898,23 @@
                 ? '<span class="tp-chip is-bad">удалён</span>'
                 : rank === 1 ? '<span class="tp-chip is-warn">закрыт</span>'
                     : '<span class="tp-chip is-good">открыт</span>';
-            // Имя сервиса и признак адреса.
+            // Адрес сервиса.
             //
-            // Шаблон биллинга: `<логин> <addrFrom> <addrTo>`. По нему видно,
-            // выдан ли адрес: «AV0000001 10.100.31.30» — выдан (серый это или
-            // белый — показывает сам адрес), «[IpAddress:null]» — не выдан.
-            // Поэтому адрес оставляем, заглушку заменяем на явное «без адреса»,
-            // а повтор адреса схлопываем (см. cleanBillServiceName).
-            const addrMatch = String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/);
-            const addr = addrMatch ? addrMatch[1] : '';
+            // Источников два, и порядок важен:
+            //  1) имя сервиса — работает только для PPPoE, где шаблон имени
+            //     содержит addrFrom («BILL0022504 10.100.92.7»);
+            //  2) форма сервиса (serviceGet) — единственный источник для IPoE,
+            //     у которого в имени адреса нет вовсе.
+            //
+            // Раньше смотрели ТОЛЬКО имя, и любой IPoE-сервис объявлялся
+            // «без адреса»: на 56933 у действующего сервиса 78197 выдан
+            // 10.128.0.158, а панель писала «IPoE без адреса». Оператор шёл
+            // проверять DHCP и не находил проблемы — её и не было.
+            const nameAddr = (String(s.name || '').match(/(\d{1,3}(?:\.\d{1,3}){3})/) || [])[1] || '';
+            const addr = nameAddr || (s.id ? (addrs[s.id] || '') : '');
             const ipChip = addr
                 ? `<span class="tp-chip tp-svc-ip is-xs">${esc(addr)}</span>`
-                : '<span class="tp-chip is-warn tp-svc-noip is-xs" title="Сервису не выдан адрес: в имени стоит заглушка шаблона [IpAddress:null]">без адреса</span>';
+                : '<span class="tp-chip is-warn tp-svc-noip is-xs" title="Сервису не выдан адрес: в форме сервиса addrFrom = 0.0.0.0">без адреса</span>';
             return `<div class="tp-pay-row">
                     <span class="tp-pay-name">${esc(cleanBillServiceName(s.name, { dropAddr: true }) || 'Сервис')} ${stateChip}
                         <span class="tp-chip is-xs">${esc(s.type || '')}</span> ${ipChip}
