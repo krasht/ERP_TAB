@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.47
+// @version      0.72.48
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.47';
+    const SELF_VERSION = '0.72.48';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4515,6 +4515,53 @@
         return hex.join('').toUpperCase();
     }
 
+    /** Hex-группы MAC: «HWTC:6A:0C:D2:75» → ['6A','0C','D2','75']. */
+    function macGroups(mac) {
+        return String(mac || '').trim().split(/[:\-\s]+/)
+            .filter((g) => /^[0-9a-f]{1,2}$/i.test(g))
+            .map((g) => g.toUpperCase());
+    }
+
+    /**
+     * Технология PON по MAC из GetOLT: 'EPON', 'GPON' или '' (не определить).
+     *
+     * В EPON MAC — это обычный Ethernet-адрес из шести байт, и OLT ждёт его
+     * с двоеточиями. В GPON MAC — серийный номер ONU: четыре байта после
+     * префикса вендора, и в формах он вбивается слитно (6A0CD275).
+     *
+     * Поэтому технологию определяем по САМОМУ MAC, без лишних запросов:
+     * шесть hex-групп — EPON, четыре — GPON. Проверено на 21 договоре
+     * (EP-* и GP-* OLT): правило не дало ни одного исключения.
+     *
+     * Это надёжнее, чем смотреть на имя OLT: список OLT отдаётся одним
+     * ответом на 334 КБ, и тянуть его ради двух букв в карточке незачем.
+     * Заодно не ломается на OLT с нестандартным именем («OLT-FD1208_201»).
+     */
+    function ponType(mac) {
+        const groups = macGroups(mac);
+        if (groups.length === 6) return 'EPON';
+        if (groups.length === 4) return 'GPON';
+        return '';
+    }
+
+    /**
+     * MAC ONU в том виде, в каком его ждёт оборудование этого типа.
+     *
+     * EPON → «08:C6:B3:B9:3E:3B» (шесть байт через двоеточие);
+     * GPON → «6A0CD275» (четыре байта слитно, без префикса вендора).
+     *
+     * Раньше копировалось всегда слитно и без разделителей: для GPON это
+     * верно, а на EPON оператор получал «08C6B3B93E3B» — такую строку
+     * OLT не принимает, и её приходилось разбивать руками.
+     */
+    function onuMacCopy(mac) {
+        const groups = macGroups(mac);
+        if (groups.length === 6) return groups.join(':');
+        if (groups.length === 4) return groups.join('');
+        // Незнакомый формат — отдаём прежнее поведение, чтобы не потерять MAC
+        return macPlain(mac);
+    }
+
     /**
      * Копируемый фрагмент: значение с иконкой копирования.
      *
@@ -4553,7 +4600,11 @@
         let html = '';
 
         if (onu.length) {
-            html += '<div class="tp-eq-group">GPON</div>';
+            // Тип PON берём по MAC первой ONU: он же решает, в каком виде
+            // копируется MAC. Заголовок группы раньше был жёстко «GPON»,
+            // и на EPON-подключениях это было просто неправдой.
+            const tech = ponType(onu[0].mac);
+            html += `<div class="tp-eq-group">${tech ? esc(tech) : 'PON'}</div>`;
             onu.forEach((o) => {
                 // Где стоит: OLT + порт/ONU ID — то, что нужно диспетчеру для выезда.
                 // Адрес OLT копируем по последним двум октетам: на OLT его ищут
@@ -4592,7 +4643,7 @@
                                 ? '<span class="tp-chip is-good">online</span>'
                                 : `<span class="tp-chip is-bad">${esc(o.state || 'offline')}</span>`}
                         </div>
-                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(macPlain(o.mac), o.mac)}</div>` : ''}
+                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(onuMacCopy(o.mac), o.mac)}</div>` : ''}
                         ${place ? `<div class="tp-device-meta">${place}</div>` : ''}
                         ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${macLine}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
