@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.50
+// @version      0.72.51
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.50';
+    const SELF_VERSION = '0.72.51';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -105,6 +105,28 @@
     const PROCESS_STATUS_DONE = '4';
     /** Промежуточный «В работе»: из «Новый» в «Завершено» напрямую нельзя. */
     const PROCESS_STATUS_WORK = '2';
+
+    /*
+     * Заявки эксплуатации: «Перенос линий связи» и «Провис ВОЛС».
+     *
+     * В базе есть похожие пары типов, и перепутать их легко:
+     *   182 «Перенос ЛС» / 183 «Провис ЛС» — отдел «Эксплуатация», нужны нам;
+     *   200 «Выезд монтажника: Провис ЛС» / 201 «Перенос ЛС» — отдел
+     *   «Монтажники», это выезд бригады, а не заявка на линию.
+     * ID сверены по дереву типов на живой карточке.
+     */
+    const PROCESS_TYPE_TRANSFER = '182';
+    const PROCESS_TYPE_SAG = '183';
+
+    /*
+     * «Причина обращения ( TREE)» — параметр 400 процесса типа 28.
+     *
+     * Значения — позиции в дереве («1.17»), а не ID: так их присылает ERP
+     * в чекбоксах формы параметра. «Интернет» — тема «1».
+     */
+    const PROCESS_PARAM_REASON = '400';
+    const PROCESS_REASON_TRANSFER = '1.17';   // Интернет Перенос линий связи
+    const PROCESS_REASON_SAG = '1.18';        // Интернет Провис ВОЛС
 
     /**
      * Адреса, с которых ERP умеет отправлять письма (typeId сообщения).
@@ -1299,6 +1321,144 @@
             const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
             const err = plain.match(/(Ошибка|Exception|не найден|запрещено|нельзя)[^.]{0,120}/i);
             return { ok: false, id: '', message: (err ? err[0] : plain).slice(0, 160) };
+        },
+
+        /**
+         * Значение параметра процесса: /user/parameter.do, method=parameterUpdate.
+         *
+         * Так ERP сохраняет параметры из карточки процесса. Значения дерева
+         * («Причина обращения») передаются ПОВТОРЯЮЩИМИСЯ полями value — форма
+         * собирается через serializeAnything, а он пишет каждое отмеченное
+         * поле отдельной парой `value=…`, без индексов. Поэтому массив
+         * склеиваем вручную, а не через URLSearchParams.append в цикле —
+         * результат тот же, но так видно, что порядок и повторы важны.
+         */
+        async setProcessParam(processId, paramId, values) {
+            const pid = String(processId || '');
+            if (!pid) return { ok: false, message: 'нет ID процесса' };
+
+            const parts = [
+                'method=parameterUpdate',
+                'id=' + encodeURIComponent(pid),
+                'paramId=' + encodeURIComponent(String(paramId)),
+            ];
+            (values || []).forEach((v) => {
+                parts.push('value=' + encodeURIComponent(String(v)));
+            });
+
+            try {
+                const res = await fetch('/user/parameter.do', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: parts.join('&'),
+                });
+                const text = await res.text();
+                const verdict = jsonVerdict(text);
+                // Пустой ответ — норма: ERP на успешное сохранение параметра
+                // отдаёт пустое тело, и jsonVerdict считает это ошибкой.
+                if (!String(text).trim()) return { ok: true, message: '' };
+                return verdict;
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Создание и привязка связанного процесса: /user/process/link/process.do,
+         * method=linkProcessCreate с createTypeId.
+         *
+         * Это та же операция, что делает кнопка «Создать и привязать» на
+         * вкладке «Связанные процессы»: она отправляет форму и читает
+         * data.process.id из ответа (см. $$.process.link.process.createAndLink).
+         */
+        async linkProcess(processId, typeId) {
+            const pid = String(processId || '');
+            if (!pid || !typeId) return { ok: false, id: '', message: 'нет ID процесса или типа' };
+
+            try {
+                const res = await fetch('/user/process/link/process.do', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        method: 'linkProcessCreate',
+                        id: pid,
+                        createTypeId: String(typeId),
+                    }),
+                });
+                const text = await res.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (e) { /* не JSON */ }
+
+                const newId = json && json.data && json.data.process && json.data.process.id;
+                if (newId) return { ok: true, id: String(newId), message: '' };
+
+                const verdict = jsonVerdict(text);
+                return { ok: false, id: '', message: verdict.message || 'процесс не создан' };
+            } catch (e) {
+                return { ok: false, id: '', message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Заявка «Перенос линий связи» или «Провис ВОЛС» одним действием.
+         *
+         * Три шага, в этом порядке:
+         *   1) обращение «1 Линия / Обращение абонента» (тип 28);
+         *   2) причина обращения в дереве параметра 400 (1.17 или 1.18);
+         *   3) связанный процесс эксплуатации (182 или 183).
+         *
+         * Обращение НЕ закрываем: по договорённости с поддержкой его закрывает
+         * их доработка. И создаём новое даже при наличии открытого — так же
+         * договорились.
+         *
+         * Ошибку на шагах 2–3 не превращаем в исключение: обращение уже
+         * существует, и оператору важно знать его номер, чтобы не заводить
+         * второе вручную. Поэтому возвращаем ok:false вместе с requestId.
+         */
+        async createLineRequest(cid, kind) {
+            const id = cid || this.contractId();
+            if (!id) return { ok: false, requestId: '', linkedId: '', message: 'Нет ID договора' };
+
+            const isTransfer = kind !== 'sag';
+            const typeId = isTransfer ? PROCESS_TYPE_TRANSFER : PROCESS_TYPE_SAG;
+            const reason = isTransfer ? PROCESS_REASON_TRANSFER : PROCESS_REASON_SAG;
+            const label = isTransfer ? 'Перенос линий связи' : 'Провис ВОЛС';
+
+            const created = await this.createProcess(id, { typeId: PROCESS_TYPE_LINE1 });
+            if (!created || !created.ok || !created.id) {
+                return {
+                    ok: false,
+                    requestId: '',
+                    linkedId: '',
+                    message: (created && created.message) || 'не удалось создать обращение',
+                };
+            }
+
+            const requestId = created.id;
+
+            const param = await this.setProcessParam(requestId, PROCESS_PARAM_REASON, [reason]);
+            if (!param.ok) {
+                return {
+                    ok: false,
+                    requestId,
+                    linkedId: '',
+                    message: `обращение #${requestId} создано, но причина «${label}» не записалась: ${param.message}`,
+                };
+            }
+
+            const linked = await this.linkProcess(requestId, typeId);
+            if (!linked.ok) {
+                return {
+                    ok: false,
+                    requestId,
+                    linkedId: '',
+                    message: `обращение #${requestId} создано с причиной «${label}», но связанный процесс не привязался: ${linked.message}`,
+                };
+            }
+
+            return { ok: true, requestId, linkedId: linked.id, message: '' };
         },
 
         /**
@@ -3891,6 +4051,30 @@
             background: rgba(127,127,127,.14); border-radius: 999px; padding: 1px 8px;
         }
         .tp-proc-state:empty { display: none; }
+        /* Кнопки заявок эксплуатации в шапке карточки «Процессы».
+           margin-left:auto прижимает их к правому краю: заголовок карточки —
+           flex, и без этого кнопки встали бы сразу после счётчика.
+           Размер уменьшен относительно .tp-btn: в шапке карточки полноценная
+           кнопка перетягивала бы внимание с самого списка процессов. */
+        .tp-proc-actions { margin-left: auto; display: inline-flex; gap: 6px; flex: 0 0 auto; }
+        .tp-proc-new {
+            font: inherit; font-size: 11.5px; font-weight: 600;
+            /* Заголовок карточки — uppercase с трекингом; кнопке это ни к чему:
+               «ПЕРЕНОС ЛС» капсом читается как ещё один заголовок, а не как
+               действие. Сбрасываем оба свойства явно. */
+            text-transform: none; letter-spacing: normal;
+            padding: 4px 9px; border-radius: 8px; cursor: pointer;
+            color: var(--tp-fg2); background: rgba(127,127,127,.12);
+            border: 1px solid transparent; white-space: nowrap;
+            transition: background .15s, color .15s;
+        }
+        .tp-proc-new:hover { background: rgba(127,127,127,.20); color: var(--tp-fg); }
+        .tp-proc-new:focus-visible { outline: 2px solid var(--tp-blue); outline-offset: 1px; }
+        .tp-proc-new[disabled] { opacity: .55; cursor: default; }
+        .tp-proc-msg { font-size: 12px; font-weight: 500; margin-top: 10px; line-height: 1.4; }
+        .tp-proc-msg.is-ok { color: var(--tp-ok); }
+        .tp-proc-msg.is-bad { color: var(--tp-bad); }
+        .tp-proc-msg a { color: inherit; text-decoration: underline; }
         /* Вкладки внутри карточки — те же, что у «Сессии»: оператор уже знает,
            как они выглядят и что счётчик справа от подписи. */
         .tp-proc-tabs { margin-bottom: 10px; }
@@ -4993,6 +5177,12 @@
             <div class="tp-card-title">
                 <span class="tp-dot"></span>Процессы
                 <span class="tp-proc-state" data-role="proc-state"></span>
+                <span class="tp-proc-actions">
+                    <button type="button" class="tp-proc-new" data-kind="transfer"
+                            title="Создать обращение «1 Линия» с причиной «Интернет Перенос линий связи» и привязать процесс «Перенос ЛС»">Перенос ЛС</button>
+                    <button type="button" class="tp-proc-new" data-kind="sag"
+                            title="Создать обращение «1 Линия» с причиной «Интернет Провис ВОЛС» и привязать процесс «Провис ЛС»">Провис ВОЛС</button>
+                </span>
             </div>
             <div class="tp-lazy-body">${skeleton(2)}</div>
         </div>`;
@@ -6615,6 +6805,13 @@
                 return;
             }
 
+            // Заявка эксплуатации: «Перенос ЛС» / «Провис ВОЛС»
+            const newBtn = ev.target.closest('.tp-proc-new');
+            if (newBtn) {
+                createLineRequest(panel, card, newBtn).catch(() => { /* обработано внутри */ });
+                return;
+            }
+
             const btn = ev.target.closest('.tp-proc-tabs button');
             if (!btn) return;
             const kind = btn.dataset.kind || 'open';
@@ -6635,6 +6832,69 @@
             ev.preventDefault();
             openProcess(row.dataset.proc);
         });
+    }
+
+    /**
+     * Кнопки «Перенос ЛС» и «Провис ВОЛС»: заявка эксплуатации одним кликом.
+     *
+     * Порядок действий задан процессом в ERP: обращение «1 Линия» → причина
+     * в дереве параметра → связанный процесс эксплуатации. Всё это делает
+     * ERP.createLineRequest, здесь только состояние кнопки и текст результата.
+     *
+     * Сообщение ставим в конец карточки, а не всплывашкой: оператору нужен
+     * номер обращения, чтобы сослаться на него в разговоре, и он должен
+     * остаться на экране.
+     */
+    async function createLineRequest(panel, card, btn) {
+        const cid = panel.dataset.contractId || card.dataset.contract || '';
+        const kind = btn.dataset.kind || 'transfer';
+        const isTransfer = kind !== 'sag';
+        const label = isTransfer ? 'Перенос ЛС' : 'Провис ВОЛС';
+
+        // Второй клик во время работы создал бы дубль заявки — блокируем сразу
+        // все кнопки карточки, а не только нажатую.
+        const buttons = Array.from(card.querySelectorAll('.tp-proc-new'));
+        const restore = buttons.map((b) => ({ el: b, text: b.textContent }));
+        buttons.forEach((b) => { b.disabled = true; });
+        btn.textContent = 'Создаю…';
+
+        const oldMsg = card.querySelector('.tp-proc-msg');
+        if (oldMsg) oldMsg.remove();
+
+        // Сообщение вешаем на САМУ карточку, а не в тело: loadProcesses
+        // перерисовывает .tp-lazy-body целиком, и текст с номером обращения
+        // исчез бы сразу после обновления списка — то есть в тот момент,
+        // когда он и нужен оператору.
+        const show = (cls, html) => {
+            const el = document.createElement('div');
+            el.className = 'tp-proc-msg ' + cls;
+            el.innerHTML = html;
+            card.appendChild(el);
+        };
+
+        try {
+            const res = await ERP.createLineRequest(cid, kind);
+            if (res.ok) {
+                show('is-ok', `Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">`
+                    + `#${esc(res.requestId)}</a> создано, причина «${esc(label)}», `
+                    + `связанный процесс #${esc(res.linkedId)}.`);
+                // Список активных обновится с сервера: новое обращение должно
+                // появиться сразу, иначе оператор заведёт второе.
+                await loadProcesses(panel, cid).catch(() => null);
+            } else {
+                show('is-bad', esc(res.message || 'не удалось создать заявку')
+                    + (res.requestId
+                        ? ` Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">#${esc(res.requestId)}</a> уже создано.`
+                        : ''));
+            }
+        } catch (e) {
+            show('is-bad', esc(e.message || String(e)));
+        } finally {
+            restore.forEach(({ el, text }) => {
+                el.disabled = false;
+                el.textContent = text;
+            });
+        }
     }
 
     /* ------------------------------------------------ отправка доступа на почту */
