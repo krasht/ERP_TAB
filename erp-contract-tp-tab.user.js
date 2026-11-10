@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.46
+// @version      0.72.47
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.46';
+    const SELF_VERSION = '0.72.47';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -7489,7 +7489,9 @@
             if (!prev) {
                 byValue.set(key, {
                     value: r.value,
-                    labels: [r.name],
+                    // Подпись храним вместе с рангом: в строке показываем только
+                    // действующие имена, а закрытые и удалённые уходят в title.
+                    labels: [{ name: r.name, rank: r.kind === 'stat' ? Infinity : r.rank }],
                     // Infinity — «статуса нет»: служебная строка не должна
                     // становиться лучшим статусом только из-за пустого rank.
                     rank: r.kind === 'stat' ? Infinity : r.rank,
@@ -7506,25 +7508,57 @@
                 });
                 return;
             }
-            if (r.name && prev.labels.indexOf(r.name) < 0) prev.labels.push(r.name);
+            // Дедуп по имени, но с сохранением ЛУЧШЕГО ранга. На договоре 56832
+            // две записи «Интернет (BRAS-004)»: одна удалённая, одна живая.
+            // Простой пропуск повтора оставлял в списке удалённую, живая терялась,
+            // и строка снова подписывалась мёртвым сервисом.
+            const labelRank = r.kind === 'stat' ? Infinity : r.rank;
+            const same = r.name ? prev.labels.find((l) => l.name === r.name) : null;
+            if (same) {
+                same.rank = Math.min(same.rank, labelRank);
+            } else if (r.name) {
+                prev.labels.push({ name: r.name, rank: labelRank });
+            }
             if (r.kind === 'stat') { prev.isStat = true; return; }
             prev.total += 1;
             if (r.rank === 0) prev.alive += 1;
             prev.rank = Math.min(prev.rank, r.rank);
         });
-        const uniq = Array.from(byValue.values()).map((r) => ({
-            name: r.labels.filter(Boolean).join(' · '),
-            state: r.rank === 0 ? 'действует'
-                : r.rank === 1 ? 'закрыт'
-                    : r.rank === 2 ? 'удалён' : '',
-            good: r.rank === 0,
-            // Пароль статистики помечаем явно: по значению его не отличить
-            // от пароля PPPoE (в биллинге они часто совпадают), а блоку
-            // «Отправить на почту» нужно взять именно его.
-            kind: r.isStat ? 'stat' : 'svc',
-            count: r.total > 1 ? { alive: r.alive, total: r.total } : null,
-            value: r.value,
-        }));
+        const rankState = (rank) => (rank === 0 ? 'действует'
+            : rank === 1 ? 'закрыт'
+                : rank === 2 ? 'удалён' : '');
+
+        const uniq = Array.from(byValue.values()).map((r) => {
+            // В строке — только живые имена. Раньше подписывались ВСЕ записи
+            // с этим паролем, и на договоре 56832 получалось «Статистика ·
+            // IPoE Интернет (IPoE(DHCP)) · IPoE Интернет (BRAS-004)»: удалённый
+            // 07.11 сервис стоял в одной строке с действующим, и оператор читал
+            // это как два работающих подключения. Полный список со статусами
+            // уходит в title — там же видно, что именно закрыто.
+            const stat = r.labels.filter((l) => l.rank === Infinity);
+            const alive = r.labels.filter((l) => l.rank === 0);
+            const dead = r.labels.filter((l) => l.rank !== Infinity && l.rank !== 0);
+            const shown = (alive.length ? stat.concat(alive) : r.labels.slice())
+                .map((l) => l.name).filter(Boolean);
+
+            const title = r.labels
+                .filter((l) => l.name)
+                .map((l) => (l.rank === Infinity ? l.name : `${l.name} — ${rankState(l.rank)}`))
+                .join('\n');
+
+            return {
+                name: shown.join(' · '),
+                title: dead.length || alive.length > 1 ? title : '',
+                state: rankState(r.rank),
+                good: r.rank === 0,
+                // Пароль статистики помечаем явно: по значению его не отличить
+                // от пароля PPPoE (в биллинге они часто совпадают), а блоку
+                // «Отправить на почту» нужно взять именно его.
+                kind: r.isStat ? 'stat' : 'svc',
+                count: r.total > 1 ? { alive: r.alive, total: r.total } : null,
+                value: r.value,
+            };
+        });
 
         if (!uniq.length) {
             panel._tpAccessHtml = '';
@@ -7537,10 +7571,11 @@
         uniq.forEach((r) => {
             const stateCls = r.good ? ' is-good' : '';
             const cnt = r.count
-                ? ` <span class="tp-pwd-count" title="Действующих ${r.count.alive} из ${r.count.total} записей">${r.count.alive} из ${r.count.total}</span>`
+                ? ` <span class="tp-pwd-count" title="Записей с этим паролем: ${r.count.total}, из них действует ${r.count.alive}">${r.count.alive} из ${r.count.total}</span>`
                 : '';
+            const nameTitle = r.title || r.name;
             html += `<div class="tp-pwd-row"${r.kind === 'stat' ? ' data-kind="stat"' : ''}>
-                <span class="tp-pwd-name" title="${esc(r.name)}">${esc(r.name)}${r.state ? ` <span class="tp-pwd-state${stateCls}">${esc(r.state)}</span>` : ''}${cnt}</span>
+                <span class="tp-pwd-name" title="${esc(nameTitle)}">${esc(r.name)}${r.state ? ` <span class="tp-pwd-state${stateCls}">${esc(r.state)}</span>` : ''}${cnt}</span>
                 <span class="tp-pwd-val" data-pwd="${esc(r.value)}" tabindex="0" title="Нажмите, чтобы скопировать">${esc(r.value)}</span>
             </div>`;
         });
