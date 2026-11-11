@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.59
+// @version      0.72.60
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.59';
+    const SELF_VERSION = '0.72.60';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -7088,10 +7088,12 @@
                 return;
             }
 
-            // Заявка эксплуатации: «Перенос ЛС» / «Провис ВОЛС»
+            // Заявка эксплуатации: «Перенос ЛС» / «Провис ВОЛС».
+            // createLineRequest синхронная — она только раскрывает форму,
+            // запрос к ERP уходит позже, по кнопке «Создать заявку».
             const newBtn = ev.target.closest('.tp-proc-new');
             if (newBtn) {
-                createLineRequest(panel, card, newBtn).catch(() => { /* обработано внутри */ });
+                createLineRequest(panel, card, newBtn);
                 return;
             }
 
