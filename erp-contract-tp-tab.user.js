@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.52
+// @version      0.72.53
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.52';
+    const SELF_VERSION = '0.72.53';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -908,6 +908,15 @@
 
     /* --------------------------------------------------------- ERP data layer */
 
+    /**
+     * Кэш списка OLT (id → название и вендор).
+     *
+     * Список отдаётся одним ответом на 334 КБ, а нужен только чтобы понять
+     * тип PON для ONU. Держим его 5 минут: справочник OLT меняется раз
+     * в месяц, а карточек за смену открывают десятки.
+     */
+    const OLT_CACHE = { data: null, until: 0 };
+
     const ERP = {
         /**
          * Поддерживаем два способа открытия договора в ERP:
@@ -1271,6 +1280,47 @@
 
             const onu = parseGetoltOnu(html);
             return { ok: true, onu, href, reason: onu.length ? '' : 'empty' };
+        },
+
+        /**
+         * Список OLT из GetOLT: { id → {title, vendor} }.
+         *
+         * Нужен, чтобы определить тип PON (EPON/GPON) для ONU. В карточке ONU
+         * типа нет — только bg-olt-id, а сам список отдаётся одним ответом
+         * на 334 КБ. Кэш держит его 5 минут: справочник меняется раз в месяц,
+         * а карточек за смену открывают десятки.
+         *
+         * Через общий fetchText с noCache нельзя: TTL по умолчанию 30 секунд,
+         * и каждое открытие договора тянуло бы треть мегабайта. Поэтому
+         * отдельный кэш на модуле.
+         */
+        async oltList() {
+            const now = Date.now();
+            if (OLT_CACHE.data && OLT_CACHE.until > now) return OLT_CACHE.data;
+
+            const url = '/user/plugin/getolt/massIncident.do?method=oltList';
+            let text = '';
+            try {
+                text = await fetchText(url, { noCache: true });
+            } catch (e) {
+                return OLT_CACHE.data || {};
+            }
+
+            // Двойной JSON: ответ обёрнут в {data:{body:"{...}"}}
+            let list = [];
+            try {
+                const outer = JSON.parse(text);
+                const inner = JSON.parse(outer.data.body);
+                list = inner.data || [];
+            } catch (e) {
+                return OLT_CACHE.data || {};
+            }
+
+            const map = {};
+            list.forEach((o) => { map[String(o.id)] = { title: o.title || '', vendor: o.vendor || '' }; });
+            OLT_CACHE.data = map;
+            OLT_CACHE.until = now + 5 * 60 * 1000;
+            return map;
         },
 
         /* ------------------------------------------- почта: процесс и сообщение */
@@ -4651,6 +4701,13 @@
 
             return {
                 mac: String(mac).trim(),
+                // ID OLT из кнопки «Перезагрузить ONU»: по нему находим тип PON
+                // в списке OLT. В самой карточке типа нет, а угадывать его
+                // по формату MAC нельзя — вендор отдаёт и полный шестибайтовый.
+                oltId: (() => {
+                    const btn = card.querySelector('[bg-olt-id]');
+                    return btn ? String(btn.getAttribute('bg-olt-id') || '') : '';
+                })(),
                 status: statusText,
                 online: /getolt-online/i.test(statusCls) || /^(online|up)$/i.test(statusText),
                 updated: updatedTitle || (upd ? String(upd.textContent || '').trim() : ''),
@@ -4679,6 +4736,7 @@
         const legacy = {
             mac: pairFind(map, /mac/i)
                 || (rawText.match(/\b([0-9a-f]{2}(?:[:\-.][0-9a-f]{2}){5})\b/i) || [])[1] || '',
+            oltId: '',
             status: pairFind(map, /(статус|status|состояни|state)/i),
             online: /online|up|active|работа/i.test(pairFind(map, /(статус|status|состояни|state)/i)),
             updated: '',
@@ -4756,42 +4814,49 @@
     }
 
     /**
-     * Технология PON по MAC из GetOLT: 'EPON', 'GPON' или '' (не определить).
+     * Технология PON по записи OLT из списка GetOLT: 'EPON', 'GPON' или ''.
      *
-     * В EPON MAC — это обычный Ethernet-адрес из шести байт, и OLT ждёт его
-     * с двоеточиями. В GPON MAC — серийный номер ONU: четыре байта после
-     * префикса вендора, и в формах он вбивается слитно (6A0CD275).
+     * ВАЖНО: раньше тип определялся по длине MAC (6 групп — EPON, 4 — GPON).
+     * Это оказалось неверно. На договоре 13676 OLT «GP-Indus-72.171»
+     * (вендор CDATAGPON, то есть GPON), а ONU отдаёт ПОЛНЫЙ шестибайтовый
+     * MAC «DD:16:E6:86:0D:C7». Значит формат MAC зависит от вендора OLT,
+     * а не от технологии: C-Data на GPON умеет отдавать и полный MAC.
      *
-     * Поэтому технологию определяем по САМОМУ MAC, без лишних запросов:
-     * шесть hex-групп — EPON, четыре — GPON. Проверено на 21 договоре
-     * (EP-* и GP-* OLT): правило не дало ни одного исключения.
-     *
-     * Это надёжнее, чем смотреть на имя OLT: список OLT отдаётся одним
-     * ответом на 334 КБ, и тянуть его ради двух букв в карточке незачем.
-     * Заодно не ломается на OLT с нестандартным именем («OLT-FD1208_201»).
+     * Источник истины — сам OLT. Тип берём по имени и вендору из списка:
+     *   «GP-…» / вендор с GPON / FD1608S → GPON;
+     *   «EP-…» / вендор CDATA / GATERAY  → EPON.
+     * Проверено на всех 160 OLT базы — ни одного неопределённого.
      */
-    function ponType(mac) {
-        const groups = macGroups(mac);
-        if (groups.length === 6) return 'EPON';
-        if (groups.length === 4) return 'GPON';
+    function ponTypeByOlt(olt) {
+        if (!olt) return '';
+        const title = String(olt.title || '');
+        const vendor = String(olt.vendor || '');
+        if (/^GP[-_\s]/i.test(title)) return 'GPON';
+        if (/^EP(ON)?[-_\s]/i.test(title)) return 'EPON';
+        if (/GPON/i.test(vendor) || /FD1608S/i.test(vendor)) return 'GPON';
+        if (/^CDATA$/i.test(vendor) || /GATERAY/i.test(vendor) || /^EPON/i.test(vendor)) return 'EPON';
         return '';
     }
 
     /**
-     * MAC ONU в том виде, в каком его ждёт оборудование этого типа.
+     * MAC ONU в том виде, в каком его ждёт оборудование.
      *
-     * EPON → «08:C6:B3:B9:3E:3B» (шесть байт через двоеточие);
-     * GPON → «6A0CD275» (четыре байта слитно, без префикса вендора).
+     * GPON → «6A0CD275» (четыре байта серийника слитно, без префикса вендора);
+     * EPON → «08:C6:B3:B9:3E:3B» (шесть байт через двоеточие).
      *
-     * Раньше копировалось всегда слитно и без разделителей: для GPON это
-     * верно, а на EPON оператор получал «08C6B3B93E3B» — такую строку
-     * OLT не принимает, и её приходилось разбивать руками.
+     * Для GPON режем до четырёх байт: даже если OLT отдал полный шестибайтовый
+     * MAC (как C-Data на 13676), в формах GPON вбивается серийник из четырёх
+     * байт. Для EPON оставляем все шесть.
+     *
+     * Раньше здесь смотрели на длину MAC, и на 13676 получалось «EPON»
+     * с копированием через двоеточия — хотя это GPON.
      */
-    function onuMacCopy(mac) {
+    function onuMacCopy(mac, tech) {
         const groups = macGroups(mac);
-        if (groups.length === 6) return groups.join(':');
-        if (groups.length === 4) return groups.join('');
-        // Незнакомый формат — отдаём прежнее поведение, чтобы не потерять MAC
+        if (!groups.length) return '';
+        if (tech === 'EPON') return groups.slice(0, 6).join(':');
+        if (tech === 'GPON') return groups.slice(-4).join('');
+        // Тип неизвестен — прежнее поведение (слитно), чтобы не терять MAC
         return macPlain(mac);
     }
 
@@ -4827,18 +4892,30 @@
     }
 
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
-    function renderEquipment(onuList, objects) {
+    function renderEquipment(onuList, objects, oltMap) {
         const onu = onuList || [];
         const objs = objects || [];
+        const olts = oltMap || {};
         let html = '';
 
         if (onu.length) {
-            // Тип PON берём по MAC первой ONU: он же решает, в каком виде
-            // копируется MAC. Заголовок группы раньше был жёстко «GPON»,
-            // и на EPON-подключениях это было просто неправдой.
-            const tech = ponType(onu[0].mac);
-            html += `<div class="tp-eq-group">${tech ? esc(tech) : 'PON'}</div>`;
+            // Тип PON — по САМОМУ OLT, а не по формату MAC.
+            //
+            // Раньше смотрели на длину MAC (6 групп — EPON, 4 — GPON).
+            // На договоре 13676 это дало неверный «EPON»: OLT там
+            // «GP-Indus-72.171» (вендор CDATAGPON), но ONU отдаёт полный
+            // шестибайтовый MAC. То есть формат MAC зависит от вендора,
+            // а не от технологии.
+            //
+            // Тип берём у каждого OLT отдельно: у договора может быть
+            // несколько ONU на разных OLT (после переноса линии), и общий
+            // заголовок в таком случае врёт.
+            const techOf = (o) => ponTypeByOlt(olts[String(o.oltId || '')]);
+            const techs = Array.from(new Set(onu.map(techOf).filter(Boolean)));
+            const groupTitle = techs.length === 1 ? techs[0] : (techs.length ? 'PON' : 'PON');
+            html += `<div class="tp-eq-group">${esc(groupTitle)}</div>`;
             onu.forEach((o) => {
+                const tech = techOf(o);
                 // Где стоит: OLT + порт/ONU ID — то, что нужно диспетчеру для выезда.
                 // Адрес OLT копируем по последним двум октетам: на OLT его ищут
                 // именно так. Порт и ONU ID копировать не даём — их набирают
@@ -4876,7 +4953,7 @@
                                 ? '<span class="tp-chip is-good">online</span>'
                                 : `<span class="tp-chip is-bad">${esc(o.state || 'offline')}</span>`}
                         </div>
-                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(onuMacCopy(o.mac), o.mac)}</div>` : ''}
+                        ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(onuMacCopy(o.mac, tech), o.mac)}</div>` : ''}
                         ${place ? `<div class="tp-device-meta">${place}</div>` : ''}
                         ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${macLine}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
@@ -8703,7 +8780,10 @@
         alive('equipment', Promise.all([
             ERP.equipment(id).catch(() => []),
             ERP.getolt(id).catch(() => ({ ok: false, onu: [], reason: 'fetch-failed' })),
-        ]), ([objects, olt]) => {
+            // Справочник OLT нужен, чтобы показать EPON/GPON и правильно
+            // скопировать MAC. Сбой не критичен: без него будет «PON».
+            ERP.oltList().catch(() => ({})),
+        ]), ([objects, olt, oltMap]) => {
             const onu = (olt && olt.onu) || [];
             if (!onu.length && !(objects && objects.length)) {
                 // Плагин мог быть недоступен по правам — честно говорим об этом,
@@ -8715,7 +8795,7 @@
                 fillLazy(panel, 'equipment', `<div class="tp-hint">${hint}</div>`);
                 return;
             }
-            let html = renderEquipment(onu, objects);
+            let html = renderEquipment(onu, objects, oltMap);
             // GetOLT недоступен, но объекты есть — предупреждаем, чтобы оператор
             // не решил, что ONU нет вовсе
             if (!onu.length && olt && (olt.reason === 'no-access' || olt.reason === 'no-link')) {
