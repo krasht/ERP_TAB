@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.60
+// @version      0.72.61
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
 // @match        https://sd.org.avanta-telecom.ru/user/*
+// @match        https://sd.avanta-telecom.ru/user
+// @match        https://sd.avanta-telecom.ru/user/*
 // @updateURL    https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.meta.js
 // @downloadURL  https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.user.js
 // @grant        none
@@ -26,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.60';
+    const SELF_VERSION = '0.72.61';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
