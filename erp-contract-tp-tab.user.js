@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.53
+// @version      0.72.54
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.53';
+    const SELF_VERSION = '0.72.54';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -127,6 +127,16 @@
     const PROCESS_PARAM_REASON = '400';
     const PROCESS_REASON_TRANSFER = '1.17';   // Интернет Перенос линий связи
     const PROCESS_REASON_SAG = '1.18';        // Интернет Провис ВОЛС
+
+    /*
+     * «Загрузить Акт работ/ТМЦ/Фото» — параметр 85.
+     *
+     * Единственный способ приложить файл к процессу, доступный нашим правам:
+     * плагин «Документы» закрыт («Действие запрещено»). Принимает
+     * multipart/form-data с полем file, по одному файлу за запрос.
+     * Параметр есть и у обращения (28), и у заявок эксплуатации (182/183).
+     */
+    const PROCESS_PARAM_PHOTO = '85';
 
     /**
      * Адреса, с которых ERP умеет отправлять письма (typeId сообщения).
@@ -1467,22 +1477,34 @@
          * существует, и оператору важно знать его номер, чтобы не заводить
          * второе вручную. Поэтому возвращаем ok:false вместе с requestId.
          */
-        async createLineRequest(cid, kind) {
+        async createLineRequest(cid, kind, opts) {
             const id = cid || this.contractId();
             if (!id) return { ok: false, requestId: '', linkedId: '', message: 'Нет ID договора' };
+
+            const o = opts || {};
+            const description = String(o.description || '').trim();
+            const files = Array.isArray(o.files) ? o.files.filter(Boolean) : [];
 
             const isTransfer = kind !== 'sag';
             const typeId = isTransfer ? PROCESS_TYPE_TRANSFER : PROCESS_TYPE_SAG;
             const reason = isTransfer ? PROCESS_REASON_TRANSFER : PROCESS_REASON_SAG;
             const label = isTransfer ? 'Перенос линий связи' : 'Провис ВОЛС';
 
-            const created = await this.createProcess(id, { typeId: PROCESS_TYPE_LINE1 });
+            // Описание уходит при создании обращения — и ERP сама передаёт его
+            // связанному процессу («Из обращения #N / Описание обращения: …»).
+            // Поэтому во второй процесс его отдельно НЕ пишем: получилась бы
+            // копия текста внутри копии.
+            const created = await this.createProcess(id, {
+                typeId: PROCESS_TYPE_LINE1,
+                description,
+            });
             if (!created || !created.ok || !created.id) {
                 return {
                     ok: false,
                     requestId: '',
                     linkedId: '',
                     message: (created && created.message) || 'не удалось создать обращение',
+                    warnings: [],
                 };
             }
 
@@ -1495,6 +1517,7 @@
                     requestId,
                     linkedId: '',
                     message: `обращение #${requestId} создано, но причина «${label}» не записалась: ${param.message}`,
+                    warnings: [],
                 };
             }
 
@@ -1505,10 +1528,65 @@
                     requestId,
                     linkedId: '',
                     message: `обращение #${requestId} создано с причиной «${label}», но связанный процесс не привязался: ${linked.message}`,
+                    warnings: [],
                 };
             }
 
-            return { ok: true, requestId, linkedId: linked.id, message: '' };
+            /*
+             * Файлы — только в обращение.
+             *
+             * Сейчас ERP не передаёт вложения связанному процессу, но эту
+             * передачу дорабатывают. Если грузить в оба процесса, после
+             * доработки в заявке окажутся дубли — по копии от каждой загрузки.
+             * Поэтому грузим в один, а дальше пусть работает ERP.
+             *
+             * Сбой загрузки НЕ отменяет заявку: она уже создана и видна
+             * в очереди. Возвращаем предупреждения — иначе оператор решит,
+             * что не вышло ничего, и заведёт вторую.
+             */
+            const warnings = [];
+            for (const file of files) {
+                const up = await this.uploadProcessFile(requestId, file);
+                if (!up.ok) {
+                    warnings.push(`файл «${file.name || 'без имени'}»: ${up.message || 'не загрузился'}`);
+                }
+            }
+
+            return { ok: true, requestId, linkedId: linked.id, message: '', warnings };
+        },
+
+        /**
+         * Загрузка файла в процесс: параметр 85 «Загрузить Акт работ/ТМЦ/Фото».
+         *
+         * Форма ERP отправляет файл через $$.ajax.fileUpload — по одному файлу
+         * за запрос, multipart/form-data с единственным полем file. Повторяем
+         * ровно это: пакетная отправка здесь не работает, сервер читает
+         * только первый файл.
+         *
+         * Ответ — {"status":"ok","data":{}}; сам файл появляется в параметре
+         * как ссылка /user/file.do?id=…&title=…
+         */
+        async uploadProcessFile(processId, file) {
+            const pid = String(processId || '');
+            if (!pid || !file) return { ok: false, message: 'нет процесса или файла' };
+
+            try {
+                const fd = new FormData();
+                fd.set('file', file);
+                const res = await fetch(
+                    '/user/parameter.do?method=parameterUpdate&responseType=json'
+                    + `&id=${encodeURIComponent(pid)}&paramId=${PROCESS_PARAM_PHOTO}`,
+                    { method: 'POST', credentials: 'same-origin', body: fd }
+                );
+                const text = await res.text();
+                // Пустое тело — не ошибка, но и не подтверждение: ERP на файл
+                // отвечает JSON, поэтому пустоту считаем сбоем, чтобы оператор
+                // не остался с мыслью, что фото прикреплено.
+                if (!String(text).trim()) return { ok: false, message: 'пустой ответ ERP' };
+                return jsonVerdict(text);
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
         },
 
         /**
@@ -4124,7 +4202,63 @@
         .tp-proc-msg { font-size: 12px; font-weight: 500; margin-top: 10px; line-height: 1.4; }
         .tp-proc-msg.is-ok { color: var(--tp-ok); }
         .tp-proc-msg.is-bad { color: var(--tp-bad); }
+        .tp-proc-msg.is-warn { color: var(--tp-warn); }
         .tp-proc-msg a { color: inherit; text-decoration: underline; }
+
+        /* ---- форма заявки: описание и файлы
+           Свёрнута до клика по «Перенос ЛС» / «Провис ВОЛС»: постоянное поле
+           ввода занимало бы полкарточки ради действия, которое делают нечасто. */
+        .tp-proc-form {
+            display: flex; flex-direction: column; gap: 9px;
+            margin-top: 12px; padding-top: 12px;
+            border-top: 1px solid var(--tp-border);
+        }
+        /* hidden перебивается display:flex — возвращаем ему силу */
+        .tp-proc-form[hidden] { display: none; }
+        .tp-proc-form-head {
+            font-size: 12px; font-weight: 600; color: var(--tp-fg);
+        }
+        .tp-proc-form textarea {
+            font: inherit; color: var(--tp-fg); resize: vertical; min-height: 76px;
+            background: rgba(127,127,127,.10);
+            border: 1px solid transparent; border-radius: 10px;
+            padding: 8px 11px; width: 100%; outline: none;
+            transition: border-color .15s, background .15s;
+        }
+        .tp-proc-form textarea:focus { border-color: var(--tp-blue); background: rgba(127,127,127,.06); }
+        /* Зона приёма файлов. Пунктир — единственный намёк, что сюда можно
+           перетащить; при наведении файла подсвечиваем фоном. */
+        .tp-proc-drop {
+            border: 1px dashed rgba(127,127,127,.42); border-radius: 10px;
+            padding: 14px 12px; text-align: center; cursor: pointer;
+            font-size: 12px; color: var(--tp-fg3); line-height: 1.5;
+            transition: border-color .15s, background .15s, color .15s;
+        }
+        .tp-proc-drop:hover { border-color: var(--tp-blue); color: var(--tp-fg2); }
+        .tp-proc-drop.is-over {
+            border-color: var(--tp-blue); background: rgba(0,122,255,.08); color: var(--tp-fg);
+        }
+        .tp-proc-pick { color: var(--tp-blue); text-decoration: underline; cursor: pointer; }
+        .tp-proc-files { display: flex; flex-direction: column; gap: 5px; }
+        .tp-proc-files:empty { display: none; }
+        .tp-proc-file {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12px; color: var(--tp-fg2);
+            background: rgba(127,127,127,.10); border-radius: 8px; padding: 5px 9px;
+        }
+        .tp-proc-file-name {
+            flex: 1 1 auto; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tp-proc-file-size { font-size: 11px; color: var(--tp-fg3); flex: 0 0 auto; }
+        .tp-proc-file-del {
+            font: inherit; font-size: 14px; line-height: 1; cursor: pointer;
+            background: none; border: 0; padding: 0 2px; color: var(--tp-fg3);
+            flex: 0 0 auto;
+        }
+        .tp-proc-file-del:hover { color: var(--tp-bad); }
+        .tp-proc-form-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .tp-proc-form-btns .tp-btn { padding: 7px 14px; }
         /* Вкладки внутри карточки — те же, что у «Сессии»: оператор уже знает,
            как они выглядят и что счётчик справа от подписи. */
         .tp-proc-tabs { margin-bottom: 10px; }
@@ -5262,6 +5396,23 @@
                 </span>
             </div>
             <div class="tp-lazy-body">${skeleton(2)}</div>
+            <div class="tp-proc-form" hidden>
+                <div class="tp-proc-form-head"></div>
+                <label class="tp-field">
+                    <span>Описание</span>
+                    <textarea rows="4" placeholder="Что случилось, адрес, детали для монтажника"></textarea>
+                </label>
+                <div class="tp-proc-drop" tabindex="0">
+                    Перетащите файлы сюда, вставьте из буфера (Ctrl+V) или
+                    <label class="tp-proc-pick">выберите<input type="file" multiple hidden></label>
+                </div>
+                <div class="tp-proc-files"></div>
+                <div class="tp-proc-form-btns">
+                    <button type="button" class="tp-btn tp-proc-submit">Создать заявку</button>
+                    <button type="button" class="tp-btn is-ghost tp-proc-cancel">Отмена</button>
+                    <span class="tp-proc-msg"></span>
+                </div>
+            </div>
         </div>`;
 
         /*
@@ -6909,69 +7060,261 @@
             ev.preventDefault();
             openProcess(row.dataset.proc);
         });
+
+        // Форма заявки: описание, файлы, отправка. Обработчики вешаем один раз
+        // на карточку — сама форма живёт в каркасе и перерисовкой тела
+        // не затрагивается.
+        mountProcForm(panel, card);
     }
 
     /**
-     * Кнопки «Перенос ЛС» и «Провис ВОЛС»: заявка эксплуатации одним кликом.
+     * Кнопки «Перенос ЛС» и «Провис ВОЛС»: форма заявки эксплуатации.
      *
-     * Порядок действий задан процессом в ERP: обращение «1 Линия» → причина
-     * в дереве параметра → связанный процесс эксплуатации. Всё это делает
-     * ERP.createLineRequest, здесь только состояние кнопки и текст результата.
+     * Раньше клик сразу создавал заявку. Теперь раскрывается форма с описанием
+     * и файлами: без описания монтажник не знает, что случилось и куда ехать,
+     * а без фото не видит масштаб провиса. Пустая форма тоже допустима —
+     * причина обращения уже задаёт смысл заявки.
      *
-     * Сообщение ставим в конец карточки, а не всплывашкой: оператору нужен
-     * номер обращения, чтобы сослаться на него в разговоре, и он должен
-     * остаться на экране.
+     * Всю работу с ERP делает ERP.createLineRequest, здесь только форма,
+     * накопитель файлов и текст результата.
      */
-    async function createLineRequest(panel, card, btn) {
-        const cid = panel.dataset.contractId || card.dataset.contract || '';
+    function createLineRequest(panel, card, btn) {
+        const form = card.querySelector('.tp-proc-form');
+        if (!form) return;
+
         const kind = btn.dataset.kind || 'transfer';
         const isTransfer = kind !== 'sag';
         const label = isTransfer ? 'Перенос ЛС' : 'Провис ВОЛС';
 
-        // Второй клик во время работы создал бы дубль заявки — блокируем сразу
-        // все кнопки карточки, а не только нажатую.
-        const buttons = Array.from(card.querySelectorAll('.tp-proc-new'));
-        const restore = buttons.map((b) => ({ el: b, text: b.textContent }));
-        buttons.forEach((b) => { b.disabled = true; });
-        btn.textContent = 'Создаю…';
+        // Повторный клик по той же кнопке сворачивает форму; по другой —
+        // переключает тип, сохраняя введённое описание и файлы.
+        if (!form.hidden && form.dataset.kind === kind) {
+            form.hidden = true;
+            return;
+        }
 
-        const oldMsg = card.querySelector('.tp-proc-msg');
-        if (oldMsg) oldMsg.remove();
+        form.dataset.kind = kind;
+        form.hidden = false;
+        const head = form.querySelector('.tp-proc-form-head');
+        if (head) head.textContent = 'Заявка: ' + label;
 
-        // Сообщение вешаем на САМУ карточку, а не в тело: loadProcesses
-        // перерисовывает .tp-lazy-body целиком, и текст с номером обращения
-        // исчез бы сразу после обновления списка — то есть в тот момент,
-        // когда он и нужен оператору.
-        const show = (cls, html) => {
-            const el = document.createElement('div');
-            el.className = 'tp-proc-msg ' + cls;
-            el.innerHTML = html;
-            card.appendChild(el);
+        const ta = form.querySelector('textarea');
+        if (ta) ta.focus();
+    }
+
+    /**
+     * Навешивает обработчики формы заявки: файлы, отправка, отмена.
+     *
+     * Накопитель файлов живёт в замыкании, а не в DOM: объект File нельзя
+     * положить в атрибут, а пересобирать его из input после каждого изменения
+     * пришлось бы вручную. Список отрисован отдельно и лишь отражает состояние.
+     */
+    function mountProcForm(panel, card) {
+        const form = card.querySelector('.tp-proc-form');
+        if (!form) return;
+        if (form.dataset.bound === '1') return;
+        form.dataset.bound = '1';
+
+        const head = form.querySelector('.tp-proc-form-head');
+        const ta = form.querySelector('textarea');
+        const drop = form.querySelector('.tp-proc-drop');
+        const pick = form.querySelector('.tp-proc-pick input[type=file]');
+        const filesBox = form.querySelector('.tp-proc-files');
+        const submitBtn = form.querySelector('.tp-proc-submit');
+        const cancelBtn = form.querySelector('.tp-proc-cancel');
+        const msg = form.querySelector('.tp-proc-msg');
+
+        let pending = [];
+
+        const say = (cls, text) => {
+            if (!msg) return;
+            msg.className = 'tp-proc-msg' + (cls ? ' ' + cls : '');
+            msg.textContent = text || '';
         };
 
-        try {
-            const res = await ERP.createLineRequest(cid, kind);
-            if (res.ok) {
-                show('is-ok', `Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">`
-                    + `#${esc(res.requestId)}</a> создано, причина «${esc(label)}», `
-                    + `связанный процесс #${esc(res.linkedId)}.`);
-                // Список активных обновится с сервера: новое обращение должно
-                // появиться сразу, иначе оператор заведёт второе.
-                await loadProcesses(panel, cid).catch(() => null);
-            } else {
-                show('is-bad', esc(res.message || 'не удалось создать заявку')
-                    + (res.requestId
-                        ? ` Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">#${esc(res.requestId)}</a> уже создано.`
-                        : ''));
-            }
-        } catch (e) {
-            show('is-bad', esc(e.message || String(e)));
-        } finally {
-            restore.forEach(({ el, text }) => {
-                el.disabled = false;
-                el.textContent = text;
+        const fmtSize = (n) => {
+            if (!Number.isFinite(n)) return '';
+            if (n < 1024) return n + ' Б';
+            if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' КБ';
+            return (n / 1024 / 1024).toFixed(1) + ' МБ';
+        };
+
+        const renderFiles = () => {
+            if (!filesBox) return;
+            filesBox.innerHTML = pending.map((f, i) => `<div class="tp-proc-file" data-idx="${i}">
+                    <span class="tp-proc-file-name" title="${esc(f.name)}">${esc(f.name)}</span>
+                    <span class="tp-proc-file-size">${esc(fmtSize(f.size))}</span>
+                    <button type="button" class="tp-proc-file-del" title="Убрать">×</button>
+                </div>`).join('');
+            const n = pending.length;
+            submitBtn.textContent = n ? `Создать заявку (${n})` : 'Создать заявку';
+        };
+
+        /**
+         * Добавление файлов с дедупликацией.
+         *
+         * Один и тот же скриншот легко вставить дважды (Ctrl+V срабатывает
+         * и когда фокус в поле описания), а ERP принимает файл отдельным
+         * запросом — дубль загрузился бы дважды и занял место в параметре.
+         */
+        const addFiles = (list) => {
+            const arr = Array.from(list || []).filter(Boolean);
+            if (!arr.length) return;
+            let added = 0;
+            arr.forEach((f) => {
+                const key = `${f.name}|${f.size}|${f.lastModified || 0}`;
+                const dup = pending.some((p) => `${p.name}|${p.size}|${p.lastModified || 0}` === key);
+                if (dup) return;
+                pending.push(f);
+                added += 1;
+            });
+            renderFiles();
+            if (added < arr.length) say('', `Повторы пропущены: ${arr.length - added}.`);
+            else say('', '');
+        };
+
+        // ---- выбор через диалог
+        if (pick) {
+            pick.addEventListener('change', () => {
+                addFiles(pick.files);
+                // Сбрасываем input: иначе повторный выбор того же файла
+                // не вызовет change, и оператор решит, что ничего не вышло.
+                pick.value = '';
             });
         }
+
+        // ---- перетаскивание.
+        // preventDefault обязателен на dragover: без него браузер откроет
+        // файл в новой вкладке вместо того, чтобы отдать его нам.
+        if (drop) {
+            ['dragenter', 'dragover'].forEach((evName) => {
+                drop.addEventListener(evName, (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    drop.classList.add('is-over');
+                });
+            });
+            ['dragleave', 'drop'].forEach((evName) => {
+                drop.addEventListener(evName, (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    if (evName === 'dragleave') {
+                        // Уход на дочерний элемент тоже даёт dragleave —
+                        // проверяем, что курсор правда покинул зону.
+                        if (drop.contains(ev.relatedTarget)) return;
+                    }
+                    drop.classList.remove('is-over');
+                });
+            });
+            drop.addEventListener('drop', (ev) => {
+                const dt = ev.dataTransfer;
+                addFiles(dt && dt.files);
+            });
+            // Клик по зоне открывает диалог выбора
+            drop.addEventListener('click', (ev) => {
+                if (ev.target === pick || (pick && pick.contains(ev.target))) return;
+                if (pick) pick.click();
+            });
+        }
+
+        // ---- вставка из буфера.
+        // Слушаем на всей форме, а не только на зоне: оператор набирает
+        // описание и жмёт Ctrl+V, ожидая, что скриншот прикрепится.
+        form.addEventListener('paste', (ev) => {
+            const cd = ev.clipboardData;
+            if (!cd) return;
+            const items = Array.from(cd.items || []);
+            const files = items
+                .filter((it) => it.kind === 'file')
+                .map((it) => it.getAsFile())
+                .filter(Boolean);
+            if (!files.length) return; // обычный текст — не мешаем вставке
+            ev.preventDefault();
+            addFiles(files);
+        });
+
+        // ---- удаление файла из списка
+        if (filesBox) {
+            filesBox.addEventListener('click', (ev) => {
+                const del = ev.target.closest('.tp-proc-file-del');
+                if (!del) return;
+                const row = del.closest('.tp-proc-file');
+                const idx = Number(row && row.dataset.idx);
+                if (!Number.isFinite(idx)) return;
+                pending.splice(idx, 1);
+                renderFiles();
+            });
+        }
+
+        // ---- отмена: свернуть и очистить
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', () => {
+                form.hidden = true;
+                pending = [];
+                renderFiles();
+                if (ta) ta.value = '';
+                say('', '');
+            });
+        }
+
+        // ---- отправка
+        if (submitBtn) {
+            submitBtn.addEventListener('click', async () => {
+                const cid = panel.dataset.contractId || card.dataset.contract || '';
+                const kind = form.dataset.kind || 'transfer';
+                const isTransfer = kind !== 'sag';
+                const label = isTransfer ? 'Перенос ЛС' : 'Провис ВОЛС';
+                const description = ta ? ta.value.trim() : '';
+                const files = pending.slice();
+
+                if (!cid) { say('is-bad', 'Не удалось определить договор.'); return; }
+
+                // Второй клик создал бы дубль заявки — блокируем кнопки карточки
+                const buttons = Array.from(card.querySelectorAll('.tp-proc-new'));
+                const restore = buttons.map((b) => ({ el: b, text: b.textContent }));
+                buttons.forEach((b) => { b.disabled = true; });
+                submitBtn.disabled = true;
+                const origSubmit = submitBtn.textContent;
+                submitBtn.textContent = files.length ? 'Создаю и загружаю…' : 'Создаю…';
+                say('', '');
+
+                try {
+                    const res = await ERP.createLineRequest(cid, kind, { description, files });
+                    if (res.ok) {
+                        const warn = (res.warnings || []).length
+                            ? `<div class="tp-proc-msg is-warn">${res.warnings.map((w) => esc(w)).join('<br>')}</div>`
+                            : '';
+                        say('is-ok', '');
+                        msg.innerHTML = `Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">`
+                            + `#${esc(res.requestId)}</a> создано, причина «${esc(label)}», `
+                            + `связанный процесс #${esc(res.linkedId)}.` + warn;
+                        // Очищаем только после успеха: при ошибке введённое
+                        // описание и файлы должны остаться, иначе оператор
+                        // набирает всё заново.
+                        pending = [];
+                        renderFiles();
+                        if (ta) ta.value = '';
+                        form.hidden = true;
+                        await loadProcesses(panel, cid).catch(() => null);
+                    } else {
+                        say('is-bad', (res.message || 'не удалось создать заявку')
+                            + (res.requestId ? ` Обращение #${res.requestId} уже создано.` : ''));
+                    }
+                } catch (e) {
+                    say('is-bad', e.message || String(e));
+                } finally {
+                    restore.forEach(({ el, text }) => {
+                        el.disabled = false;
+                        el.textContent = text;
+                    });
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = origSubmit;
+                    renderFiles();
+                }
+            });
+        }
+
+        renderFiles();
     }
 
     /* ------------------------------------------------ отправка доступа на почту */
