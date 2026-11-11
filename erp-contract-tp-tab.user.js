@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.54
+// @version      0.72.55
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -26,7 +26,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.54';
+    const SELF_VERSION = '0.72.55';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -2276,12 +2276,16 @@
          * В таблице сессий этих данных нет — берём отдельным запросом.
          * Возвращает { map: {название: {type,status,state,period}}, list: [...] }.
          */
-        async services(cid) {
+        async services(cid, opts) {
             const id = cid || this.contractId();
             if (!id) return { map: {}, list: [] };
 
             const html = await fetchText(
-                `/user/plugin/bgbilling/proto/inet.do?billingId=bill&contractId=${id}&moduleId=1&method=serviceTree`
+                `/user/plugin/bgbilling/proto/inet.do?billingId=bill&contractId=${id}&moduleId=1&method=serviceTree`,
+                // noCache — для автообновления: справочник почти статичен, но
+                // именно он показывает, подключён ли сервис прямо сейчас.
+                // С TTL 90 с панель отставала бы на два медленных тика.
+                { noCache: !!(opts && opts.noCache) }
             );
             const body = parseHtml(html);
 
@@ -5838,8 +5842,44 @@
                     ? loadRadiusErrors(panel, cid).catch(() => null)
                     : Promise.resolve(null);
 
+                /*
+                 * «Сервисы в биллинге» — тоже живой блок.
+                 *
+                 * Раньше он грузился ОДИН раз при сборке панели и больше никогда:
+                 * erpOnce кэширует ответ на всё поколение, а сам блок в тик не
+                 * входил. В итоге сервис, подключённый в биллинге через минуту
+                 * после открытия карточки, не появлялся до F5. На 56933 это
+                 * выглядело как «Действующих сервисов нет — все записи закрыты»
+                 * при живом сервисе 78281 (открыт/включен) в дереве.
+                 *
+                 * В медленный круг: сервисы меняются раз в сутки, а запрос
+                 * serviceTree плюс формы адресов — это десятки килобайт.
+                 * Кэш эпохи при этом сбрасываем, иначе erpOnce вернёт тот же
+                 * старый ответ и обновление будет пустым.
+                 */
+                const servicesPromise = slow
+                    ? (() => {
+                        /*
+                         * Кэш эпохи сбрасываем точечно — только ключ 'services'.
+                         *
+                         * Глобальный netDrop(/serviceTree/) здесь трогать нельзя:
+                         * по этому же URL ходят сессии и «Белый IP», и сброс
+                         * заставлял их перезапрашивать дерево на каждом медленном
+                         * тике. А форма адреса (serviceGet) кэшируется отдельно
+                         * и имеет TTL 90 с — этого достаточно.
+                         */
+                        if (panel._tpOnce) panel._tpOnce.delete('services');
+                        return erpOnce(panel, 'services', () => ERP.services(cid, { noCache: true }))
+                            .then((data) => {
+                                if (genOf(panel) !== generation || !document.contains(panel)) return null;
+                                return renderServicesBlock(panel, cid, data, generation);
+                            })
+                            .catch(() => null);
+                    })()
+                    : Promise.resolve(null);
+
                 try {
-                    await Promise.allSettled([sessionsPromise, errorsPromise]);
+                    await Promise.allSettled([sessionsPromise, errorsPromise, servicesPromise]);
                     if (genOf(panel) !== generation || !document.contains(panel)) { plan(AUTO_REFRESH_MS); return; }
 
                     // Медленный круг: доступы (пароль могли сменить в биллинге)
@@ -9005,6 +9045,65 @@
     }
 
     /**
+     * Отрисовка блока «Сервисы в биллинге» по готовому дереву сервисов.
+     *
+     * Вынесено из hydrate отдельной функцией, потому что блок нужно уметь
+     * обновлять повторно: раньше он грузился один раз и не обновлялся вообще.
+     * Сервис, подключённый через минуту после открытия карточки, не появлялся
+     * до F5 — на 56933 панель писала «Действующих сервисов нет», хотя в дереве
+     * был живой сервис 78281.
+     *
+     * Здесь же считается признак блокировки: состояние сервиса («отключен
+     * [Недостаточно средств]») приходит от биллинга и не зависит от того,
+     * сходятся ли цифры в отчёте.
+     */
+    async function renderServicesBlock(panel, cid, data, generation) {
+        if (!document.contains(panel)) return null;
+        if (genOf(panel) !== generation) return null;
+
+        const svcList = (data && data.list) || [];
+
+        const disabled = disabledServices(svcList);
+        if (panel._tpCtx) {
+            panel._tpCtx.disabled = disabled.length ? disabled : null;
+            refreshMoney(panel);
+        }
+
+        // Раскрытие истории сервисов переживает перерисовку: автообновление
+        // перерисовывает блок, и без восстановления открытый оператором
+        // список закрывался бы сам.
+        const restoreMore = () => {
+            const box = panel.querySelector('.tp-lazy[data-lazy="services"]');
+            const more = box && box.querySelector('[data-svc-more]');
+            if (!more) return;
+            if (panel._tpSvcMoreOpen) more.open = true;
+            more.addEventListener('toggle', () => { panel._tpSvcMoreOpen = more.open; });
+        };
+
+        // Адреса берём без кэша эпохи: при обновлении сервис мог смениться,
+        // и старый набор адресов приклеился бы к новым ID.
+        //
+        // Но и заново тянуть все формы на каждом тике незачем: сервис с тем же
+        // ID и тем же периодом адрес не меняет. Спрашиваем только те, которых
+        // ещё нет в прошлом наборе.
+        const prevAddrs = panel._tpSvcAddrs || {};
+        const need = svcList.filter((s) => s && s.id && isAliveService(s)
+            && prevAddrs[s.id] === undefined);
+        const fresh = need.length
+            ? await ERP.serviceAddresses(cid, need).catch(() => ({}))
+            : {};
+        const addrs = Object.assign({}, prevAddrs, fresh);
+        panel._tpSvcAddrs = addrs;
+
+        if (genOf(panel) !== generation) return null;
+        if (!document.contains(panel)) return null;
+
+        fillLazy(panel, 'services', renderServices(svcList, addrs));
+        restoreMore();
+        return svcList;
+    }
+
+    /**
      * Фоновая догрузка всех блоков. Запускается сразу после вставки каркаса,
      * блоки заполняются по мере готовности — независимо друг от друга.
      */
@@ -9084,7 +9183,11 @@
          */
         const balanceOnce = () => erpOnce(panel, 'balance', () => ERP.balance(id));
         const limitOnce = () => erpOnce(panel, 'limit', () => ERP.limitInfo(id));
-        const servicesOnce = () => erpOnce(panel, 'services', () => ERP.services(id));
+        // Сервисы НЕ через erpOnce: этот кэш живёт до перерисовки панели,
+        // а блок должен обновляться в автообновлении. Иначе сервис, подключённый
+        // после открытия карточки, не появится до F5. Запрос один на сборку —
+        // его же использует «Белый IP», но тот ходит в ERP.services напрямую.
+        const servicesOnce = () => ERP.services(id);
 
         // Прогноз требует абонплату, она приходит отдельным запросом.
         // Досчитываем цену дня и дату блокировки один раз, когда пришла.
@@ -9283,42 +9386,7 @@
         // каждого ДЕЙСТВУЮЩЕГО сервиса. Делаем это здесь, а не внутри
         // renderServices: рендер синхронный и сеть в нём ждать нельзя.
         alive('services', servicesOnce(), (data) => {
-            const svcList = (data && data.list) || [];
-
-            // Состояние сервиса — самый точный признак блокировки: «отключен
-            // [Недостаточно средств]» приходит от биллинга и не зависит от
-            // того, сходятся ли цифры в отчёте. Без этого панель писала
-            // «Блокировки нет» договору с уже отключённой услугой.
-            const disabled = disabledServices(svcList);
-            if (panel._tpCtx) {
-                panel._tpCtx.disabled = disabled.length ? disabled : null;
-                refreshMoney(panel);
-            }
-
-            // Раскрытие истории сервисов переживает перерисовку: автообновление
-            // перерисовывает блок каждые 42 секунды, и без восстановления
-            // открытый оператором список закрывался бы сам.
-            const restoreMore = () => {
-                const box = panel.querySelector('.tp-lazy[data-lazy="services"]');
-                const more = box && box.querySelector('[data-svc-more]');
-                if (!more) return;
-                if (panel._tpSvcMoreOpen) more.open = true;
-                more.addEventListener('toggle', () => { panel._tpSvcMoreOpen = more.open; });
-            };
-
-            erpOnce(panel, 'serviceAddrs', () => ERP.serviceAddresses(id, svcList).catch(() => ({})))
-                .then((addrs) => {
-                    if (genOf(panel) !== generation) return;
-                    if (!document.contains(panel)) return;
-                    fillLazy(panel, 'services', renderServices(svcList, addrs));
-                    restoreMore();
-                })
-                .catch(() => {
-                    if (genOf(panel) !== generation) return;
-                    if (!document.contains(panel)) return;
-                    fillLazy(panel, 'services', renderServices(svcList));
-                    restoreMore();
-                });
+            renderServicesBlock(panel, id, data, generation).catch(() => null);
         });
 
         // Примечания — тот же узел, что в дереве карточки BGBilling.
@@ -10590,6 +10658,9 @@
         panel._tpPwdCache = null;
         panel._tpErrHtml = null;
         panel._tpAccessHtml = null;
+        // Адреса сервисов — тоже: у нового договора свои ID, и старый набор
+        // приклеился бы к ним по совпадению номеров.
+        panel._tpSvcAddrs = null;
         // Разбор #treeTable тоже обнуляем: договор мог смениться, а кэш
         // от прошлой отрисовки содержал бы прежние статус и баланс.
         panel._tpParams = null;
