@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.61
+// @version      0.72.62
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.61';
+    const SELF_VERSION = '0.72.62';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -12223,30 +12223,150 @@
         return new TextDecoder().decode(bytes);
     }
 
+    /*
+     * Общий вход для двух доменов ERP: sd.org.avanta-telecom.ru и
+     * sd.avanta-telecom.ru.
+     *
+     * localStorage привязан к origin, поэтому на втором домене сохранённых
+     * данных нет: панель писала «Заполните логин и пароль», и автовход не
+     * срабатывал. Оператору пришлось бы вводить пароль заново на каждом
+     * домене — а он их путает и не понимает, почему «скрипт сломался».
+     *
+     * Решение — cookie на РОДИТЕЛЬСКОМ домене avanta-telecom.ru: она видна
+     * обоим хостам. Пишем её при сохранении и при каждом чтении, если в
+     * localStorage есть данные, а cookie ещё нет. Так уже сохранённый на
+     * старом домене вход «переезжает» на новый при первом же заходе туда.
+     *
+     * Оговорка про безопасность: cookie уходит на сервер в заголовке каждого
+     * запроса к *.avanta-telecom.ru, в отличие от localStorage. Значение
+     * кодируется base64, как и в localStorage, — это защита от случайного
+     * взгляда, а не шифрование. Внутри корпоративного контура это приемлемо;
+     * если политика запрещает, обмен можно выключить (AUTH_SHARE).
+     */
+    const AUTH_COOKIE = 'erpTpAuthShared';
+    const AUTH_SHARE = true;
+    const AUTH_COOKIE_DAYS = 365;
+
+    /** Родительский домен для общей cookie или '' если это не avanta-telecom.ru. */
+    function authCookieDomain() {
+        const host = String((window.location && window.location.hostname) || '');
+        const m = host.match(/(?:^|\.)(avanta-telecom\.ru)$/i);
+        return m ? '.' + m[1] : '';
+    }
+
+    function authCookieGet(name) {
+        try {
+            const m = String(document.cookie || '').match(
+                new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+            return m ? decodeURIComponent(m[1]) : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function authCookieSet(name, value) {
+        const dom = authCookieDomain();
+        if (!dom || !value) return false;
+        const parts = [
+            name + '=' + encodeURIComponent(value),
+            'Path=/',
+            'Domain=' + dom,
+            'Max-Age=' + (AUTH_COOKIE_DAYS * 24 * 60 * 60),
+            'SameSite=Lax',
+        ];
+        if (window.location.protocol === 'https:') parts.push('Secure');
+        try {
+            document.cookie = parts.join('; ');
+            return authCookieGet(name) === value;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function authCookieDel(name) {
+        const dom = authCookieDomain();
+        if (!dom) return;
+        try {
+            document.cookie = name + '=; Path=/; Domain=' + dom + '; Max-Age=0; SameSite=Lax';
+        } catch (e) { /* ignore */ }
+    }
+
     /** Сохранённые данные входа. Пустые значения — «ничего не сохранено». */
     function authLoad() {
         const empty = { login: '', password: '', auto: true };
+
+        const parse = (raw) => {
+            if (!raw) return null;
+            try {
+                const obj = JSON.parse(raw) || {};
+                let password = '';
+                try {
+                    password = obj.password ? authB64Decode(obj.password) : '';
+                } catch (e) { password = ''; }
+                return {
+                    login: String(obj.login || ''),
+                    password,
+                    auto: obj.auto !== false,
+                };
+            } catch (e) {
+                return null;
+            }
+        };
+
         const ls = authStore();
-        if (!ls) return empty;
-        try {
-            const raw = ls.getItem(AUTH_KEY);
-            if (!raw) return empty;
-            const obj = JSON.parse(raw) || {};
-            let password = '';
-            try { password = obj.password ? authB64Decode(obj.password) : ''; } catch (e) { password = ''; }
-            return {
-                login: String(obj.login || ''),
-                password,
-                auto: obj.auto !== false,
-            };
-        } catch (e) {
-            return empty;
+        const localRaw = ls ? (() => { try { return ls.getItem(AUTH_KEY); } catch (e) { return null; } })() : null;
+        const fromLocal = parse(localRaw);
+
+        // На этом домене данных нет, но они есть в общей cookie — вход уже
+        // сохраняли на втором домене ERP. Забираем оттуда и дублируем в
+        // localStorage, чтобы дальше читать без cookie.
+        if (!fromLocal && AUTH_SHARE) {
+            const shared = parse(authCookieGet(AUTH_COOKIE));
+            if (shared && shared.login && shared.password) {
+                if (ls) {
+                    try {
+                        ls.setItem(AUTH_KEY, JSON.stringify({
+                            v: 1,
+                            login: shared.login,
+                            password: authB64Encode(shared.password),
+                            auto: shared.auto !== false,
+                        }));
+                    } catch (e) { /* приватный режим */ }
+                }
+                return shared;
+            }
         }
+
+        if (!fromLocal) return empty;
+
+        // Обратный перенос: данные есть в localStorage, но общей cookie ещё
+        // нет. Так вход, сохранённый ДО появления cookie, «переезжает» на
+        // второй домен при первом заходе туда.
+        if (AUTH_SHARE && fromLocal.login && fromLocal.password && !authCookieGet(AUTH_COOKIE)) {
+            authCookieSet(AUTH_COOKIE, localRaw);
+        }
+
+        return fromLocal;
     }
 
     function authSave(creds) {
         const ls = authStore();
-        if (!ls) return false;
+
+        // Сначала общая cookie: даже если localStorage недоступен (приватный
+        // режим, политики), вход сохранится и переедет на второй домен.
+        if (AUTH_SHARE) {
+            if (!creds.login && !creds.password) authCookieDel(AUTH_COOKIE);
+            else {
+                authCookieSet(AUTH_COOKIE, JSON.stringify({
+                    v: 1,
+                    login: String(creds.login || ''),
+                    password: authB64Encode(creds.password || ''),
+                    auto: creds.auto !== false,
+                }));
+            }
+        }
+
+        if (!ls) return AUTH_SHARE ? !!authCookieGet(AUTH_COOKIE) : false;
         try {
             if (!creds.login && !creds.password) {
                 ls.removeItem(AUTH_KEY);
@@ -12265,9 +12385,13 @@
     }
 
     function authClear() {
+        if (AUTH_SHARE) authCookieDel(AUTH_COOKIE);
         const ls = authStore();
         if (!ls) return;
         try { ls.removeItem(AUTH_KEY); } catch (e) { /* ignore */ }
+        // Копия могла остаться от прошлого чтения — чистим и её,
+        // иначе после «Забыть» вход восстановится из localStorage.
+        try { ls.removeItem(AUTH_LAST_SUBMIT_KEY); } catch (e) { /* ignore */ }
     }
 
     function authLastSubmitAt() {
