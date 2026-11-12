@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.65
+// @version      0.72.66
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.65';
+    const SELF_VERSION = '0.72.66';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -12132,6 +12132,15 @@
         .tp-ls-drop[hidden] { display: none; }
         .tp-ls-drop * { box-sizing: border-box; white-space: normal; }
         .tp-ls-kinds { display: flex; gap: 6px; margin-bottom: 10px; }
+        /* Заголовок поповера несёт контекст, которого нет на кнопке:
+           в шапке помещается только «Провис / перенос», а «без абонента» —
+           главное отличие от обычной заявки на договоре. */
+        .tp-ls-head {
+            font-size: 12px; font-weight: 600;
+            color: var(--text-color, #1d1d1f);
+            margin-bottom: 9px; padding-bottom: 8px;
+            border-bottom: 1px solid var(--input-border-color, rgba(0,0,0,.09));
+        }
         .tp-ls-kind {
             flex: 1; padding: 7px 8px; cursor: pointer;
             font: inherit; font-size: 12px;
@@ -13250,11 +13259,12 @@
         const wrap = document.createElement('div');
         wrap.className = 'tp-ls-wrap';
         wrap.innerHTML = `
-            <button type="button" class="tp-ls-btn" title="Заявка эксплуатации без абонента">
-                <span>Заявка на линию</span>
+            <button type="button" class="tp-ls-btn" title="Заявка на провис или перенос линии связи без абонента">
+                <span>Провис / перенос</span>
                 <i class="ti-angle-down"></i>
             </button>
             <div class="tp-ls-drop" hidden>
+                <div class="tp-ls-head">Заявка без абонента</div>
                 <div class="tp-ls-kinds">
                     <button type="button" class="tp-ls-kind is-on" data-kind="transfer">Перенос ЛС</button>
                     <button type="button" class="tp-ls-kind" data-kind="sag">Провис ВОЛС</button>
