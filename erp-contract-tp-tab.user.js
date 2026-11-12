@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.63
+// @version      0.72.65
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.63';
+    const SELF_VERSION = '0.72.65';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -139,6 +139,21 @@
      * Параметр есть и у обращения (28), и у заявок эксплуатации (182/183).
      */
     const PROCESS_PARAM_PHOTO = '85';
+
+    /*
+     * «Заявитель» — параметр 466, «абонент или не абонент».
+     *
+     * В описании параметра прямо сказано: обязателен при создании (мастер
+     * wizard.createStep). Для заявки с улицы ставим «Не абонент» (2) — иначе
+     * обращение выглядит как пришедшее от неизвестного клиента, и поддержка
+     * ищет договор, которого нет.
+     *
+     * «Источник обращения» — параметр 465. Правило типа 28 подставляет
+     * «Звонок» само, поэтому пишем его только когда нужно переопределить.
+     */
+    const PROCESS_PARAM_APPLICANT = '466';
+    const PROCESS_PARAM_SOURCE = '465';
+    const PROCESS_APPLICANT_NOT_SUBSCRIBER = '2';
 
     /**
      * Адреса, с которых ERP умеет отправлять письма (typeId сообщения).
@@ -1566,6 +1581,150 @@
             }
 
             return { ok: true, requestId, linkedId: linked.id, message: '', warnings };
+        },
+
+        /**
+         * Создание процесса БЕЗ привязки к объекту.
+         *
+         * createProcess (выше) всегда шлёт objectType=contract:bill и id
+         * договора — без абонента он не годится. Здесь другая форма, та же,
+         * что у кнопки «Создать процесс» в очереди:
+         * POST /user/process.do с method=processCreate.
+         *
+         * Ответ ERP — {"status":"ok","data":{"process":{"id":…}}}. Если вместо
+         * JSON пришёл HTML (форма, страница входа), id не будет — возвращаем
+         * текст ошибки, а не пустоту.
+         */
+        async createProcessStandalone(typeId, description) {
+            const tid = String(typeId || PROCESS_TYPE_LINE1);
+            try {
+                const res = await fetch('/user/process.do', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        method: 'processCreate',
+                        typeId: tid,
+                        description: String(description || ''),
+                    }),
+                });
+                const text = await res.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (e) { /* не JSON — разберём текстом */ }
+
+                const pid = json && json.data && json.data.process && json.data.process.id;
+                if (pid) return { ok: true, id: String(pid), message: '' };
+
+                if (json && json.status && json.status !== 'ok') {
+                    return { ok: false, id: '', message: String(json.message || json.status).slice(0, 160) };
+                }
+                const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                const err = plain.match(/(Ошибка|Exception|не найден|запрещено|нельзя|недопустим)[^.]{0,120}/i);
+                return { ok: false, id: '', message: (err ? err[0] : plain).slice(0, 160) || 'ERP не вернула ID процесса' };
+            } catch (e) {
+                return { ok: false, id: '', message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Заявка «Перенос ЛС / Провис ВОЛС» БЕЗ абонента.
+         *
+         * Отличие от createLineRequest ровно в корне: там обращение вешается
+         * на договор (contract:bill), здесь создаётся самостоятельный процесс
+         * типа 28 и сразу обрастает параметрами. Дальше цепочка та же:
+         * причина в дереве 400, связанный процесс эксплуатации 182/183.
+         *
+         * Порядок важен: параметр 466 «Заявитель» помечен обязательным при
+         * создании, поэтому пишем его СРАЗУ после создания и до открытия
+         * карточки — иначе ERP может увести оператора в мастер.
+         *
+         * Параметры пишем и в корень, и в дочерний: linkProcessCreate копирует
+         * только описание, а заявка в очереди эксплуатации без причины
+         * и адреса бесполезна.
+         *
+         * Адрес — свободным текстом (параметр 20 — справочник со streetId/
+         * houseId; без резолва дом не привяжется, поэтому не трогаем его).
+         */
+        async createStandaloneLineRequest(kind, opts) {
+            const o = opts || {};
+            const description = String(o.description || '').trim();
+            const files = Array.isArray(o.files) ? o.files.filter(Boolean) : [];
+
+            const isTransfer = kind !== 'sag';
+            const typeId = isTransfer ? PROCESS_TYPE_TRANSFER : PROCESS_TYPE_SAG;
+            const reason = isTransfer ? PROCESS_REASON_TRANSFER : PROCESS_REASON_SAG;
+            const label = isTransfer ? 'Перенос линий связи' : 'Провис ВОЛС';
+
+            const created = await this.createProcessStandalone(PROCESS_TYPE_LINE1, description);
+            if (!created || !created.ok || !created.id) {
+                return {
+                    ok: false,
+                    requestId: '',
+                    linkedId: '',
+                    message: (created && created.message) || 'не удалось создать обращение',
+                    warnings: [],
+                };
+            }
+
+            const requestId = created.id;
+            const warnings = [];
+
+            // 1) Обязательный «Заявитель» — не абонент.
+            const applicant = await this.setProcessParam(requestId, PROCESS_PARAM_APPLICANT,
+                [PROCESS_APPLICANT_NOT_SUBSCRIBER]);
+            if (!applicant.ok) {
+                warnings.push(`заявитель «не абонент» не записался: ${applicant.message || 'нет ответа'}`);
+            }
+
+            // 2) Причина обращения — то, по чему очередь эксплуатации сортирует.
+            const param = await this.setProcessParam(requestId, PROCESS_PARAM_REASON, [reason]);
+            if (!param.ok) {
+                return {
+                    ok: false,
+                    requestId,
+                    linkedId: '',
+                    message: `обращение #${requestId} создано, но причина «${label}» не записалась: ${param.message}`,
+                    warnings,
+                };
+            }
+
+            // 3) Связанный процесс эксплуатации.
+            const linked = await this.linkProcess(requestId, typeId);
+            if (!linked.ok) {
+                return {
+                    ok: false,
+                    requestId,
+                    linkedId: '',
+                    message: `обращение #${requestId} создано с причиной «${label}», но связанный процесс не привязался: ${linked.message}`,
+                    warnings,
+                };
+            }
+
+            // 4) Дублируем причину и заявителя в дочерний: ERP их не копирует.
+            const childId = linked.id;
+            const childReason = await this.setProcessParam(childId, PROCESS_PARAM_REASON, [reason]);
+            if (!childReason.ok) {
+                warnings.push(`причина в заявке #${childId} не записалась: ${childReason.message || 'нет ответа'}`);
+            }
+            const childApplicant = await this.setProcessParam(childId, PROCESS_PARAM_APPLICANT,
+                [PROCESS_APPLICANT_NOT_SUBSCRIBER]);
+            if (!childApplicant.ok) {
+                warnings.push(`заявитель в заявке #${childId} не записался: ${childApplicant.message || 'нет ответа'}`);
+            }
+
+            /*
+             * Файлы — в корневое обращение: ERP передаёт вложения связанному
+             * процессу доработкой, и загрузка в оба дала бы дубли. Сбой
+             * загрузки заявку не отменяет — только предупреждение.
+             */
+            for (const file of files) {
+                const up = await this.uploadProcessFile(requestId, file);
+                if (!up.ok) {
+                    warnings.push(`файл «${file.name || 'без имени'}»: ${up.message || 'не загрузился'}`);
+                }
+            }
+
+            return { ok: true, requestId, linkedId: childId, message: '', warnings };
         },
 
         /**
@@ -11923,6 +12082,148 @@
             border-color: var(--input-border-color, rgba(0,0,0,.14));
             color: var(--text-color, #1d1d1f);
         }
+
+        /* --- заявка без абонента: кнопка в шапке и поповер ---
+           Геометрия кнопки повторяет .tp-pp-main: в шапке ERP рядом стоят
+           счётчики, «Автозаполнение» и тема, и своя высота выбивалась бы. */
+        .tp-ls-wrap { position: relative; display: inline-flex; vertical-align: middle; margin-right: 6px; }
+        .tp-ls-btn {
+            display: inline-flex; align-items: center; gap: 5px;
+            height: 35.6px; box-sizing: border-box;
+            padding: 0 10px; margin: 0;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 4px;
+            background-color: var(--surface-color, #fff);
+            background-image: none;
+            cursor: pointer;
+            font-family: inherit; font-size: 12px;
+            color: var(--text-color, #1d1d1f);
+            white-space: nowrap;
+            transition: background-color .12s ease, border-color .12s ease;
+        }
+        .tp-ls-btn:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
+        .tp-ls-wrap.is-open .tp-ls-btn {
+            background-color: var(--table-head-bg-color, #f7f9fc);
+            border-color: var(--link-color, rgba(0,0,0,.22));
+        }
+        .tp-ls-btn .ti-angle-down { font-size: 10px; opacity: .6; }
+
+        /* Поповер: 460 px — та же ширина, что у выпадающего списка процессов,
+           иначе две соседние панели в шапке выглядели бы разного масштаба.
+           white-space и text-align задаём явно: они наследуются от SPAN.right
+           шапки ERP, где стоит nowrap, и от него подпись под формой вылезала
+           за границу окна одной длинной строкой. */
+        .tp-ls-drop {
+            position: absolute; top: 100%; right: 0; margin-top: 4px;
+            width: 460px; max-width: calc(100vw - 24px); max-height: 74vh; overflow: auto;
+            padding: 12px;
+            background-color: var(--surface-color, #fff);
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 6px;
+            box-shadow: 0 8px 28px rgba(0,0,0,.18);
+            z-index: 2147483002;
+            text-align: left;
+            white-space: normal;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .tp-ls-drop[hidden] { display: none; }
+        .tp-ls-drop * { box-sizing: border-box; white-space: normal; }
+        .tp-ls-kinds { display: flex; gap: 6px; margin-bottom: 10px; }
+        .tp-ls-kind {
+            flex: 1; padding: 7px 8px; cursor: pointer;
+            font: inherit; font-size: 12px;
+            color: var(--text-color, #1d1d1f);
+            background-color: transparent; background-image: none;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.14));
+            border-radius: 4px;
+        }
+        .tp-ls-kind:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
+        .tp-ls-kind.is-on {
+            border-color: var(--link-color, #007aff);
+            color: var(--link-color, #007aff);
+            font-weight: 600;
+        }
+        .tp-ls-field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+        .tp-ls-field > span {
+            font-size: 11px; color: var(--hint-color, rgba(29,29,31,.5));
+        }
+        .tp-ls-field input, .tp-ls-field textarea {
+            font: inherit; font-size: 12.5px;
+            color: var(--text-color, #1d1d1f);
+            background-color: var(--surface-color, #fff);
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.14));
+            border-radius: 4px;
+            padding: 6px 8px; width: 100%; outline: none;
+        }
+        .tp-ls-field textarea { resize: vertical; min-height: 72px; }
+        .tp-ls-field input:focus, .tp-ls-field textarea:focus {
+            border-color: var(--link-color, #007aff);
+        }
+        .tp-ls-drop-zone {
+            border: 1px dashed var(--input-border-color, rgba(0,0,0,.28));
+            border-radius: 4px; padding: 11px 10px; text-align: center;
+            font-size: 11.5px; color: var(--hint-color, rgba(29,29,31,.5));
+            cursor: pointer; line-height: 1.5;
+            transition: border-color .15s ease, background-color .15s ease;
+        }
+        .tp-ls-drop-zone:hover { border-color: var(--link-color, #007aff); }
+        .tp-ls-drop-zone.is-over {
+            border-color: var(--link-color, #007aff);
+            background-color: var(--table-head-bg-color, rgba(0,122,255,.08));
+        }
+        .tp-ls-files { display: flex; flex-direction: column; gap: 4px; margin-top: 7px; }
+        .tp-ls-files:empty { display: none; }
+        .tp-ls-file {
+            display: flex; align-items: center; gap: 7px; font-size: 11.5px;
+            background-color: var(--table-head-bg-color, rgba(0,0,0,.05));
+            border-radius: 4px; padding: 4px 8px;
+        }
+        .tp-ls-file-name {
+            flex: 1 1 auto; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tp-ls-file-del {
+            font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+            background: none; border: 0; padding: 0 2px;
+            color: var(--hint-color, rgba(29,29,31,.5));
+        }
+        .tp-ls-file-del:hover { color: var(--tp-pp-warn, #b25000); }
+        .tp-ls-btns { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+        .tp-ls-btns button {
+            padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
+            border-radius: 4px; border: 1px solid var(--input-border-color, rgba(0,0,0,.14));
+            background-color: transparent; background-image: none;
+            color: var(--text-color, #1d1d1f);
+        }
+        .tp-ls-btns button:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
+        .tp-ls-btns .tp-ls-submit {
+            border-color: var(--link-color, #007aff);
+            color: var(--link-color, #007aff);
+            font-weight: 600;
+        }
+        .tp-ls-btns button[disabled] { opacity: .55; cursor: default; }
+        .tp-ls-msg { font-size: 11.5px; margin-top: 9px; line-height: 1.45; white-space: normal; }
+        .tp-ls-msg.is-bad { color: var(--tp-pp-warn, #b25000); }
+        .tp-ls-msg.is-ok { color: var(--ok-color, #1f8f42); }
+        .tp-ls-msg a { color: inherit; text-decoration: underline; }
+        .tp-ls-note {
+            font-size: 11px; color: var(--hint-color, rgba(29,29,31,.5));
+            margin-top: 7px; line-height: 1.45;
+            /* nowrap прилетает по наследству от шапки — возвращаем перенос */
+            white-space: normal; word-break: break-word; overflow-wrap: anywhere;
+        }
+        /* Подсказка про Ctrl+V: буфер обмена — самый быстрый способ
+           приложить скриншот, и о нём легко не догадаться. */
+        .tp-ls-drop-zone kbd {
+            font: inherit; font-size: 10.5px;
+            padding: 1px 4px; border-radius: 3px;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.2));
+            background-color: var(--table-head-bg-color, rgba(0,0,0,.05));
+            color: var(--text-color, #1d1d1f);
+        }
     `;
 
     /** Вставка стилей панели процессов (один <style> на страницу). */
@@ -12587,6 +12888,9 @@
     /** Обработчик клика вне панели: один на документ, снимается в teardown. */
     let procDocHandler = null;
 
+    /** То же для поповера заявки без абонента — свой, чтобы панели не мешали друг другу. */
+    let procLineDocHandler = null;
+
     /** Сегодняшняя дата в формате ERP: «09.11.2026» — берём общий todayRu(). */
 
     /**
@@ -12921,6 +13225,315 @@
         }
 
         return box;
+    }
+
+    /*
+     * Заявка без абонента: кнопка в шапке ERP.
+     *
+     * Живёт рядом со счётчиками процессов, но не зависит от них: договор
+     * и открытая карточка не нужны, обращение создаётся самостоятельным
+     * процессом типа 28. Поэтому монтируется на любой странице ERP, где
+     * есть #head, а не только на карточке договора.
+     */
+    function procMountLineRequest() {
+        const head = document.querySelector('#head');
+        if (!head) return null;
+
+        const existing = head.querySelector('.tp-ls-wrap');
+        if (existing) return existing;
+
+        const right = head.querySelector('.right') || head;
+        const ppPanel = right.querySelector('.tp-pp-panel');
+        const authBtn = right.querySelector('.tp-auth-head-btn');
+        const themeSwitch = right.querySelector('.theme-switch');
+
+        const wrap = document.createElement('div');
+        wrap.className = 'tp-ls-wrap';
+        wrap.innerHTML = `
+            <button type="button" class="tp-ls-btn" title="Заявка эксплуатации без абонента">
+                <span>Заявка на линию</span>
+                <i class="ti-angle-down"></i>
+            </button>
+            <div class="tp-ls-drop" hidden>
+                <div class="tp-ls-kinds">
+                    <button type="button" class="tp-ls-kind is-on" data-kind="transfer">Перенос ЛС</button>
+                    <button type="button" class="tp-ls-kind" data-kind="sag">Провис ВОЛС</button>
+                </div>
+                <label class="tp-ls-field">
+                    <span>Описание</span>
+                    <textarea class="tp-ls-desc" rows="4" placeholder="Что случилось, где, что нужно сделать"></textarea>
+                </label>
+                <label class="tp-ls-field">
+                    <span>ФИО / контрагент</span>
+                    <input type="text" class="tp-ls-fio" placeholder="Кто сообщил">
+                </label>
+                <label class="tp-ls-field">
+                    <span>Телефон</span>
+                    <input type="text" class="tp-ls-tel" placeholder="+7…">
+                </label>
+                <label class="tp-ls-field">
+                    <span>Адрес</span>
+                    <input type="text" class="tp-ls-addr" placeholder="Населённый пункт, улица, дом">
+                </label>
+                <div class="tp-ls-drop-zone">
+                    Перетащите фото сюда, вставьте из буфера (<kbd>Ctrl</kbd>+<kbd>V</kbd>)<br>
+                    или <span style="text-decoration:underline">выберите файл</span>
+                    <input type="file" class="tp-ls-pick" multiple hidden>
+                </div>
+                <div class="tp-ls-files"></div>
+                <div class="tp-ls-btns">
+                    <button type="button" class="tp-ls-submit">Создать заявку</button>
+                    <button type="button" class="tp-ls-cancel">Отмена</button>
+                </div>
+                <div class="tp-ls-msg"></div>
+                <div class="tp-ls-note">
+                    Обращение создаётся без договора, заявитель — «Не абонент».
+                    Адрес уходит текстом в описание.
+                </div>
+            </div>`;
+
+        // Порядок в шапке: счётчики процессов, затем наша кнопка, затем
+        // «Автозаполнение», затем тема.
+        if (ppPanel && ppPanel.parentNode === right) right.insertBefore(wrap, ppPanel.nextSibling);
+        else if (authBtn && authBtn.parentNode === right) right.insertBefore(wrap, authBtn);
+        else if (themeSwitch && themeSwitch.parentNode === right) right.insertBefore(wrap, themeSwitch);
+        else right.appendChild(wrap);
+
+        procBindLineRequest(wrap);
+        return wrap;
+    }
+
+    /**
+     * Логика формы заявки без абонента: тип, файлы, отправка.
+     *
+     * Накопитель файлов — в замыкании, как в форме на карточке договора:
+     * объект File нельзя положить в атрибут, а пересобирать из input после
+     * каждого изменения пришлось бы вручную.
+     */
+    function procBindLineRequest(wrap) {
+        if (wrap.dataset.bound === '1') return;
+        wrap.dataset.bound = '1';
+
+        const btn = wrap.querySelector('.tp-ls-btn');
+        const drop = wrap.querySelector('.tp-ls-drop');
+        const kinds = Array.from(wrap.querySelectorAll('.tp-ls-kind'));
+        const desc = wrap.querySelector('.tp-ls-desc');
+        const fio = wrap.querySelector('.tp-ls-fio');
+        const tel = wrap.querySelector('.tp-ls-tel');
+        const addr = wrap.querySelector('.tp-ls-addr');
+        const zone = wrap.querySelector('.tp-ls-drop-zone');
+        const pick = wrap.querySelector('.tp-ls-pick');
+        const filesBox = wrap.querySelector('.tp-ls-files');
+        const submit = wrap.querySelector('.tp-ls-submit');
+        const cancel = wrap.querySelector('.tp-ls-cancel');
+        const msg = wrap.querySelector('.tp-ls-msg');
+
+        let kind = 'transfer';
+        let pending = [];
+
+        const say = (cls, text) => {
+            if (!msg) return;
+            msg.className = 'tp-ls-msg' + (cls ? ' ' + cls : '');
+            msg.textContent = text || '';
+        };
+
+        const fmtSize = (n) => {
+            if (!Number.isFinite(n)) return '';
+            if (n < 1024) return n + ' Б';
+            if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' КБ';
+            return (n / 1024 / 1024).toFixed(1) + ' МБ';
+        };
+
+        const renderFiles = () => {
+            if (!filesBox) return;
+            filesBox.innerHTML = pending.map((f, i) => `<div class="tp-ls-file" data-idx="${i}">
+                    <span class="tp-ls-file-name" title="${esc(f.name)}">${esc(f.name)}</span>
+                    <span>${esc(fmtSize(f.size))}</span>
+                    <button type="button" class="tp-ls-file-del" title="Убрать">×</button>
+                </div>`).join('');
+            submit.textContent = pending.length ? `Создать заявку (${pending.length})` : 'Создать заявку';
+        };
+
+        const addFiles = (list) => {
+            const arr = Array.from(list || []).filter(Boolean);
+            if (!arr.length) return;
+            arr.forEach((f) => {
+                const key = `${f.name}|${f.size}|${f.lastModified || 0}`;
+                if (pending.some((p) => `${p.name}|${p.size}|${p.lastModified || 0}` === key)) return;
+                pending.push(f);
+            });
+            renderFiles();
+        };
+
+        const setOpen = (open) => {
+            wrap.classList.toggle('is-open', open);
+            drop.hidden = !open;
+            if (open && desc) setTimeout(() => desc.focus(), 30);
+        };
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setOpen(drop.hidden);
+        });
+
+        // Клик вне поповера закрывает его. Слушатель один на документ:
+        // кнопка пересоздаётся при смене шапки, а обработчик живёт отдельно.
+        if (!procLineDocHandler) {
+            procLineDocHandler = (e) => {
+                const box = document.querySelector('.tp-ls-wrap');
+                if (!box || !box.classList.contains('is-open')) return;
+                if (e.target.closest && e.target.closest('.tp-ls-wrap')) return;
+                box.classList.remove('is-open');
+                const d = box.querySelector('.tp-ls-drop');
+                if (d) d.hidden = true;
+            };
+            document.addEventListener('mousedown', procLineDocHandler, true);
+        }
+
+        kinds.forEach((k) => {
+            k.addEventListener('click', () => {
+                kind = k.dataset.kind || 'transfer';
+                kinds.forEach((x) => x.classList.toggle('is-on', x === k));
+            });
+        });
+
+        if (pick) {
+            pick.addEventListener('change', () => {
+                addFiles(pick.files);
+                pick.value = '';
+            });
+        }
+
+        if (zone) {
+            ['dragenter', 'dragover'].forEach((evName) => {
+                zone.addEventListener(evName, (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    zone.classList.add('is-over');
+                });
+            });
+            ['dragleave', 'drop'].forEach((evName) => {
+                zone.addEventListener(evName, (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    if (evName === 'dragleave') {
+                        if (zone.contains(ev.relatedTarget)) return;
+                    }
+                    zone.classList.remove('is-over');
+                });
+            });
+            zone.addEventListener('drop', (ev) => {
+                addFiles(ev.dataTransfer && ev.dataTransfer.files);
+            });
+            zone.addEventListener('click', (ev) => {
+                if (ev.target === pick || (pick && pick.contains(ev.target))) return;
+                if (pick) pick.click();
+            });
+        }
+
+        wrap.addEventListener('paste', (ev) => {
+            const cd = ev.clipboardData;
+            if (!cd) return;
+            const files = Array.from(cd.items || [])
+                .filter((it) => it.kind === 'file')
+                .map((it) => it.getAsFile())
+                .filter(Boolean);
+            if (!files.length) return;
+            ev.preventDefault();
+            addFiles(files);
+        });
+
+        if (filesBox) {
+            filesBox.addEventListener('click', (ev) => {
+                const del = ev.target.closest('.tp-ls-file-del');
+                if (!del) return;
+                const row = del.closest('.tp-ls-file');
+                const idx = Number(row && row.dataset.idx);
+                if (!Number.isFinite(idx)) return;
+                pending.splice(idx, 1);
+                renderFiles();
+            });
+        }
+
+        if (cancel) {
+            cancel.addEventListener('click', () => {
+                setOpen(false);
+                pending = [];
+                renderFiles();
+                if (desc) desc.value = '';
+                if (fio) fio.value = '';
+                if (tel) tel.value = '';
+                if (addr) addr.value = '';
+                say('', '');
+            });
+        }
+
+        if (submit) {
+            submit.addEventListener('click', async () => {
+                const text = desc ? desc.value.trim() : '';
+                const person = fio ? fio.value.trim() : '';
+                const phone = tel ? tel.value.trim() : '';
+                const address = addr ? addr.value.trim() : '';
+
+                if (!text && !address) {
+                    say('is-bad', 'Нужно описание или адрес — иначе монтажник не поймёт, куда ехать.');
+                    return;
+                }
+
+                /*
+                 * ФИО, телефон и адрес ERP отдельными параметрами не принимает
+                 * без справочника, поэтому собираем их в описание: заявка
+                 * должна читаться целиком в очереди, а не только в карточке.
+                 */
+                const lines = [];
+                if (address) lines.push('Адрес: ' + address);
+                if (person) lines.push('Заявитель: ' + person);
+                if (phone) lines.push('Телефон: ' + phone);
+                if (text) lines.push(text);
+                const description = lines.join('\n');
+
+                submit.disabled = true;
+                const origText = submit.textContent;
+                submit.textContent = pending.length ? 'Создаю и загружаю…' : 'Создаю…';
+                say('', '');
+
+                try {
+                    const res = await ERP.createStandaloneLineRequest(kind, {
+                        description,
+                        files: pending.slice(),
+                    });
+
+                    if (res.ok) {
+                        const warn = (res.warnings || []).length
+                            ? ' ' + res.warnings.join('; ')
+                            : '';
+                        msg.className = 'tp-ls-msg is-ok';
+                        msg.innerHTML = `Заявка <a href="/user/process#${esc(res.requestId)}" target="_blank">#${esc(res.requestId)}</a>`
+                            + ` и процесс <a href="/user/process#${esc(res.linkedId)}" target="_blank">#${esc(res.linkedId)}</a> созданы.`
+                            + (warn ? `<br><span>${esc(warn)}</span>` : '');
+                        pending = [];
+                        renderFiles();
+                        if (desc) desc.value = '';
+                        if (fio) fio.value = '';
+                        if (tel) tel.value = '';
+                        if (addr) addr.value = '';
+                    } else {
+                        const tail = res.requestId
+                            ? ` Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">#${esc(res.requestId)}</a> уже создано — не заводите второе.`
+                            : '';
+                        msg.className = 'tp-ls-msg is-bad';
+                        msg.innerHTML = esc(res.message || 'не удалось создать заявку') + tail;
+                    }
+                } catch (e) {
+                    say('is-bad', e.message || String(e));
+                } finally {
+                    submit.disabled = false;
+                    submit.textContent = origText;
+                    renderFiles();
+                }
+            });
+        }
     }
 
     /** Обновление цифр на кнопке. */
@@ -13472,6 +14085,7 @@
 
         procInjectStyle();
         procMountHeadButton();
+        procMountLineRequest();
         procMountLayer();
 
         /*
@@ -13685,9 +14299,14 @@
             document.removeEventListener('mousedown', procDocHandler, true);
             procDocHandler = null;
         }
+        if (procLineDocHandler) {
+            document.removeEventListener('mousedown', procLineDocHandler, true);
+            procLineDocHandler = null;
+        }
         const toasts = document.getElementById('tp-pp-toasts');
         if (toasts) toasts.remove();
         document.querySelectorAll('.tp-pp-panel').forEach((el) => el.remove());
+        document.querySelectorAll('.tp-ls-wrap').forEach((el) => el.remove());
         const style = document.getElementById('tp-pp-style');
         if (style) style.remove();
     }
