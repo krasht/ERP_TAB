@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.66
+// @version      0.72.67
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.66';
+    const SELF_VERSION = '0.72.67';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -11873,6 +11873,14 @@
     const AUTH_KEY = 'erpTpAuth';
     const AUTH_LAST_SUBMIT_KEY = 'erpTpAuthLastSubmit';
     const AUTH_PAGE_KEY = 'erpTpAuthPage';
+    /*
+     * Новогодние снежинки: ключ настройки.
+     *
+     * Отсутствие ключа означает «включено» — декор сезонный, и заставлять
+     * оператора включать его руками в декабре незачем. Значение '0' —
+     * единственный способ выключить, и он переживает перезагрузку.
+     */
+    const NY_KEY = 'erpTpSnow';
     // Если после нашей отправки окно входа появилось снова — пароль, скорее всего,
     // неверный. Столько ждём, прежде чем пробовать автовход опять, чтобы не
     // получить бесконечный цикл «отправил > ошибка > отправил». Пауза короткая:
@@ -12243,6 +12251,109 @@
         const el = document.createElement('style');
         el.id = 'tp-pp-style';
         el.textContent = PROC_CSS;
+        host.appendChild(el);
+    }
+
+    /*
+     * Новогодние снежинки — только CSS.
+     *
+     * Нагрузка здесь считается не «сколько красиво», а «сколько работы
+     * браузеру». Три ограничения держат её около нуля:
+     *
+     *   • анимируются только transform и opacity — они живут на композиторе,
+     *     поэтому layout и paint не пересчитываются ни разу за весь цикл;
+     *   • ни одного таймера: всё время задано в animation-duration/delay,
+     *     JS в кадрах не участвует вообще;
+     *   • ни одной картинки и ни одного запроса: снежинка — текстовый глиф,
+     *     слой — один div с position: fixed.
+     *
+     * Для сравнения: гифка со снегом на фоне перерисовывает полноэкранный
+     * слой каждый кадр поверх таблиц очередей. Здесь 14 элементов в своих
+     * композитных слоях, и страница под ними не перерисовывается.
+     */
+    const NY_CSS = `
+        #tp-ny-snow {
+            position: fixed; inset: 0; overflow: hidden;
+            pointer-events: none;   /* клики и выделение проходят насквозь */
+            z-index: 100;           /* выше страницы, ниже диалогов ERP */
+            contain: layout style paint;
+            --tp-ny-color: rgba(120, 150, 185, .55);
+        }
+        html[data-theme="dark"] #tp-ny-snow,
+        html[data-theme="modern-dark"] #tp-ny-snow { --tp-ny-color: rgba(220, 235, 255, .65); }
+
+        #tp-ny-snow i {
+            position: absolute; top: -10vh; left: 0;
+            font-style: normal; line-height: 1;
+            color: var(--tp-ny-color);
+            animation-name: tpNyFall;
+            animation-timing-function: linear;
+            animation-iteration-count: infinite;
+            will-change: transform;
+        }
+
+        @keyframes tpNyFall {
+            0%   { transform: translate3d(0, -10vh, 0) rotate(0deg); }
+            100% { transform: translate3d(var(--tp-ny-drift, 40px), 110vh, 0) rotate(360deg); }
+        }
+
+        /* Вариации заданы статикой: размер, скорость, задержка, снос.
+           Отрицательная задержка начинает снежинку «уже в полёте», поэтому
+           при загрузке небо не пустое и не сыплется всё разом. */
+        #tp-ny-snow i:nth-child(1)  { left:  3%; font-size: 13px; animation-duration: 19s; animation-delay:  -3s; --tp-ny-drift:  34px; }
+        #tp-ny-snow i:nth-child(2)  { left: 11%; font-size:  9px; animation-duration: 26s; animation-delay: -11s; --tp-ny-drift: -22px; }
+        #tp-ny-snow i:nth-child(3)  { left: 18%; font-size: 15px; animation-duration: 22s; animation-delay:  -7s; --tp-ny-drift:  48px; }
+        #tp-ny-snow i:nth-child(4)  { left: 26%; font-size: 10px; animation-duration: 31s; animation-delay: -19s; --tp-ny-drift: -31px; }
+        #tp-ny-snow i:nth-child(5)  { left: 34%; font-size: 12px; animation-duration: 17s; animation-delay:  -2s; --tp-ny-drift:  26px; }
+        #tp-ny-snow i:nth-child(6)  { left: 41%; font-size:  8px; animation-duration: 29s; animation-delay: -14s; --tp-ny-drift: -18px; }
+        #tp-ny-snow i:nth-child(7)  { left: 49%; font-size: 14px; animation-duration: 24s; animation-delay:  -9s; --tp-ny-drift:  41px; }
+        #tp-ny-snow i:nth-child(8)  { left: 57%; font-size: 11px; animation-duration: 21s; animation-delay: -16s; --tp-ny-drift: -27px; }
+        #tp-ny-snow i:nth-child(9)  { left: 64%; font-size: 16px; animation-duration: 34s; animation-delay:  -5s; --tp-ny-drift:  52px; }
+        #tp-ny-snow i:nth-child(10) { left: 71%; font-size:  9px; animation-duration: 27s; animation-delay: -22s; --tp-ny-drift: -24px; }
+        #tp-ny-snow i:nth-child(11) { left: 78%; font-size: 12px; animation-duration: 20s; animation-delay: -12s; --tp-ny-drift:  37px; }
+        #tp-ny-snow i:nth-child(12) { left: 85%; font-size: 10px; animation-duration: 32s; animation-delay:  -6s; --tp-ny-drift: -29px; }
+        #tp-ny-snow i:nth-child(13) { left: 92%; font-size: 14px; animation-duration: 23s; animation-delay: -18s; --tp-ny-drift:  44px; }
+        #tp-ny-snow i:nth-child(14) { left: 97%; font-size:  8px; animation-duration: 28s; animation-delay: -25s; --tp-ny-drift: -16px; }
+
+        /* Настройка ОС главнее декора: просили меньше движения — снега нет. */
+        @media (prefers-reduced-motion: reduce) {
+            #tp-ny-snow { display: none; }
+        }
+
+        /* Свёрнутая вкладка не жжёт батарею: композитор тоже отдыхает. */
+        body.tp-ny-idle #tp-ny-snow i { animation-play-state: paused; }
+
+        /* Выключено переключателем. */
+        body.tp-ny-off #tp-ny-snow { display: none; }
+
+        /* --- переключатель в подвале панели процессов ---
+           Подвал вне .tp-pp-drop-body: тело перерисовывается при каждом
+           опросе, и кнопка внутри него теряла бы слушатель. */
+        .tp-pp-foot {
+            display: flex; align-items: center; justify-content: flex-end;
+            gap: 8px; padding: 8px 14px;
+            border-top: 1px solid var(--input-border-color, rgba(0,0,0,.09));
+        }
+        .tp-ny-toggle {
+            font: inherit; font-size: 11.5px;
+            padding: 4px 9px; cursor: pointer;
+            color: var(--text-color, #1d1d1f);
+            background-color: transparent; background-image: none;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.14));
+            border-radius: 4px;
+        }
+        .tp-ny-toggle:hover { background-color: var(--table-head-bg-color, #f7f9fc); }
+        .tp-ny-toggle.is-off { color: var(--hint-color, rgba(29,29,31,.5)); }
+    `;
+
+    /** Вставка стилей снега (один <style> на страницу). */
+    function procInjectSnowStyle() {
+        if (document.getElementById('tp-ny-style')) return;
+        const host = document.head || document.documentElement;
+        if (!host) return;
+        const el = document.createElement('style');
+        el.id = 'tp-ny-style';
+        el.textContent = NY_CSS;
         host.appendChild(el);
     }
 
@@ -12900,6 +13011,9 @@
     /** То же для поповера заявки без абонента — свой, чтобы панели не мешали друг другу. */
     let procLineDocHandler = null;
 
+    /** Слушатель visibilitychange для снега: пауза в скрытой вкладке. */
+    let procSnowVisHandler = null;
+
     /** Сегодняшняя дата в формате ERP: «09.11.2026» — берём общий todayRu(). */
 
     /**
@@ -13202,6 +13316,9 @@
             </button>
             <div class="tp-pp-drop" hidden>
                 <div class="tp-pp-drop-body"></div>
+                <div class="tp-pp-foot">
+                    <button type="button" class="tp-ny-toggle">Снежинки: вкл</button>
+                </div>
             </div>`;
 
         // Порядок в шапке: панель, потом «Автозаполнение», потом тема.
@@ -13233,7 +13350,106 @@
             document.addEventListener('mousedown', procDocHandler, true);
         }
 
+        // Кнопка снега живёт в подвале и не перерисовывается вместе с телом
+        procBindSnowToggle(box);
+
         return box;
+    }
+
+    /* ------------------------------------------------- новогодние снежинки */
+
+    /** Сколько снежинок. Больше — заметнее, но и слоёв больше. */
+    const NY_FLAKES = 14;
+
+    /** Состояние снега: включён, если ключ не равен '0'. */
+    function procSnowEnabled() {
+        try { return window.localStorage.getItem(NY_KEY) !== '0'; } catch (e) { return true; }
+    }
+
+    /**
+     * Монтаж снега: контейнер и снежинки.
+     *
+     * Идемпотентно — вызывается из procRefresh, а тот дёргается таймером.
+     * Если контейнер уже есть, выходим сразу: пересоздание 14 узлов каждые
+     * 10 секунд было бы ровно той нагрузкой, которой этот декор избегает.
+     */
+    function procMountSnow() {
+        procInjectSnowStyle();
+
+        const head = document.querySelector('#head');
+        const existing = document.getElementById('tp-ny-snow');
+        if (existing) {
+            // Настройка могла измениться в другой вкладке — применяем её
+            procSnowApply(procSnowEnabled(), false);
+            return existing;
+        }
+        // Без шапки ERP не на чем рисовать (страница входа и подобное)
+        if (!head) return null;
+
+        const box = document.createElement('div');
+        box.id = 'tp-ny-snow';
+        box.setAttribute('aria-hidden', 'true');
+        // Глиф текстовый: ни картинок, ни шрифтов, ни запросов
+        box.innerHTML = new Array(NY_FLAKES + 1).join('<i>\u2744</i>');
+        document.body.appendChild(box);
+
+        procSnowApply(procSnowEnabled(), false);
+        procBindSnowVisibility();
+        return box;
+    }
+
+    /**
+     * Применить состояние.
+     *
+     * onlyToggle = true — не писать в localStorage (вызов из монтажа, где
+     * значение только что прочитано оттуда же). Иначе каждая перерисовка
+     * панели писала бы в хранилище одно и то же.
+     */
+    function procSnowApply(on, persist) {
+        const enabled = !!on;
+        if (document.body) document.body.classList.toggle('tp-ny-off', !enabled);
+
+        const btn = document.querySelector('.tp-ny-toggle');
+        if (btn) {
+            btn.textContent = enabled ? 'Снежинки: вкл' : 'Снежинки: выкл';
+            btn.classList.toggle('is-off', !enabled);
+            btn.title = enabled
+                ? 'Снег на фоне включён — нажмите, чтобы убрать'
+                : 'Снег на фоне выключен — нажмите, чтобы вернуть';
+        }
+
+        if (persist !== false) {
+            try { window.localStorage.setItem(NY_KEY, enabled ? '1' : '0'); } catch (e) { /* приватный режим */ }
+        }
+    }
+
+    /**
+     * Пауза в скрытой вкладке.
+     *
+     * Слушатель один на документ и срабатывает только при переключении
+     * вкладки — не в кадре. Снимается в procTeardown.
+     */
+    function procBindSnowVisibility() {
+        if (procSnowVisHandler) return;
+        procSnowVisHandler = () => {
+            if (!document.body) return;
+            document.body.classList.toggle('tp-ny-idle', !!document.hidden);
+        };
+        document.addEventListener('visibilitychange', procSnowVisHandler);
+        procSnowVisHandler();
+    }
+
+    /** Обработчик кнопки в подвале панели процессов. */
+    function procBindSnowToggle(box) {
+        const btn = box && box.querySelector('.tp-ny-toggle');
+        if (!btn || btn.dataset.bound === '1') return;
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            procSnowApply(!procSnowEnabled(), true);
+        });
+        procSnowApply(procSnowEnabled(), false);
     }
 
     /*
@@ -14096,6 +14312,7 @@
         procInjectStyle();
         procMountHeadButton();
         procMountLineRequest();
+        procMountSnow();
         procMountLayer();
 
         /*
@@ -14317,6 +14534,18 @@
         if (toasts) toasts.remove();
         document.querySelectorAll('.tp-pp-panel').forEach((el) => el.remove());
         document.querySelectorAll('.tp-ls-wrap').forEach((el) => el.remove());
+
+        // Снег: контейнер, стили, слушатель и классы на body
+        if (procSnowVisHandler) {
+            document.removeEventListener('visibilitychange', procSnowVisHandler);
+            procSnowVisHandler = null;
+        }
+        const snow = document.getElementById('tp-ny-snow');
+        if (snow) snow.remove();
+        const snowStyle = document.getElementById('tp-ny-style');
+        if (snowStyle) snowStyle.remove();
+        if (document.body) document.body.classList.remove('tp-ny-idle', 'tp-ny-off');
+
         const style = document.getElementById('tp-pp-style');
         if (style) style.remove();
     }
