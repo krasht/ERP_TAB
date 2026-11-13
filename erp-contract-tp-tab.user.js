@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.67
+// @version      0.72.68
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.67';
+    const SELF_VERSION = '0.72.68';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -154,6 +154,17 @@
     const PROCESS_PARAM_APPLICANT = '466';
     const PROCESS_PARAM_SOURCE = '465';
     const PROCESS_APPLICANT_NOT_SUBSCRIBER = '2';
+
+    /*
+     * «Координаты» — параметр 152.
+     *
+     * Куда пишем точку дома из техучёта. Параметр 20 «Адрес» — справочник
+     * ERP со streetId/houseId, и дома из техучёта там может не быть вовсе
+     * (на Южной 195 в справочнике 26 домов, а 195-го нет). Координаты же
+     * приходят из техучёта всегда, когда дом найден, поэтому это надёжное
+     * «доп поле».
+     */
+    const PROCESS_PARAM_COORDS = '152';
 
     /**
      * Адреса, с которых ERP умеет отправлять письма (typeId сообщения).
@@ -1713,6 +1724,60 @@
             }
 
             /*
+             * 5) Адрес из техучёта: параметр 20, координаты, привязка дома.
+             *
+             * Параметр 20 «Адрес» — то, что оператор видит в «Параметрах»
+             * карточки. Он принимает только пару streetId/houseId из
+             * справочника ERP, поэтому сначала переводим заголовок дома
+             * техучёта в эту пару.
+             *
+             * Дома в справочнике может не быть вовсе (техучёт шире). Это
+             * обычное дело, а не сбой: адрес уже лежит в описании заявки,
+             * и оператор его видит. Поэтому молча пропускаем, без
+             * предупреждений — они только зашумят результат.
+             *
+             * Параметр 152 «Координаты» есть только у заявки эксплуатации
+             * (182/183) — у обращения типа 28 его нет вовсе.
+             */
+            const coords = o.coords;
+            if (o.addressTitle) {
+                const resolved = await this.resolveAddress(o.addressTitle);
+                if (resolved.ok) {
+                    // Адрес пишем в оба процесса: он нужен и поддержке,
+                    // и бригаде, а ERP его между процессами не копирует.
+                    const rootAddr = await this.setProcessAddress(requestId, resolved);
+                    if (!rootAddr.ok) {
+                        warnings.push(`адрес в обращении #${requestId} не записался: ${rootAddr.message || 'нет ответа'}`);
+                    }
+                    const childAddr = await this.setProcessAddress(childId, resolved);
+                    if (!childAddr.ok) {
+                        warnings.push(`адрес в заявке #${childId} не записался: ${childAddr.message || 'нет ответа'}`);
+                    }
+                }
+                // Не нашли в справочнике — адрес остаётся в описании, и всё
+            }
+
+            if (coords && Number.isFinite(Number(coords.lat)) && Number.isFinite(Number(coords.lon))) {
+                const value = `${Number(coords.lat).toFixed(6)},${Number(coords.lon).toFixed(6)}`;
+                const childCoords = await this.setProcessParam(childId, PROCESS_PARAM_COORDS, [value]);
+                if (!childCoords.ok) {
+                    warnings.push(`координаты в заявке #${childId} не записались: ${childCoords.message || 'нет ответа'}`);
+                }
+                // Корень — по возможности: у типа 28 параметра нет, это норма
+                await this.setProcessParam(requestId, PROCESS_PARAM_COORDS, [value]);
+            }
+
+            /*
+             * Привязка дома (buildingSelect) — к корню: именно его карточку
+             * откроют из очереди. Работает только когда адрес в параметре 20
+             * уже записан, поэтому идёт последней и молча: сбой здесь ничего
+             * не ломает, координаты у оператора уже есть.
+             */
+            if (o.buildingId) {
+                await this.buildingSelect(requestId, o.buildingId).catch(() => null);
+            }
+
+            /*
              * Файлы — в корневое обращение: ERP передаёт вложения связанному
              * процессу доработкой, и загрузка в оба дала бы дубли. Сбой
              * загрузки заявку не отменяет — только предупреждение.
@@ -1725,6 +1790,277 @@
             }
 
             return { ok: true, requestId, linkedId: childId, message: '', warnings };
+        },
+
+        /**
+         * Поиск дома в техучёте по строке адреса.
+         *
+         * Это тот же поиск, что делает вкладка «Техвозможность» (кнопка
+         * «Изменить» у сопоставленного дома). Ключевое свойство: он смотрит
+         * ТОЛЬКО наш техучёт, поэтому «найден» = «наш дом». Проверено:
+         * «Москва Красная площадь 1» даёт 0 результатов, «Южная 195» — один
+         * дом с координатами.
+         *
+         * Ответ: {ok, buildings: [{id, title, lat, lon}], truncated, message}.
+         * truncated — сервер обрезал выдачу (лимит 50), нужен уточняющий запрос.
+         */
+        async buildingSearch(query) {
+            const q = String(query || '').trim();
+            if (!q) return { ok: true, buildings: [], truncated: false, message: '' };
+
+            try {
+                const res = await fetch('/user/plugin/techaccount/techaccount.do'
+                    + '?method=buildingSearch&query=' + encodeURIComponent(q),
+                    { credentials: 'same-origin' });
+                const text = await res.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (e) { /* не JSON — разберём текстом */ }
+
+                if (!json || !json.data) {
+                    const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                    const err = plain.match(/(Ошибка|Exception|запрещено|не найден)[^.]{0,120}/i);
+                    return {
+                        ok: false, buildings: [], truncated: false,
+                        message: (err ? err[0] : plain).slice(0, 160) || 'поиск адреса недоступен',
+                    };
+                }
+
+                /*
+                 * Координаты (0, 0) — не точка в Гвинейском заливе, а «не
+                 * заданы»: тот же сигнал, что и в серверном MapPayload.build.
+                 * Такой дом нельзя ни показать на карте, ни проверить по
+                 * линиям, поэтому он уходит в отдельный список noCoords —
+                 * молча выбросить его нельзя, оператор решит, что дома нет.
+                 */
+                const all = (json.data.buildings || []).map((b) => ({
+                    id: String(b.buildingId),
+                    title: String(b.title || ''),
+                    lat: b.lat,
+                    lon: b.lon,
+                })).filter((b) => b.id);
+
+                const hasCoords = (b) => Number.isFinite(b.lat) && Number.isFinite(b.lon)
+                    && !(Number(b.lat) === 0 && Number(b.lon) === 0);
+
+                return {
+                    ok: true,
+                    buildings: all.filter(hasCoords),
+                    noCoords: all.filter((b) => !hasCoords(b)),
+                    truncated: !!json.data.truncated,
+                    message: '',
+                };
+            } catch (e) {
+                return { ok: false, buildings: [], truncated: false, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Линии вокруг точки: что у нас проложено в этом месте.
+         *
+         * Метод вкладки «Карта линий». Именно он отвечает на вопрос «наши тут
+         * линии или нет»: у дома возвращает кабели и узлы, в пустом месте —
+         * пустые массивы. Проверено: дом на Южной 195 — 7 кабелей и 8 узлов,
+         * точка в море — 0 и 0.
+         *
+         * cables[]: {id, from, to, points:[[lat,lon],…], path, planned, title}
+         * nodes[]:  {id, name, type, typeId, lat, lon, role}
+         */
+        async linesAt(lat, lon) {
+            const la = Number(lat), lo = Number(lon);
+            if (!Number.isFinite(la) || !Number.isFinite(lo)) {
+                return { ok: false, cables: [], nodes: [], origin: null, message: 'нет координат' };
+            }
+            // (0, 0) — «координата не задана», а не точка в океане: запрос по
+            // ней вернул бы пустой набор, и оператор прочитал бы это как
+            // «линий нет», хотя дом просто не геокодирован.
+            if (la === 0 && lo === 0) {
+                return { ok: false, cables: [], nodes: [], origin: null, message: 'у дома нет координат' };
+            }
+            try {
+                const res = await fetch('/user/plugin/techlink/techlink.do'
+                    + `?method=linesAt&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`,
+                    { credentials: 'same-origin' });
+                const text = await res.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (e) { /* не JSON */ }
+
+                if (!json || !json.data || !json.data.lines) {
+                    const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                    const err = plain.match(/(Ошибка|Exception|запрещено|не найден)[^.]{0,120}/i);
+                    return {
+                        ok: false, cables: [], nodes: [], origin: null,
+                        message: (err ? err[0] : plain).slice(0, 160) || 'карта линий недоступна',
+                    };
+                }
+
+                const lines = json.data.lines || {};
+                return {
+                    ok: true,
+                    cables: Array.isArray(lines.cables) ? lines.cables : [],
+                    nodes: Array.isArray(lines.nodes) ? lines.nodes : [],
+                    origin: lines.origin || null,
+                    notes: Array.isArray(lines.notes) ? lines.notes : [],
+                    message: '',
+                };
+            } catch (e) {
+                return { ok: false, cables: [], nodes: [], origin: null, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Разбор заголовка дома техучёта на части адреса.
+         *
+         * Формат: «, , Город, , Улица, Дом» — с пустыми полями между
+         * разделителями. Пустые части отбрасываем: значимых всегда три
+         * (город, улица, дом), и лишние запятые в названиях («снт Садовод 2
+         * (Краснодар)») не мешают, потому что город идёт первым.
+         */
+        parseBuildingTitle(title) {
+            const parts = String(title || '').split(',').map((s) => s.trim()).filter(Boolean);
+            return {
+                city: parts[0] || '',
+                street: parts[1] || '',
+                house: parts[2] || '',
+            };
+        },
+
+        /**
+         * Найти дом техучёта в справочнике ERP и вернуть streetId/houseId.
+         *
+         * Параметр 20 «Адрес» принимает только пару из СВОЕГО справочника:
+         * на запрос со свободным текстом ERP отвечает «Не удалось найти дом
+         * с таким номером». Поэтому имя дома из техучёта проходим по тому же
+         * справочнику: улица по названию и городу, дом по номеру.
+         *
+         * Возвращает {ok, streetId, houseId, street, house, message}.
+         * ok:false — дома в справочнике нет (обычное дело: техучёт шире).
+         */
+        async resolveAddress(title) {
+            const p = this.parseBuildingTitle(title);
+            if (!p.street || !p.house) {
+                return { ok: false, message: 'не разобрать адрес: ' + (title || '') };
+            }
+
+            const post = (body) => fetch('/user/directory/address.do', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            }).then((r) => r.json());
+
+            try {
+                // 1) Улица: имя может повторяться в десятках населённых пунктов,
+                // поэтому сравниваем ещё и город.
+                const st = await post('method=streetSearch&page.pageSize=300&title='
+                    + encodeURIComponent(p.street));
+                const streets = (st && st.data && st.data.list) || [];
+                const cityNorm = p.city.toLowerCase();
+                const matches = streets.filter((s) => {
+                    if (s.title.toLowerCase() !== p.street.toLowerCase()) return false;
+                    if (!cityNorm) return true;
+                    return String((s.addressCity && s.addressCity.title) || '')
+                        .toLowerCase().indexOf(cityNorm) >= 0;
+                });
+                if (!matches.length) {
+                    return { ok: false, message: 'улицы нет в справочнике ERP' };
+                }
+
+                // 2) Дом в найденной улице. Перебираем улицы, пока дом не найдётся.
+                for (const street of matches) {
+                    const hs = await post('method=houseSearch&page.pageSize=300&streetId='
+                        + encodeURIComponent(street.id));
+                    const houses = (hs && hs.data && hs.data.list) || [];
+                    const house = houses.find((h) => String(h.houseAndFrac || '').toLowerCase()
+                        === p.house.toLowerCase());
+                    if (house) {
+                        return {
+                            ok: true,
+                            streetId: String(street.id),
+                            houseId: String(house.id),
+                            street: p.street,
+                            house: p.house,
+                            message: '',
+                        };
+                    }
+                }
+                return { ok: false, message: 'дома нет в справочнике ERP' };
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Записать адрес в параметр 20 «Адрес».
+         *
+         * Форма ERP шлёт streetId и houseId — по ним она и находит дом.
+         * Свободный текст street/house тоже передаём: без него значение
+         * сохраняется, но в карточке не отображается.
+         */
+        async setProcessAddress(processId, resolved) {
+            const pid = String(processId || '');
+            if (!pid || !resolved || !resolved.ok) {
+                return { ok: false, message: 'нет процесса или адреса' };
+            }
+            const body = [
+                'method=parameterUpdate',
+                'id=' + encodeURIComponent(pid),
+                'paramId=20',
+                'streetId=' + encodeURIComponent(resolved.streetId),
+                'houseId=' + encodeURIComponent(resolved.houseId),
+                'street=' + encodeURIComponent(resolved.street || ''),
+                'house=' + encodeURIComponent(resolved.house || ''),
+                'flat=', 'pod=', 'floor=', 'comment=', 'position=',
+            ].join('&');
+
+            try {
+                const res = await fetch('/user/parameter.do', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body,
+                });
+                const text = await res.text();
+                if (!String(text).trim()) return { ok: true, message: '' };
+                return jsonVerdict(text);
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
+        },
+
+        /**
+         * Привязать дом техучёта к процессу.
+         *
+         * После этого «Карта линий» в карточке процесса открывается сразу на
+         * этом адресе, а не пустая.
+         *
+         * ⚠️ ERP выполняет привязку только если у заявки заполнен параметр 20
+         * «Адрес» из своего справочника, иначе отвечает текстом «Ни у этой
+         * заявки, ни у связанных не заполнен адрес». Поэтому вызывать его
+         * имеет смысл только после setProcessAddress.
+         */
+        async buildingSelect(processId, buildingId) {
+            const pid = String(processId || '');
+            const bid = String(buildingId || '');
+            if (!pid || !bid) return { ok: false, message: 'нет процесса или дома' };
+
+            try {
+                const res = await fetch('/user/plugin/techaccount/techaccount.do'
+                    + `?method=buildingSelect&processId=${encodeURIComponent(pid)}`
+                    + `&buildingId=${encodeURIComponent(bid)}`,
+                    { credentials: 'same-origin' });
+                const text = await res.text();
+                // Пустое тело — норма для этой ручки
+                if (!String(text).trim()) return { ok: true, message: '' };
+                const plain = String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                // «Не заполнен адрес» — ожидаемый ответ, а не поломка
+                if (/не заполнен адрес/i.test(plain)) {
+                    return { ok: false, skipped: true, message: plain.slice(0, 160) };
+                }
+                const verdict = jsonVerdict(text);
+                return verdict;
+            } catch (e) {
+                return { ok: false, message: e.message || String(e) };
+            }
         },
 
         /**
@@ -12123,7 +12459,11 @@
            за границу окна одной длинной строкой. */
         .tp-ls-drop {
             position: absolute; top: 100%; right: 0; margin-top: 4px;
-            width: 460px; max-width: calc(100vw - 24px); max-height: 74vh; overflow: auto;
+            width: 460px; max-width: calc(100vw - 24px);
+            /* Высоту не ограничиваем: при появлении карты поповер растёт сам,
+               и оператору не приходится прокручивать его внутри, чтобы
+               добрать до кнопки. Предел — только высота экрана. */
+            max-height: calc(100vh - 80px); overflow-y: auto;
             padding: 12px;
             background-color: var(--surface-color, #fff);
             border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
@@ -12241,6 +12581,76 @@
             background-color: var(--table-head-bg-color, rgba(0,0,0,.05));
             color: var(--text-color, #1d1d1f);
         }
+
+        /* --- поиск адреса по техучёту ---
+           Список домов и карта появляются под полем адреса. Список — не
+           выпадашка поверх контента, а обычный блок в потоке: в поповере
+           460 px наложение закрыло бы поле, в которое оператор смотрит. */
+        .tp-ls-addr-pick {
+            display: flex; flex-direction: column; gap: 2px;
+            max-height: 150px; overflow-y: auto;
+            margin: -2px 0 8px;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 4px;
+        }
+        .tp-ls-addr-pick[hidden] { display: none; }
+        .tp-ls-pick-row {
+            display: flex; align-items: baseline; justify-content: space-between;
+            gap: 8px; padding: 6px 8px; cursor: pointer; text-align: left;
+            font: inherit; font-size: 11.5px;
+            color: var(--text-color, #1d1d1f);
+            background: none; border: 0; border-bottom: 1px solid var(--input-border-color, rgba(0,0,0,.07));
+        }
+        .tp-ls-pick-row:last-child { border-bottom: 0; }
+        .tp-ls-pick-row:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.08)); }
+        .tp-ls-pick-title {
+            flex: 1 1 auto; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tp-ls-pick-coord {
+            flex: 0 0 auto; font-size: 10.5px;
+            color: var(--hint-color, rgba(29,29,31,.5));
+            font-variant-numeric: tabular-nums;
+        }
+        .tp-ls-pick-note {
+            padding: 6px 8px; font-size: 10.5px; line-height: 1.4;
+            color: var(--hint-color, rgba(29,29,31,.5));
+            border-top: 1px solid var(--input-border-color, rgba(0,0,0,.07));
+        }
+
+        /* Карта. z-index: 0 обязателен: Leaflet создаёт свой stacking context,
+           и без него его панели (зум, атрибуция) лезут поверх шапки ERP. */
+        .tp-ls-map {
+            height: 240px; margin: 0 0 8px;
+            border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
+            border-radius: 4px; overflow: hidden;
+            z-index: 0; position: relative;
+        }
+        .tp-ls-map[hidden] { display: none; }
+
+        /*
+         * Leaflet в этой ERP приходит со своим правилом
+         *   .leaflet-container img.leaflet-tile { mix-blend-mode: plus-lighter; }
+         * — оно рассчитано на тёмную подложку, где тайлы «подсвечиваются».
+         * На светлом фоне плюс-сложение выбеливает картинку в чистый белый:
+         * тайлы загружены, координаты верны, а на экране пустота. Возвращаем
+         * нормальный режим наложения именно для нашей карты.
+         */
+        .tp-ls-map img.leaflet-tile { mix-blend-mode: normal !important; }
+        /* На тёмной теме светлые тайлы бьют по глазам — приглушаем */
+        html[data-theme="dark"] .tp-ls-map img.leaflet-tile,
+        html[data-theme="modern-dark"] .tp-ls-map img.leaflet-tile {
+            filter: brightness(.82) contrast(.95) saturate(.85);
+        }
+
+        .tp-ls-verdict { font-size: 11.5px; line-height: 1.45; margin: 0 0 8px; }
+        .tp-ls-verdict:empty { display: none; }
+        .tp-ls-verdict.is-ok { color: var(--ok-color, #1f8f42); }
+        .tp-ls-verdict.is-bad { color: var(--tp-pp-warn, #b25000); }
+        .tp-ls-map-note { color: var(--hint-color, rgba(29,29,31,.5)); }
+
+        /* Кнопка отправки заблокирована — говорим почему, а не молчим */
+        .tp-ls-btns button[disabled] { opacity: .55; cursor: default; }
     `;
 
     /** Вставка стилей панели процессов (один <style> на страницу). */
@@ -13453,6 +13863,51 @@
     }
 
     /*
+     * Ленивая загрузка Leaflet.
+     *
+     * Библиотека лежит на самом сервере ERP (/js/leaflet/), поэтому интернет
+     * для неё не нужен — только для тайлов подложки. Приём взят из
+     * pl.techlink.js: сначала window.L, потом css, потом скрипт.
+     *
+     * Колбэки, а не промис: старый jQuery-стек ERP и вызов из обработчика
+     * события — промис здесь ничего не упрощает.
+     */
+    let leafletPromise = null;
+
+    function ensureLeafletMap() {
+        if (window.L) return Promise.resolve(true);
+        if (leafletPromise) return leafletPromise;
+
+        leafletPromise = new Promise((resolve) => {
+            const head = document.head || document.documentElement;
+            if (!head) { resolve(false); return; }
+
+            if (!document.getElementById('tp-lf-css')) {
+                const link = document.createElement('link');
+                link.id = 'tp-lf-css';
+                link.rel = 'stylesheet';
+                link.href = '/js/leaflet/leaflet.css';
+                head.appendChild(link);
+            }
+
+            const done = () => resolve(!!window.L);
+            const script = document.createElement('script');
+            script.src = '/js/leaflet/leaflet.js';
+            script.async = true;
+            script.onload = done;
+            script.onerror = () => resolve(false);
+            head.appendChild(script);
+        }).then((ok) => {
+            // Неудачу не кэшируем: сеть могла моргнуть, следующая попытка
+            // (другой адрес) должна иметь шанс.
+            if (!ok) leafletPromise = null;
+            return ok;
+        });
+
+        return leafletPromise;
+    }
+
+    /*
      * Заявка без абонента: кнопка в шапке ERP.
      *
      * Живёт рядом со счётчиками процессов, но не зависит от них: договор
@@ -13498,9 +13953,13 @@
                     <input type="text" class="tp-ls-tel" placeholder="+7…">
                 </label>
                 <label class="tp-ls-field">
-                    <span>Адрес</span>
-                    <input type="text" class="tp-ls-addr" placeholder="Населённый пункт, улица, дом">
+                    <span>Адрес (поиск по нашим линиям)</span>
+                    <input type="text" class="tp-ls-addr" placeholder="Улица и дом, например: Южная 195"
+                           autocomplete="off">
                 </label>
+                <div class="tp-ls-addr-pick" hidden></div>
+                <div class="tp-ls-map" hidden></div>
+                <div class="tp-ls-verdict"></div>
                 <div class="tp-ls-drop-zone">
                     Перетащите фото сюда, вставьте из буфера (<kbd>Ctrl</kbd>+<kbd>V</kbd>)<br>
                     или <span style="text-decoration:underline">выберите файл</span>
@@ -13514,7 +13973,8 @@
                 <div class="tp-ls-msg"></div>
                 <div class="tp-ls-note">
                     Обращение создаётся без договора, заявитель — «Не абонент».
-                    Адрес уходит текстом в описание.
+                    Адрес ищется по нашему техучёту; без него заявку создать нельзя,
+                    если адрес указан.
                 </div>
             </div>`;
 
@@ -13547,6 +14007,9 @@
         const fio = wrap.querySelector('.tp-ls-fio');
         const tel = wrap.querySelector('.tp-ls-tel');
         const addr = wrap.querySelector('.tp-ls-addr');
+        const addrPick = wrap.querySelector('.tp-ls-addr-pick');
+        const mapBox = wrap.querySelector('.tp-ls-map');
+        const verdict = wrap.querySelector('.tp-ls-verdict');
         const zone = wrap.querySelector('.tp-ls-drop-zone');
         const pick = wrap.querySelector('.tp-ls-pick');
         const filesBox = wrap.querySelector('.tp-ls-files');
@@ -13556,6 +14019,310 @@
 
         let kind = 'transfer';
         let pending = [];
+
+        /*
+         * Состояние адреса.
+         *
+         * Три разных состояния, и они не взаимозаменяемы:
+         *   • picked === null, addr пустой — адрес не задан, заявка разрешена
+         *     (провис на перегоне между сёлами — законный случай);
+         *   • picked === null, addr заполнен — оператор ввёл текст, но дом не
+         *     выбран: отправку блокируем, иначе проверка линий обходится;
+         *   • picked !== null — дом выбран, lines уже загружены.
+         */
+        let picked = null;        // {id, title, lat, lon}
+        let lines = null;         // {cables, nodes, origin} или null
+        let map = null;           // экземпляр Leaflet
+        let mapLayers = [];       // слои поверх подложки
+        let searchTimer = null;
+        let searchToken = 0;
+        let tilesFailed = false;
+
+        const setVerdict = (cls, html) => {
+            if (!verdict) return;
+            verdict.className = 'tp-ls-verdict' + (cls ? ' ' + cls : '');
+            verdict.innerHTML = html || '';
+        };
+
+        /**
+         * Разрешение на отправку.
+         *
+         * Адрес пустой — можно (заявка без адреса существует).
+         * Адрес введён, но дом не выбран — нельзя: проверка не пройдена.
+         * Дом выбран — только если в точке есть наши линии.
+         */
+        const canSubmit = () => {
+            const typed = addr ? addr.value.trim() : '';
+            if (!typed) return true;
+            if (!picked) return false;
+            return !!(lines && (lines.cables || []).length);
+        };
+
+        const refreshSubmitState = () => {
+            if (!submit) return;
+            const ok = canSubmit();
+            // Пока идёт создание, кнопку не трогаем: её disabled ведёт отправка
+            if (submit.dataset.busy === '1') return;
+            submit.disabled = !ok;
+            submit.title = ok ? '' : 'Сначала выберите адрес с нашими линиями';
+        };
+
+        /** Сброс выбора адреса: текст изменился — старый дом больше не годится. */
+        const resetPick = (keepText) => {
+            picked = null;
+            lines = null;
+            tilesFailed = false;
+            if (addrPick) { addrPick.hidden = true; addrPick.innerHTML = ''; }
+            destroyMap();
+            if (!keepText) setVerdict('', '');
+            refreshSubmitState();
+        };
+
+        function destroyMap() {
+            if (map) {
+                try { map.remove(); } catch (e) { /* уже уничтожена */ }
+                map = null;
+            }
+            mapLayers = [];
+            if (mapBox) {
+                mapBox.hidden = true;
+                mapBox.innerHTML = '';
+            }
+        }
+
+        /**
+         * Отрисовка линий в точке.
+         *
+         * Цвета — из легенды вкладки «Карта линий»: синий EPON, зелёный GPON.
+         * Тип берём по узлам кабеля (typeId 1 — PON боксы); если тип неизвестен,
+         * красим нейтрально, чтобы не соврать.
+         */
+        const drawMap = (origin, data) => {
+            if (!mapBox) return;
+            mapBox.hidden = false;
+            mapBox.innerHTML = '';
+
+            ensureLeafletMap().then((ok) => {
+                if (!ok) {
+                    mapBox.hidden = true;
+                    setVerdict('is-bad', 'Не удалось загрузить карту (Leaflet недоступен).');
+                    return;
+                }
+                if (!document.body.contains(mapBox)) return;
+
+                /*
+                 * Контейнер только что стал видимым (был hidden). Leaflet
+                 * меряет размер в момент создания, и если элемент ещё не
+                 * прошёл раскладку, получает нули — тайлы тогда встают со
+                 * смещением и уезжают за край. Поэтому создаём карту в
+                 * следующем кадре, когда размеры уже настоящие.
+                 */
+                requestAnimationFrame(() => {
+                    if (!document.body.contains(mapBox)) return;
+                    buildMap(origin, data);
+                });
+            });
+        };
+
+        /** Собственно сборка карты — уже с известными размерами контейнера. */
+        const buildMap = (origin, data) => {
+            if (!mapBox) return;
+            map = window.L.map(mapBox, {
+                scrollWheelZoom: false,
+                // Подпись «Leaflet | © OpenStreetMap» в шапке ERP — лишний
+                // шум: карта здесь служебная, а не картографический сервис.
+                attributionControl: false,
+            });
+
+            // Подложка. Ошибка тайлов не должна ломать карту: линии
+            // рисуются своими координатами и без неё.
+            const tiles = window.L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+            });
+            tiles.on('tileerror', () => { tilesFailed = true; });
+            tiles.addTo(map);
+
+            const pts = [];
+
+            (data.cables || []).forEach((c) => {
+                const path = Array.isArray(c.points) ? c.points : [];
+                if (path.length < 2) return;
+                const color = c.path ? '#8e24aa' : (c.planned ? '#9e9e9e' : '#1e88e5');
+                const line = window.L.polyline(path, {
+                    color,
+                    weight: 3,
+                    opacity: .9,
+                    dashArray: c.planned ? '5 6' : null,
+                }).addTo(map);
+                line.bindTooltip(c.title || ('Линия #' + c.id));
+                mapLayers.push(line);
+                path.forEach((p) => pts.push(p));
+            });
+
+            (data.nodes || []).forEach((n) => {
+                if (!Number.isFinite(n.lat) || !Number.isFinite(n.lon)) return;
+                const marker = window.L.circleMarker([n.lat, n.lon], {
+                    radius: 4, color: '#37474f', weight: 1,
+                    fillColor: '#90a4ae', fillOpacity: .95,
+                }).addTo(map);
+                marker.bindTooltip((n.name || 'узел') + (n.type ? ' · ' + n.type : ''));
+                mapLayers.push(marker);
+                pts.push([n.lat, n.lon]);
+            });
+
+            // Точка выбранного дома — заметнее узлов
+            const originPoint = window.L.circleMarker([origin.lat, origin.lon], {
+                radius: 7, color: '#c62828', weight: 2,
+                fillColor: '#ef5350', fillOpacity: 1,
+            }).addTo(map);
+            originPoint.bindTooltip(origin.title || 'Выбранный адрес');
+            mapLayers.push(originPoint);
+            pts.push([origin.lat, origin.lon]);
+
+            if (pts.length) {
+                map.fitBounds(window.L.latLngBounds(pts).pad(0.25), { maxZoom: 18 });
+            } else {
+                map.setView([origin.lat, origin.lon], 17);
+            }
+
+            // Размер мог измениться после fitBounds (скролл поповера,
+            // появление полосы прокрутки) — пересчитываем ещё раз.
+            setTimeout(() => { try { map.invalidateSize(); } catch (e) { /* карта уже снята */ } }, 120);
+
+            // Подложка могла не прийти (прокси без интернета). Данные при
+            // этом верны, поэтому не пугаем, а поясняем.
+            setTimeout(() => {
+                if (tilesFailed) {
+                    const base = verdict && verdict.classList.contains('is-bad') ? 'is-bad' : 'is-ok';
+                    setVerdict(base, (verdict ? verdict.innerHTML : '')
+                        + '<br><span class="tp-ls-map-note">'
+                        + 'Подложка карты недоступна, линии показаны схематично.</span>');
+                }
+            }, 1500);
+        };
+
+        /** Запрос линий по выбранному дому и вердикт. */
+        const loadLines = async (building) => {
+            picked = building;
+            lines = null;
+            refreshSubmitState();
+            setVerdict('', 'Проверяю линии…');
+
+            const res = await ERP.linesAt(building.lat, building.lon);
+            if (!res.ok) {
+                setVerdict('is-bad', esc(res.message || 'не удалось получить линии'));
+                refreshSubmitState();
+                return;
+            }
+            if (picked !== building) return; // успели выбрать другой
+
+            lines = res;
+            const cables = (res.cables || []).length;
+            const nodes = (res.nodes || []).length;
+
+            if (cables > 0) {
+                setVerdict('is-ok', `Наши линии есть: ${cables} `
+                    + `${cables === 1 ? 'кабель' : 'кабелей'}, ${nodes} узлов. `
+                    + 'Заявку создать можно.');
+            } else {
+                setVerdict('is-bad', 'Наших линий в этой точке нет. Заявку создать нельзя.');
+            }
+
+            drawMap({ lat: building.lat, lon: building.lon, title: building.title }, res);
+            refreshSubmitState();
+        };
+
+        /** Список найденных домов под полем адреса. */
+        const renderBuildings = (res) => {
+            if (!addrPick) return;
+            if (!res.ok) {
+                addrPick.hidden = true;
+                setVerdict('is-bad', esc(res.message || 'поиск адреса недоступен'));
+                return;
+            }
+            const list = res.buildings || [];
+            const noCoords = res.noCoords || [];
+
+            /*
+             * Дома без координат не рисуем как обычные: выбрать их нельзя
+             * (линии не проверить), но и молчать нельзя — оператор должен
+             * знать, что дом в техучёте есть, просто без точки на карте.
+             */
+            const noCoordsNote = noCoords.length
+                ? `<div class="tp-ls-pick-note">Ещё ${noCoords.length} `
+                  + `${noCoords.length === 1 ? 'дом' : 'домов'} без координат в техучёте — `
+                  + 'по ним линию не проверить: '
+                  + esc(noCoords.slice(0, 3).map((b) => b.title).join('; '))
+                  + (noCoords.length > 3 ? '…' : '') + '</div>'
+                : '';
+
+            if (!list.length) {
+                // Дома без координат: показать их названия важно, иначе
+                // оператор решит, что дома нет вовсе, и заведёт заявку мимо.
+                if (noCoordsNote) {
+                    addrPick.hidden = false;
+                    addrPick.innerHTML = noCoordsNote;
+                } else {
+                    addrPick.hidden = true;
+                    addrPick.innerHTML = '';
+                }
+                setVerdict('is-bad', noCoords.length
+                    ? 'Дом в техучёте есть, но без координат — проверить линии нельзя.'
+                    : 'Дома нет в техучёте — наших линий по этому адресу нет.');
+                refreshSubmitState();
+                return;
+            }
+
+            addrPick.hidden = false;
+            addrPick.innerHTML = list.map((b, i) => `<button type="button" class="tp-ls-pick-row" data-idx="${i}">
+                    <span class="tp-ls-pick-title">${esc(b.title)}</span>
+                    <span class="tp-ls-pick-coord">${esc(Number(b.lat).toFixed(5))}, ${esc(Number(b.lon).toFixed(5))}</span>
+                </button>`).join('')
+                + noCoordsNote
+                + (res.truncated
+                    ? '<div class="tp-ls-pick-note">Показаны первые 50 — уточните адрес: добавьте номер дома или населённый пункт.</div>'
+                    : '');
+
+            addrPick.querySelectorAll('.tp-ls-pick-row').forEach((row) => {
+                row.addEventListener('click', () => {
+                    const b = list[Number(row.dataset.idx)];
+                    if (!b) return;
+                    addrPick.hidden = true;
+                    if (addr) addr.value = b.title;
+                    loadLines(b);
+                });
+            });
+
+            setVerdict('', `Найдено домов: ${list.length}. Выберите нужный.`);
+            refreshSubmitState();
+        };
+
+        /** Поиск с задержкой: запрос на каждую букву — лишняя нагрузка. */
+        const scheduleSearch = () => {
+            if (searchTimer) clearTimeout(searchTimer);
+            const q = addr ? addr.value.trim() : '';
+            if (q.length < 3) {
+                if (addrPick) { addrPick.hidden = true; addrPick.innerHTML = ''; }
+                setVerdict('', '');
+                refreshSubmitState();
+                return;
+            }
+            searchTimer = setTimeout(async () => {
+                const token = ++searchToken;
+                setVerdict('', 'Ищу адрес…');
+                const res = await ERP.buildingSearch(q);
+                if (token !== searchToken) return; // устаревший ответ
+                renderBuildings(res);
+            }, 400);
+        };
+
+        if (addr) {
+            addr.addEventListener('input', () => {
+                resetPick(true);
+                setVerdict('', '');
+                scheduleSearch();
+            });
+        }
 
         const say = (cls, text) => {
             if (!msg) return;
@@ -13595,6 +14362,9 @@
             wrap.classList.toggle('is-open', open);
             drop.hidden = !open;
             if (open && desc) setTimeout(() => desc.focus(), 30);
+            // Закрыли — карту уничтожаем: иначе Leaflet копит обработчики
+            // и тайлы, а после десятка открытий это уже заметно.
+            if (!open) destroyMap();
         };
 
         btn.addEventListener('click', (e) => {
@@ -13602,6 +14372,9 @@
             e.stopPropagation();
             setOpen(drop.hidden);
         });
+
+        // Исходное состояние: адрес пуст — отправка разрешена
+        refreshSubmitState();
 
         // Клик вне поповера закрывает его. Слушатель один на документ:
         // кнопка пересоздаётся при смене шапки, а обработчик живёт отдельно.
@@ -13691,6 +14464,7 @@
                 if (fio) fio.value = '';
                 if (tel) tel.value = '';
                 if (addr) addr.value = '';
+                resetPick(false);
                 say('', '');
             });
         }
@@ -13700,25 +14474,42 @@
                 const text = desc ? desc.value.trim() : '';
                 const person = fio ? fio.value.trim() : '';
                 const phone = tel ? tel.value.trim() : '';
-                const address = addr ? addr.value.trim() : '';
+                const typedAddr = addr ? addr.value.trim() : '';
 
-                if (!text && !address) {
+                if (!canSubmit()) {
+                    if (typedAddr && !picked) {
+                        say('is-bad', 'Выберите адрес из списка — по нему проверяются наши линии.');
+                    } else {
+                        say('is-bad', 'Наших линий по этому адресу нет — заявку создать нельзя.');
+                    }
+                    return;
+                }
+
+                if (!text && !picked && !typedAddr) {
                     say('is-bad', 'Нужно описание или адрес — иначе монтажник не поймёт, куда ехать.');
                     return;
                 }
+
+                /*
+                 * Адрес в описании — заголовок выбранного дома из техучёта,
+                 * а не то, что оператор набрал в поле: набранное может быть
+                 * огрызком («Южная 19»), а в заявке нужен полный адрес.
+                 */
+                const address = picked ? picked.title : '';
 
                 /*
                  * ФИО, телефон и адрес ERP отдельными параметрами не принимает
                  * без справочника, поэтому собираем их в описание: заявка
                  * должна читаться целиком в очереди, а не только в карточке.
                  */
-                const lines = [];
-                if (address) lines.push('Адрес: ' + address);
-                if (person) lines.push('Заявитель: ' + person);
-                if (phone) lines.push('Телефон: ' + phone);
-                if (text) lines.push(text);
-                const description = lines.join('\n');
+                const lines_ = [];
+                if (address) lines_.push('Адрес: ' + address);
+                if (person) lines_.push('Заявитель: ' + person);
+                if (phone) lines_.push('Телефон: ' + phone);
+                if (text) lines_.push(text);
+                const description = lines_.join('\n');
 
+                submit.dataset.busy = '1';
                 submit.disabled = true;
                 const origText = submit.textContent;
                 submit.textContent = pending.length ? 'Создаю и загружаю…' : 'Создаю…';
@@ -13728,6 +14519,11 @@
                     const res = await ERP.createStandaloneLineRequest(kind, {
                         description,
                         files: pending.slice(),
+                        // Координаты и дом — из техучёта, а не из текста поля
+                        coords: picked ? { lat: picked.lat, lon: picked.lon } : null,
+                        buildingId: picked ? picked.id : '',
+                        // Заголовок дома техучёта: по нему ищем адрес в справочнике
+                        addressTitle: address,
                     });
 
                     if (res.ok) {
@@ -13744,6 +14540,7 @@
                         if (fio) fio.value = '';
                         if (tel) tel.value = '';
                         if (addr) addr.value = '';
+                        resetPick(false);
                     } else {
                         const tail = res.requestId
                             ? ` Обращение <a href="/user/process#${esc(res.requestId)}" target="_blank">#${esc(res.requestId)}</a> уже создано — не заводите второе.`
@@ -13754,9 +14551,10 @@
                 } catch (e) {
                     say('is-bad', e.message || String(e));
                 } finally {
-                    submit.disabled = false;
+                    delete submit.dataset.busy;
                     submit.textContent = origText;
                     renderFiles();
+                    refreshSubmitState();
                 }
             });
         }
