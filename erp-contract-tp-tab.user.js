@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.68
+// @version      0.72.69
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.68';
+    const SELF_VERSION = '0.72.69';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -621,7 +621,14 @@
                 NET.cache.set(key, hit);
                 return Promise.resolve(hit.text);
             }
-            if (hit) NET.cache.delete(key);
+            if (hit) {
+                // Счётчик байт уменьшаем и здесь: иначе просроченная запись
+                // вылетала из кэша «молча», NET.bytes оставался завышенным,
+                // и предохранитель maxBytes выбрасывал живые записи раньше
+                // времени — панель шла в сеть чаще, чем нужно.
+                NET.bytes -= (hit.text || '').length;
+                NET.cache.delete(key);
+            }
         }
 
         // Такой же запрос уже в пути — ждём его, а не дублируем
@@ -694,6 +701,29 @@
     const parseHtml = (html) => {
         const doc = new DOMParser().parseFromString(html, 'text/html');
         return doc.body || doc.documentElement;
+    };
+
+    /**
+     * Читаемый адрес из «сырого» заголовка дома техучёта.
+     *
+     * Userside отдаёт title в виде «, , Город, , Улица, Дом» — с пустыми
+     * полями между разделителями. Раньше эта строка шла как есть и в список
+     * домов, и в поле адреса, и в описание заявки: оператор видел
+     * «, , Краснодар, , Фиалковая, 58», а монтажник в заявке — то же самое.
+     *
+     * Значимых частей всегда три: город, улица, дом. Всё, что идёт после
+     * улицы, склеиваем обратно через запятую: в адресах встречаются
+     * «10км, ул. Зеленая, 2» и «1326км, 1», и терять хвост нельзя.
+     *
+     * Сырой title при этом НЕ теряется: по нему resolveAddress ищет дом
+     * в справочнике ERP, и ему нужен именно исходный формат.
+     */
+    const buildingLabel = (title) => {
+        const parts = String(title == null ? '' : title).split(',').map((s) => s.trim()).filter(Boolean);
+        if (!parts.length) return '';
+        const head = parts.slice(0, 2);
+        const tail = parts.slice(2).join(', ');
+        return tail ? head.concat(tail).join(', ') : head.join(', ');
     };
 
     const postForm = (url, data) => {
@@ -1834,7 +1864,11 @@
                  */
                 const all = (json.data.buildings || []).map((b) => ({
                     id: String(b.buildingId),
+                    // title — исходная строка техучёта (по ней ищем дом в
+                    // справочнике ERP), label — та же строка без пустых
+                    // полей, для показа оператору и записи в заявку.
                     title: String(b.title || ''),
+                    label: buildingLabel(b.title),
                     lat: b.lat,
                     lon: b.lon,
                 })).filter((b) => b.id);
@@ -12588,14 +12622,14 @@
            460 px наложение закрыло бы поле, в которое оператор смотрит. */
         .tp-ls-addr-pick {
             display: flex; flex-direction: column; gap: 2px;
-            max-height: 150px; overflow-y: auto;
+            max-height: 190px; overflow-y: auto;
             margin: -2px 0 8px;
             border: 1px solid var(--input-border-color, rgba(0,0,0,.12));
             border-radius: 4px;
         }
         .tp-ls-addr-pick[hidden] { display: none; }
         .tp-ls-pick-row {
-            display: flex; align-items: baseline; justify-content: space-between;
+            display: flex; align-items: flex-start; justify-content: space-between;
             gap: 8px; padding: 6px 8px; cursor: pointer; text-align: left;
             font: inherit; font-size: 11.5px;
             color: var(--text-color, #1d1d1f);
@@ -12603,9 +12637,17 @@
         }
         .tp-ls-pick-row:last-child { border-bottom: 0; }
         .tp-ls-pick-row:hover { background-color: var(--table-head-bg-color, rgba(0,122,255,.08)); }
+        /* Адрес не обрезаем: оператор должен видеть улицу и дом целиком.
+           Раньше стояли nowrap + ellipsis, и длинные названия — «Автодорога
+           М-4 "Дон" ... 1327-й км, 8» — превращались в огрызок без номера
+           дома, по которому нельзя понять, тот это адрес или нет.
+           Переносим на вторую строку: в поповере 460 px это две-три строки. */
         .tp-ls-pick-title {
             flex: 1 1 auto; min-width: 0;
-            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            line-height: 1.35;
         }
         .tp-ls-pick-coord {
             flex: 0 0 auto; font-size: 10.5px;
@@ -14228,7 +14270,7 @@
                 setVerdict('is-bad', 'Наших линий в этой точке нет. Заявку создать нельзя.');
             }
 
-            drawMap({ lat: building.lat, lon: building.lon, title: building.title }, res);
+            drawMap({ lat: building.lat, lon: building.lon, title: building.label || building.title }, res);
             refreshSubmitState();
         };
 
@@ -14250,9 +14292,9 @@
              */
             const noCoordsNote = noCoords.length
                 ? `<div class="tp-ls-pick-note">Ещё ${noCoords.length} `
-                  + `${noCoords.length === 1 ? 'дом' : 'домов'} без координат в техучёте — `
+                  + `${plural(noCoords.length, 'дом', 'дома', 'домов')} без координат в техучёте — `
                   + 'по ним линию не проверить: '
-                  + esc(noCoords.slice(0, 3).map((b) => b.title).join('; '))
+                  + esc(noCoords.slice(0, 3).map((b) => b.label || b.title).join('; '))
                   + (noCoords.length > 3 ? '…' : '') + '</div>'
                 : '';
 
@@ -14275,7 +14317,7 @@
 
             addrPick.hidden = false;
             addrPick.innerHTML = list.map((b, i) => `<button type="button" class="tp-ls-pick-row" data-idx="${i}">
-                    <span class="tp-ls-pick-title">${esc(b.title)}</span>
+                    <span class="tp-ls-pick-title">${esc(b.label || b.title)}</span>
                     <span class="tp-ls-pick-coord">${esc(Number(b.lat).toFixed(5))}, ${esc(Number(b.lon).toFixed(5))}</span>
                 </button>`).join('')
                 + noCoordsNote
@@ -14288,7 +14330,7 @@
                     const b = list[Number(row.dataset.idx)];
                     if (!b) return;
                     addrPick.hidden = true;
-                    if (addr) addr.value = b.title;
+                    if (addr) addr.value = b.label || b.title;
                     loadLines(b);
                 });
             });
@@ -14494,8 +14536,14 @@
                  * Адрес в описании — заголовок выбранного дома из техучёта,
                  * а не то, что оператор набрал в поле: набранное может быть
                  * огрызком («Южная 19»), а в заявке нужен полный адрес.
+                 *
+                 * label, а не title: title приходит с пустыми полями
+                 * («, , Краснодар, , Фиалковая, 58»), и в описании заявки
+                 * это читалось как мусор. Сырой title уходит отдельно,
+                 * в addressTitle — по нему resolveAddress ищет дом
+                 * в справочнике ERP.
                  */
-                const address = picked ? picked.title : '';
+                const address = picked ? (picked.label || picked.title) : '';
 
                 /*
                  * ФИО, телефон и адрес ERP отдельными параметрами не принимает
@@ -14522,8 +14570,13 @@
                         // Координаты и дом — из техучёта, а не из текста поля
                         coords: picked ? { lat: picked.lat, lon: picked.lon } : null,
                         buildingId: picked ? picked.id : '',
-                        // Заголовок дома техучёта: по нему ищем адрес в справочнике
-                        addressTitle: address,
+                        // Заголовок дома техучёта: по нему ищем адрес в справочнике.
+                        // Именно СЫРОЙ title, а не label: parseBuildingTitle
+                        // в resolveAddress разбирает формат «, , Город, , Улица, Дом»
+                        // по позициям после отбрасывания пустых частей, и на
+                        // очищенной строке позиции съезжают — улица попадёт
+                        // в город, и дом не найдётся.
+                        addressTitle: picked ? picked.title : '',
                     });
 
                     if (res.ok) {
