@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.70
+// @version      0.72.71
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.70';
+    const SELF_VERSION = '0.72.71';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5969,6 +5969,10 @@
     /** Обновление порта OLT по кнопке. */
     async function doPortRefresh(btn) {
         const orig = btn.textContent;
+        // Параметры снимаем ДО перерисовки: кнопка исчезнет из DOM, и читать
+        // её dataset после ответа будет уже не с чего.
+        const oltIp = btn.dataset.oltIp || '';
+        const port = btn.dataset.port || '';
         btn.disabled = true;
         btn.classList.add('is-busy');
         btn.textContent = 'Обновление…';
@@ -5977,8 +5981,8 @@
         let res;
         try {
             res = await ERP.refreshPort({
-                oltIp: btn.dataset.oltIp,
-                port: btn.dataset.port,
+                oltIp,
+                port,
                 processId: btn.dataset.processId,
             });
         } catch (e) {
@@ -6014,6 +6018,20 @@
                             setHtmlIfChanged(eq, renderEquipment(olt.onu, objs, panel._tpOltMap || null));
                             bindCopyTargets(eq);
                             bindOnuActions(panel);
+                            /*
+                             * Перерисовка убила и кнопку, и сообщение рядом с ней.
+                             * Оператор только что нажал «Обновить порт» и должен
+                             * видеть подтверждение, а не пустоту. Ставим текст на
+                             * новую кнопку того же порта.
+                             */
+                            const fresh = Array.from(eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]'))
+                                .find((b) => b.dataset.port === port && b.dataset.oltIp === oltIp);
+                            if (fresh) {
+                                onuSay(fresh, 'Порт опрошен. Уровни сигнала обновятся в GetOLT.', 'is-ok');
+                                setTimeout(() => {
+                                    if (document.contains(fresh)) onuSay(fresh, '');
+                                }, 8000);
+                            }
                         }).catch(() => {});
                     }).catch(() => {});
                 }
