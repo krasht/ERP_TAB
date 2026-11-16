@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.73
+// @version      0.72.74
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.73';
+    const SELF_VERSION = '0.72.74';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4711,8 +4711,17 @@
            Кнопки маленькие и намеренно не .tp-btn: это не главное действие
            экрана, а служебное, рядом с телеметрией. */
         .tp-onu-actions {
-            display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+            display: flex; align-items: center; gap: 6px;
+            /* Без flex-wrap: строка одна всегда. Перенос давал вторую высоту
+               (замерено 30 → 53 px), и блок «Оборудование» прыгал при каждом
+               появлении сообщения. Кнопки фиксированной ширины, сообщение
+               занимает остаток и обрезается — так высота постоянна. */
+            flex-wrap: nowrap;
             margin-top: 8px;
+            /* Высота зафиксирована: во время операции рядом с кнопками
+               появляется сообщение, и без этого строка под телеметрией
+               прыгала бы вниз, сдвигая «Объекты договора». */
+            min-height: 24px;
         }
         .tp-onu-btn {
             font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer;
@@ -4720,7 +4729,39 @@
             color: var(--tp-fg); background: var(--tp-fill-1);
             border: 1px solid var(--tp-border);
             transition: background .12s, color .12s, border-color .12s;
+            /*
+             * Жёсткая ширина, а не min-width — иначе строка дрожит.
+             *
+             * Текст кнопки меняется по ходу операции: «Обновить порт» →
+             * «Обновление… 3 с» → «Обновление… 12 с» → «Обновлено!».
+             * Ширина текста разная, и с min-width кнопка тянулась за ним:
+             * замерено 128 → 138 → 146 px, соседняя «Перезагрузить ONU»
+             * ездила на 18 px, сообщение справа перескакивало.
+             *
+             * Ширины посчитаны по самому длинному состоянию с запасом
+             * (замер текста + padding 20 + border 2):
+             *   refresh: «Обновление… 90 с» 123 + 22 = 145 → 148
+             *   reboot:  «Перезагрузка… 90 с» 128 + 22 = 150 → 152
+             * box-sizing уже border-box для всей панели, поэтому padding
+             * и border входят в width.
+             */
+            width: 148px;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            /* Цифры в счётчике секунд не должны дёргать текст */
+            font-variant-numeric: tabular-nums;
+            /*
+             * flex-shrink: 0 обязателен. С дефолтным shrink:1 кнопки
+             * СЖИМАЛИСЬ, когда рядом появлялся длинный текст сообщения:
+             * замерено 1509 → 1486 px, то есть 23 px влево. Фиксированная
+             * width этого не спасает — флексбокс ужимает элемент ниже width,
+             * если суммарная ширина не влезает.
+             */
+            flex: 0 0 auto;
         }
+        /* Кулдаун перезагрузки — «Перезагрузка… 90 с» — длиннее прочих подписей */
+        .tp-onu-btn[data-onu-act="reboot"] { width: 152px; }
         .tp-onu-btn:hover:not([disabled]) { background: var(--tp-fill-2); border-color: var(--tp-blue); color: var(--tp-blue); }
         .tp-onu-btn:active:not([disabled]) { transform: scale(.985); }
         .tp-onu-btn[disabled] { opacity: .6; cursor: default; }
@@ -4730,16 +4771,22 @@
         .tp-onu-btn.is-busy { opacity: .7; cursor: progress; }
         .tp-onu-btn.is-done { color: var(--tp-ok); border-color: var(--tp-ok); }
         .tp-onu-btn.is-fail { color: var(--tp-bad); border-color: var(--tp-bad); }
-        .tp-onu-msg { font-size: 11.5px; color: var(--tp-fg3); }
+        /*
+         * Сообщение рядом с кнопками.
+         *
+         * Занимает остаток строки и НЕ выталкивает кнопки: при появлении
+         * и исчезновении текста строка остаётся на месте. Одну строку
+         * держим всегда — многострочный текст здесь ломал бы высоту блока.
+         */
+        .tp-onu-msg {
+            flex: 1 1 auto; min-width: 0;
+            font-size: 11.5px; color: var(--tp-fg3);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
         .tp-onu-msg.is-ok { color: var(--tp-ok); }
         .tp-onu-msg.is-bad { color: var(--tp-bad); }
         /* «Порт уже опрашивается» — не ошибка и не успех: это ожидание. */
         .tp-onu-msg.is-warn { color: var(--tp-warn); }
-        /* Возраст данных порта по GetOLT — тихо, рядом с кнопкой. */
-        .tp-onu-age {
-            font-size: 10.5px; color: var(--tp-fg3);
-            font-variant-numeric: tabular-nums;
-        }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
         .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
         .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
@@ -5951,11 +5998,6 @@
             const left = rebootCooldownLeft(btn.dataset.rebootKey);
             if (left > 0) startCooldown(btn, left);
         });
-
-        // Возраст данных из GetOLT — рядом с кнопкой «Обновить порт».
-        // Это и есть ответ на «когда порт реально опрашивался»: время берём
-        // из самого плагина, а не из своих отметок.
-        mountLastRefreshNote(panel);
     }
 
     /** Тикающий кулдаун на кнопке перезагрузки. */
@@ -6115,71 +6157,6 @@
                 bindOnuActions(panel);
             }).catch(() => {});
         }).catch(() => {});
-    }
-
-    /**
-     * Восстановление состояния операции после перезагрузки страницы.
-     *
-     * Оператор нажал «Обновить порт», ушёл пить чай, вернулся и нажал F5 —
-     * и блок должен показать, что опрос всё ещё идёт, а не притвориться,
-     * что ничего не было.
-     *
-     * Источник — сам GetOLT, а не localStorage: у ONU есть «Обновлено:
-     * <точное время>». Если оно свежее (меньше минуты), значит плагин
-     * только что перечитал порт, и операция действительно завершилась.
-     * Если старое — операция либо ещё идёт, либо её и не было; различить
-     * это без серверного флага нельзя, поэтому показываем возраст данных
-     * и не выдумываем «идёт опрос».
-     *
-     * Так честнее: показываем то, что реально знает сервер.
-     */
-    function mountLastRefreshNote(panel) {
-        const root = panel && panel.querySelector('.tp-lazy[data-lazy="equipment"]');
-        if (!root) return;
-        const eq = root.querySelector('.tp-lazy-body');
-        if (!eq) return;
-        eq.querySelectorAll('.tp-onu-age').forEach((el) => el.remove());
-
-        eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]').forEach((btn) => {
-            const port = btn.dataset.port;
-            const box = btn.closest('.tp-onu-actions');
-            if (!box) return;
-            const onu = btn.closest('.tp-device');
-            const upd = onu && onu.querySelector('.tp-eq-upd');
-            if (!upd) return;
-            // Точное время лежит в тексте «Обновлено: 16.11.2026 15:49:10»
-            const m = String(upd.textContent || '').match(/(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})/);
-            if (!m) return;
-            const when = parseRuDateTime(m[1]);
-            if (!when) return;
-            const ageMs = Date.now() - when;
-            if (ageMs < 0 || ageMs > 24 * 3600 * 1000) return;
-            const note = document.createElement('span');
-            note.className = 'tp-onu-age';
-            note.textContent = `порт ${port}: данные ${ageText(ageMs)}`;
-            note.title = 'Время последнего опроса порта по данным GetOLT';
-            box.appendChild(note);
-        });
-    }
-
-    /** «16.11.2026 15:49:10» → Date (локальное время сервера). */
-    function parseRuDateTime(s) {
-        const m = String(s || '').match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
-        if (!m) return null;
-        const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]),
-            Number(m[4]), Number(m[5]), Number(m[6]));
-        return Number.isFinite(d.getTime()) ? d : null;
-    }
-
-    /** «12 сек. назад» / «3 мин. назад» / «2 ч. назад». */
-    function ageText(ms) {
-        const sec = Math.floor(ms / 1000);
-        if (sec < 60) return `${sec} сек. назад`;
-        const min = Math.floor(sec / 60);
-        if (min < 60) return `${min} мин. назад`;
-        const hr = Math.floor(min / 60);
-        if (hr < 24) return `${hr} ч. назад`;
-        return `${Math.floor(hr / 24)} дн. назад`;
     }
 
     /** Обновление порта OLT по кнопке. */
