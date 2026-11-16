@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.75
+// @version      0.72.76
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.75';
+    const SELF_VERSION = '0.72.76';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4711,14 +4711,13 @@
            Кнопки маленькие и намеренно не .tp-btn: это не главное действие
            экрана, а служебное, рядом с телеметрией. */
         .tp-onu-actions {
-            display: flex; align-items: center; gap: 6px 8px;
-            /* Строка кнопок + строка сообщения под ней. Сообщение всегда
-               занимает своё место (flex-basis 100%), поэтому высота блока
-               постоянна. Раньше сообщение стояло в одной строке с кнопками,
-               ему оставалось ~171 px, и длинный текст резался в «…данн..». */
-            flex-wrap: wrap;
+            display: flex; align-items: center; gap: 6px;
+            /* Одна строка: только кнопки. Весь прогресс и результат живёт
+               в подписи самой кнопки — отдельной строки сообщения нет.
+               Кнопки фиксированной ширины и не сжимаются, поэтому строка
+               стоит намертво: замерено 1355/1511 px без сдвигов. */
+            flex-wrap: nowrap;
             margin-top: 8px;
-            align-content: flex-start;
         }
         .tp-onu-btn {
             font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer;
@@ -4730,19 +4729,16 @@
              * Жёсткая ширина, а не min-width — иначе строка дрожит.
              *
              * Текст кнопки меняется по ходу операции: «Обновить порт» →
-             * «Обновление… 3 с» → «Обновление… 12 с» → «Обновлено!».
-             * Ширина текста разная, и с min-width кнопка тянулась за ним:
-             * замерено 128 → 138 → 146 px, соседняя «Перезагрузить ONU»
-             * ездила на 18 px, сообщение справа перескакивало.
+             * «Обновление… 12 с» → «Порт опрошен за 16 с». Ширина текста
+             * разная, и с min-width кнопка тянулась за ним: замерено
+             * 128 → 138 → 146 px, соседняя кнопка ездила на 18 px.
              *
-             * Ширины посчитаны по самому длинному состоянию с запасом
-             * (замер текста + padding 20 + border 2):
-             *   refresh: «Обновление… 90 с» 123 + 22 = 145 → 148
-             *   reboot:  «Перезагрузка… 90 с» 128 + 22 = 150 → 152
-             * box-sizing уже border-box для всей панели, поэтому padding
-             * и border входят в width.
+             * Ширины посчитаны по самому длинному состоянию с запасом.
+             * Замеры текста (11.5px / 600): «Порт опрошен за 90 с» = 120,
+             * «Порт уже опрашивается» = 132, «ONU перезагружена. (12 с)» = 145.
+             * Плюс padding 20 и border 2 → 167. Берём 170 и 178.
              */
-            width: 148px;
+            width: 170px;
             text-align: center;
             white-space: nowrap;
             overflow: hidden;
@@ -4750,15 +4746,15 @@
             font-variant-numeric: tabular-nums;
             /*
              * flex-shrink: 0 обязателен. С дефолтным shrink:1 кнопки
-             * СЖИМАЛИСЬ, когда рядом появлялся длинный текст сообщения:
-             * замерено 1509 → 1486 px, то есть 23 px влево. Фиксированная
-             * width этого не спасает — флексбокс ужимает элемент ниже width,
+             * СЖИМАЛИСЬ, когда рядом появлялся длинный текст: замерено
+             * 1509 → 1486 px, то есть 23 px влево. Фиксированная width
+             * этого не спасает — флексбокс ужимает элемент ниже width,
              * если суммарная ширина не влезает.
              */
             flex: 0 0 auto;
         }
-        /* Кулдаун перезагрузки — «Перезагрузка… 90 с» — длиннее прочих подписей */
-        .tp-onu-btn[data-onu-act="reboot"] { width: 152px; }
+        /* Перезагрузка несёт более длинные подписи — ей чуть больше */
+        .tp-onu-btn[data-onu-act="reboot"] { width: 178px; }
         .tp-onu-btn:hover:not([disabled]) { background: var(--tp-fill-2); border-color: var(--tp-blue); color: var(--tp-blue); }
         .tp-onu-btn:active:not([disabled]) { transform: scale(.985); }
         .tp-onu-btn[disabled] { opacity: .6; cursor: default; }
@@ -4768,28 +4764,12 @@
         .tp-onu-btn.is-busy { opacity: .7; cursor: progress; }
         .tp-onu-btn.is-done { color: var(--tp-ok); border-color: var(--tp-ok); }
         .tp-onu-btn.is-fail { color: var(--tp-bad); border-color: var(--tp-bad); }
-        /*
-         * Сообщение под кнопками, на всю ширину строки.
-         *
-         * Раньше оно делило строку с кнопками и получало остаток ~171 px:
-         * «Порт опрошен за 16 с — данные в блоке свежие» резалось в «…данн..».
-         * Теперь flex-basis 100% — сообщение всегда начинает новую строку
-         * и получает всю ширину блока.
-         */
-        .tp-onu-msg {
-            flex: 0 0 100%; min-width: 0;
-            font-size: 11.5px; color: var(--tp-fg3);
-            line-height: 1.35;
-            overflow: hidden;
-            /* Место под строку занято всегда, даже когда текста нет.
-               Иначе высота блока скакала 48 → 52 px при каждом появлении
-               сообщения, и «Объекты договора» под ним дёргались. */
-            min-height: 16px;
-        }
-        .tp-onu-msg.is-ok { color: var(--tp-ok); }
-        .tp-onu-msg.is-bad { color: var(--tp-bad); }
-        /* «Порт уже опрашивается» — не ошибка и не успех: это ожидание. */
-        .tp-onu-msg.is-warn { color: var(--tp-warn); }
+        /* Кнопка несёт собственный цвет состояния: зелёный — успех,
+           красный — отказ, жёлтый — ожидание. Отдельного .tp-onu-msg
+           больше нет: подпись живёт в самой кнопке. */
+        .tp-onu-btn.is-ok { color: var(--tp-ok); border-color: var(--tp-ok); }
+        .tp-onu-btn.is-bad { color: var(--tp-bad); border-color: var(--tp-bad); }
+        .tp-onu-btn.is-warn-state { color: var(--tp-warn); border-color: var(--tp-warn); }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
         .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
         .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
@@ -5920,7 +5900,6 @@
             ${canRefresh ? `<button type="button" class="tp-onu-btn" data-onu-act="refresh" ${refreshAttr}>Обновить порт</button>` : ''}
             ${canReboot ? `<button type="button" class="tp-onu-btn is-warn" data-onu-act="reboot" ${rebootAttr}${cooldownLeft > 0 ? ' disabled' : ''}>`
                 + `${cooldownLeft > 0 ? `Ожидание ${cooldownText(cooldownLeft)}` : 'Перезагрузить ONU'}</button>` : ''}
-            <span class="tp-onu-msg"></span>
         </div>`;
     }
 
@@ -6038,38 +6017,43 @@
     }
 
     /**
-     * Сообщение рядом с кнопками: у каждой ONU своё.
+     * Весь текст операции — В САМОЙ КНОПКЕ, без отдельной строки под ней.
      *
-     * Собственный таймер очистки на элементе — обязателен.
+     * Оператор просил именно так: одна кнопка, в ней и прогресс, и результат.
+     * Отдельная строка сообщения убрана совсем — она занимала место, дублировала
+     * состояние кнопки и мигала.
      *
-     * Раньше очистка была голым setTimeout на 10 секунд, и он не отменялся
-     * при появлении нового текста. Получался мерцающий «призрак»: первая
-     * операция ставила «Порт опрошен за 15 с» и заводила таймер; вторая
-     * ставила своё сообщение; таймер первой срабатывал и стирал ЧУЖОЙ текст
-     * посреди работы. Оператор видел, как сообщение пропадает само.
+     * Исходная подпись запоминается в dataset.tpLabel: по ней кнопка
+     * возвращается в нормальное состояние. Без этого после «Порт опрошен за 16 с»
+     * на кнопке навсегда остался бы этот текст.
      *
-     * Теперь каждый новый текст гасит предыдущий таймер этого же элемента.
+     * Таймер очистки живёт на самой кнопке и гасится при каждой новой записи —
+     * иначе таймер прошлой операции стирал текст текущей (то самое мерцание).
      */
     function onuSay(btn, text, cls, autoClearMs) {
-        const box = btn && btn.closest ? btn.closest('.tp-onu-actions') : null;
-        const msg = box ? box.querySelector('.tp-onu-msg') : null;
-        if (!msg) return;
+        if (!btn) return;
+        // Исходная подпись — один раз, при первой записи
+        if (btn.dataset.tpLabel == null) btn.dataset.tpLabel = btn.textContent.trim();
 
-        // Таймер от прошлого сообщения больше не нужен: текст заменяется
-        if (msg._tpMsgTimer) {
-            clearTimeout(msg._tpMsgTimer);
-            msg._tpMsgTimer = null;
+        if (btn._tpMsgTimer) {
+            clearTimeout(btn._tpMsgTimer);
+            btn._tpMsgTimer = null;
         }
 
-        msg.className = 'tp-onu-msg' + (cls ? ' ' + cls : '');
-        msg.textContent = text || '';
+        // Класс кнопки пересобираем, сохраняя её постоянные признаки
+        const base = btn.classList.contains('is-warn') ? 'tp-onu-btn is-warn' : 'tp-onu-btn';
+        const keep = btn.classList.contains('is-busy') ? ' is-busy'
+            : btn.classList.contains('is-done') ? ' is-done'
+                : btn.classList.contains('is-fail') ? ' is-fail' : '';
+        btn.className = base + keep + (cls ? ' ' + cls : '');
+        btn.textContent = text || btn.dataset.tpLabel;
 
         if (autoClearMs && text) {
-            msg._tpMsgTimer = setTimeout(() => {
-                msg._tpMsgTimer = null;
-                if (!document.contains(msg)) return;
-                msg.className = 'tp-onu-msg';
-                msg.textContent = '';
+            btn._tpMsgTimer = setTimeout(() => {
+                btn._tpMsgTimer = null;
+                if (!document.contains(btn)) return;
+                btn.className = base;
+                btn.textContent = btn.dataset.tpLabel;
             }, autoClearMs);
         }
     }
@@ -6083,12 +6067,11 @@
 
         const panel = btn.closest('[id^="contract-tp-info-"]');
         const cid = panel && panel.dataset.contractId;
-        const orig = btn.textContent;
 
         btn.disabled = true;
         btn.classList.add('is-busy');
-        btn.textContent = 'Перезагрузка…';
-        onuSay(btn, 'Отправлено на OLT, ждём ответа…');
+        // Подпись — только в кнопке: «Перезагрузка… N с»
+        onuSay(btn, 'Перезагрузка…');
 
         /*
          * Живой индикатор, пока сервер думает.
@@ -6111,10 +6094,7 @@
             elapsed += 3;
             if (!fresh.online) sawOffline = true;
             if (!document.contains(btn)) return;
-            btn.textContent = `Перезагрузка… ${elapsed} с`;
-            onuSay(btn, sawOffline
-                ? `ONU ушла в offline, ждём возврата (${elapsed} с)…`
-                : `OLT ещё показывает прежнее состояние (${elapsed} с)…`);
+            onuSay(btn, `Перезагрузка… ${elapsed} с`);
         }, { intervalMs: 3000, maxMs: 90000 });
 
         let res;
@@ -6135,10 +6115,10 @@
 
         if (res.ok) {
             const spent = Math.max(1, Math.round(Number(res.ms || 0) / 1000));
-            btn.classList.add('is-done');
-            btn.textContent = 'Перезагружена!';
-            onuSay(btn, (res.message || 'ONU перезагружена.')
-                + (spent ? ` (${spent} с)` : ''), 'is-ok', 8000);
+            // В кнопке — короткий итог, не весь серверный текст: он длинный
+            // («ONU 6:63 успешно перезагружена. Повторная перезагрузка…»)
+            // и не влезает в кнопку.
+            onuSay(btn, spent ? `Перезагружена за ${spent} с` : 'Перезагружена!', 'is-ok');
             // Отметку ставим в тот же ключ, что и плагин: кулдаун общий
             markRebooted(key);
             // GetOLT уже знает новое состояние — перечитываем блок
@@ -6156,17 +6136,15 @@
         if (res.cooldown) {
             const m = String(res.message || '').match(/(\d+)\s*мин\.?\s*(\d+)\s*сек/i);
             const rest = m ? (Number(m[1]) * 60 + Number(m[2])) * 1000 : GETOLT_REBOOT_COOLDOWN_MS;
-            onuSay(btn, res.message, 'is-bad');
             markRebooted(key);
             startCooldown(btn, rest);
             return;
         }
 
         btn.classList.add('is-fail');
-        btn.textContent = orig;
         btn.disabled = false;
-        onuSay(btn, res.message || 'не удалось перезагрузить', 'is-bad', 8000);
-        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 4000);
+        onuSay(btn, 'Не удалось перезагрузить', 'is-bad', 6000);
+        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 6000);
     }
 
     /**
@@ -6192,7 +6170,6 @@
 
     /** Обновление порта OLT по кнопке. */
     async function doPortRefresh(btn) {
-        const orig = btn.textContent;
         // Параметры снимаем ДО перерисовки: кнопка исчезнет из DOM, и читать
         // её dataset после ответа будет уже не с чего.
         const oltIp = btn.dataset.oltIp || '';
@@ -6202,8 +6179,7 @@
 
         btn.disabled = true;
         btn.classList.add('is-busy');
-        btn.textContent = 'Обновление…';
-        onuSay(btn, 'Запускаю опрос порта на OLT…');
+        onuSay(btn, 'Обновление…');
 
         /*
          * Снимок «до». По нему видно, дошло ли до нас новое состояние:
@@ -6232,10 +6208,7 @@
                 seenUpdated = true;
             }
             if (!document.contains(btn)) return;
-            btn.textContent = `Обновление… ${elapsed} с`;
-            onuSay(btn, seenUpdated
-                ? `Данные с порта обновились (${elapsed} с)…`
-                : `OLT опрашивает порт, ждём новые данные (${elapsed} с)…`);
+            onuSay(btn, `Обновление… ${elapsed} с`);
         }, { intervalMs: 3000, maxMs: 90000 });
 
         let res;
@@ -6254,24 +6227,20 @@
 
         if (res.ok) {
             const spent = Math.max(1, Math.round((Date.now() - t0) / 1000));
-            const okText = `Порт опрошен за ${spent} с`;
-            btn.classList.add('is-done');
-            btn.textContent = 'Обновлено!';
+            const okText = `Опрошен за ${spent} с`;
 
             /*
-             * Сообщение ставим ОДИН раз — после перерисовки, и ни секундой
-             * раньше.
+             * Итог — В КНОПКЕ, один раз.
              *
-             * Было три источника мерцания:
-             *   1) текст ставился здесь;
-             *   2) refreshEquipmentNow сносил тело блока вместе с ним;
-             *   3) через 1.2 с текст ставился заново.
+             * Раньше текст ставился здесь, потом refreshEquipmentNow сносил
+             * тело блока вместе с ним, и через 1.2 с текст ставился заново.
              * Оператор видел «появилось → пропало → появилось».
              *
-             * Пока идёт перерисовка, роль индикатора играет сама кнопка:
-             * на ней «Обновлено!» зелёным. Это и есть подтверждение; текст
-             * под кнопками добавляет к нему длительность.
+             * Теперь пишем только после перерисовки, на свежую кнопку.
+             * До этого момента состояние видно по самой кнопке: она
+             * в классе is-done и подписана «Опрошен за N с».
              */
+            onuSay(btn, okText, 'is-ok');
             setTimeout(() => {
                 refreshEquipmentNow(panel, cid);
                 // Перерисовка асинхронная — ждём её и ставим текст один раз
@@ -6302,22 +6271,18 @@
          * Иначе оператор решит, что сломано, и начнёт жать ещё.
          */
         if (res.busy) {
-            btn.textContent = 'Опрос уже идёт…';
-            onuSay(btn, 'Порт уже опрашивается — подождите 10–15 секунд.', 'is-warn');
+            onuSay(btn, 'Уже опрашивается', 'is-warn-state', PORT_REFRESH_BUSY_MS);
             setTimeout(() => {
                 if (!document.contains(btn)) return;
-                btn.textContent = orig;
                 btn.disabled = false;
-                onuSay(btn, '', '', 0);
             }, PORT_REFRESH_BUSY_MS);
             return;
         }
 
         btn.classList.add('is-fail');
-        btn.textContent = orig;
         btn.disabled = false;
-        onuSay(btn, res.message || 'не удалось обновить порт', 'is-bad', 8000);
-        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 4000);
+        onuSay(btn, 'Не удалось обновить', 'is-bad', 6000);
+        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 6000);
     }
 
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
