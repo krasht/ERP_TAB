@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.71
+// @version      0.72.72
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.71';
+    const SELF_VERSION = '0.72.72';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1006,6 +1006,15 @@
      */
     const GETOLT_REBOOT_COOLDOWN_MS = 5 * 60 * 1000;
 
+    /**
+     * Сколько держим кнопку «Обновить порт» закрытой, если порт уже опрашивается.
+     *
+     * OLT не принимает второй параллельный SNMP-опрос порта и отдаёт
+     * «Ошибка запуска обновления: 500». По замерам опрос одного порта
+     * укладывается в 10–15 секунд, поэтому 20 — с запасом.
+     */
+    const PORT_REFRESH_BUSY_MS = 20000;
+
     const ERP = {
         /**
          * Поддерживаем два способа открытия договора в ERP:
@@ -1434,13 +1443,26 @@
                 const inner = outer.data || outer.result || {};
                 const message = String(inner.message || json.message || '').trim();
                 const ok = inner.success === true || (inner.success === undefined && json.status === 'ok');
-                // Кулдаун приходит как «success:true» с текстом «Подождите…»
+                /*
+                 * Два разных отказа, и оба приходят с status:"ok":
+                 *
+                 *  • «Подождите 4 мин. 12 сек.» — кулдаун перезагрузки ONU,
+                 *    сервер сам говорит, сколько ждать;
+                 *  • «Ошибка запуска обновления: 500» — порт УЖЕ опрашивается.
+                 *    Это не поломка и не отказ по правам: плагин на OLT
+                 *    запускает SNMP-опрос порта, и второй параллельный запуск
+                 *    OLT не принимает. Проверено: пока первый опрос идёт,
+                 *    запросы подряд возвращают именно этот текст, а через
+                 *    10–15 секунд снова success:true. Показывать это как
+                 *    ошибку — пугать оператора зря; надо просто подождать.
+                 */
                 const wait = /Подождите/i.test(message);
-                return { ok: ok && !wait, message, cooldown: wait };
+                const busy = /Ошибка запуска обновления/i.test(message);
+                return { ok: ok && !wait && !busy, message, cooldown: wait, busy };
             }
 
             const plain = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-            return { ok: false, message: plain.slice(0, 200) || 'пустой ответ GetOLT', cooldown: false };
+            return { ok: false, message: plain.slice(0, 200) || 'пустой ответ GetOLT', cooldown: false, busy: false };
         },
 
         /**
@@ -1462,7 +1484,7 @@
             const port = String(src.port || '').trim();
             const onuId = String(src.onuId || '').trim();
             if (!oltId || !port || !onuId) {
-                return { ok: false, message: 'нет данных порта — перезагрузка невозможна', cooldown: false };
+                return { ok: false, message: 'нет данных порта — перезагрузка невозможна', cooldown: false, busy: false };
             }
 
             let url = '/user/plugin/getolt/getolt.do?method=rebootOnu'
@@ -1477,7 +1499,7 @@
                 const text = await postForm(url, {});
                 return this.parseGetoltActionResult(text);
             } catch (e) {
-                return { ok: false, message: e.message || String(e), cooldown: false };
+                return { ok: false, message: e.message || String(e), cooldown: false, busy: false };
             }
         },
 
@@ -1506,7 +1528,7 @@
                 const text = await postForm(url, {});
                 return this.parseGetoltActionResult(text);
             } catch (e) {
-                return { ok: false, message: e.message || String(e), cooldown: false };
+                return { ok: false, message: e.message || String(e), cooldown: false, busy: false };
             }
         },
 
@@ -4699,6 +4721,8 @@
         .tp-onu-msg { font-size: 11.5px; color: var(--tp-fg3); }
         .tp-onu-msg.is-ok { color: var(--tp-ok); }
         .tp-onu-msg.is-bad { color: var(--tp-bad); }
+        /* «Порт уже опрашивается» — не ошибка и не успех: это ожидание. */
+        .tp-onu-msg.is-warn { color: var(--tp-warn); }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
         .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
         .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
@@ -6036,6 +6060,30 @@
                     }).catch(() => {});
                 }
             }, 2000);
+            return;
+        }
+
+        /*
+         * Порт уже опрашивается.
+         *
+         * Сервер отвечает «Ошибка запуска обновления: 500», пока идёт
+         * предыдущий SNMP-опрос того же порта — это не поломка и не
+         * отсутствие прав. Проверено вживую: подряд идущие запросы дают
+         * именно этот текст, а через 10–15 секунд снова success:true.
+         *
+         * Поэтому не красим кнопку в красный и не пишем «ошибка»: объясняем,
+         * что опрос уже идёт, и держим кнопку закрытой, пока он не кончится.
+         * Иначе оператор решит, что сломано, и начнёт жать ещё.
+         */
+        if (res.busy) {
+            btn.textContent = 'Опрос уже идёт…';
+            onuSay(btn, 'Порт уже опрашивается — подождите 10–15 секунд.', 'is-warn');
+            setTimeout(() => {
+                if (!document.contains(btn)) return;
+                btn.textContent = orig;
+                btn.disabled = false;
+                onuSay(btn, '');
+            }, PORT_REFRESH_BUSY_MS);
             return;
         }
 
