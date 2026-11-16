@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.77
+// @version      0.72.78
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.77';
+    const SELF_VERSION = '0.72.78';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5897,8 +5897,10 @@
         const cooldownLeft = rebootCooldownLeft(src.rebootKey);
 
         return `<div class="tp-onu-actions">
-            ${canRefresh ? `<button type="button" class="tp-onu-btn" data-onu-act="refresh" ${refreshAttr}>Обновить порт</button>` : ''}
-            ${canReboot ? `<button type="button" class="tp-onu-btn is-warn" data-onu-act="reboot" ${rebootAttr}${cooldownLeft > 0 ? ' disabled' : ''}>`
+            ${canRefresh ? `<button type="button" class="tp-onu-btn" data-onu-act="refresh" ${refreshAttr}`
+                + ` title="Переопросить порт на OLT: обновит уровни сигнала со всех ONU на нём">Обновить порт</button>` : ''}
+            ${canReboot ? `<button type="button" class="tp-onu-btn is-warn" data-onu-act="reboot" ${rebootAttr}${cooldownLeft > 0 ? ' disabled' : ''}`
+                + ` title="Перезагрузить ONU ${esc(src.port)}:${esc(src.onuId)} — абонент потеряет связь на 1–2 минуты">`
                 + `${cooldownLeft > 0 ? `Ожидание ${cooldownText(cooldownLeft)}` : 'Перезагрузить ONU'}</button>` : ''}
         </div>`;
     }
@@ -6127,7 +6129,18 @@
         const port = btn.dataset.port || '';
         const onuId = btn.dataset.onuId || '';
         const key = btn.dataset.rebootKey || '';
-        if (!window.confirm(`Перезагрузить ONU ${port}:${onuId}?\n\nАбонент потеряет связь на 1–2 минуты.`)) return;
+        /*
+         * Без window.confirm.
+         *
+         * Браузерное окно подтверждения здесь лишнее: кнопка и так
+         * предупреждающая (жёлтая, отдельный класс is-warn), а кулдаун
+         * в пять минут защищает от случайного второго нажатия. Диалог
+         * только добавлял лишний клик на каждую перезагрузку.
+         *
+         * Оператор, который нажал «Перезагрузить ONU», уже принял решение:
+         * он видит, на каком порту и ONU стоит, и держит в голове, что
+         * абонент на минуту без связи.
+         */
 
         const panel = btn.closest('[id^="contract-tp-info-"]');
         const cid = panel && panel.dataset.contractId;
@@ -16749,19 +16762,48 @@
             box.remove();
         });
 
-        // «Обновить» открывает файл: Tampermonkey показывает свою страницу
-        // установки. Баннер снимаем, но версию в «отложенные» НЕ пишем —
-        // вместо этого ставим паузу на несколько минут.
-        //
-        // Почему так: раньше здесь запоминалась версия, и если установка не
-        // проходила (оператор не дошёл до Tampermonkey, закрыл вкладку, ставил
-        // из-под VPN), баннер пропадал навсегда, а человек продолжал работать
-        // на старом коде. Теперь по истечении паузы проверка снова покажет
-        // окно, если версия в браузере всё ещё старая.
+        /*
+         * «Перезагрузить» — отдельная кнопка, и она важнее «Обновить».
+         *
+         * Такое расхождение — обычное дело: Tampermonkey уже поставил новую
+         * версию себе, но УЖЕ ЗАПУЩЕННУЮ копию скрипта в этой вкладке он не
+         * перезапускает. Страница продолжает крутить старый код, наша же
+         * проверка видит «remote новее» и честно показывает баннер.
+         *
+         * Оператор жмёт «Обновить», попадает в Tampermonkey — а там версия
+         * уже стоит, и кнопка называется «Переустановить». Выглядит как
+         * поломка, хотя достаточно просто перезагрузить страницу.
+         *
+         * Поэтому сначала предлагаем перезагрузку: она и есть настоящее
+         * применение обновления. Установка нужна только если в менеджере
+         * версия ещё старая.
+         */
+        const reload = document.createElement('button');
+        reload.type = 'button';
+        reload.className = 'tp-upd-ok';
+        reload.textContent = 'Перезагрузить';
+        reload.title = 'Если Tampermonkey уже поставил версию — достаточно перезагрузить страницу';
+        reload.addEventListener('click', () => {
+            updateStoreSet(UPDATE_SNOOZE_KEY, '');
+            updateStoreSet(UPDATE_SEEN_KEY, '');
+            window.location.reload();
+        });
+
+        /*
+         * «Установить» открывает файл: Tampermonkey показывает свою страницу
+         * установки. Баннер снимаем, но версию в «отложенные» НЕ пишем —
+         * вместо этого ставим паузу на несколько минут.
+         *
+         * Почему так: раньше здесь запоминалась версия, и если установка не
+         * проходила (оператор не дошёл до Tampermonkey, закрыл вкладку, ставил
+         * из-под VPN), баннер пропадал навсегда, а человек продолжал работать
+         * на старом коде. Теперь по истечении паузы проверка снова покажет
+         * окно, если версия в браузере всё ещё старая.
+         */
         const ok = document.createElement('button');
         ok.type = 'button';
-        ok.className = 'tp-upd-ok';
-        ok.textContent = 'Обновить';
+        ok.textContent = 'Установить';
+        ok.title = 'Открыть файл скрипта — Tampermonkey предложит установку';
         ok.addEventListener('click', () => {
             updateStoreSet(UPDATE_SNOOZE_KEY, String(Date.now() + UPDATE_SNOOZE_MS));
             // Ставим отметку: когда оператор вернётся на эту вкладку после
@@ -16771,7 +16813,7 @@
             applyUpdate();
         });
 
-        actions.append(later, ok);
+        actions.append(later, ok, reload);
         box.append(icon, text, actions);
         (document.body || document.documentElement).appendChild(box);
     }
