@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.69
+// @version      0.72.70
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.69';
+    const SELF_VERSION = '0.72.70';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -996,6 +996,16 @@
      */
     const OLT_CACHE = { data: null, until: 0 };
 
+    /**
+     * Кулдаун перезагрузки ONU, мс.
+     *
+     * Значение серверное: после успешной перезагрузки GetOLT отвечает
+     * «Повторная перезагрузка возможна через 5 минут». Держим ту же цифру,
+     * чтобы отсчёт на нашей кнопке совпадал с плагином, и читаем тот же
+     * ключ localStorage ('getolt_reboot_' + bg-reboot-key) — кулдаун общий.
+     */
+    const GETOLT_REBOOT_COOLDOWN_MS = 5 * 60 * 1000;
+
     const ERP = {
         /**
          * Поддерживаем два способа открытия договора в ERP:
@@ -1400,6 +1410,104 @@
             OLT_CACHE.data = map;
             OLT_CACHE.until = now + 5 * 60 * 1000;
             return map;
+        },
+
+        /* --------------------------------------------- GetOLT: действия с ONU */
+
+        /**
+         * Разбор ответа GetOLT на действия с ONU.
+         *
+         * Плагин отдаёт двойную обёртку:
+         *   {status:"ok", message:"", data:{data:{success:true, message:"…"}}}
+         * причём `success` бывает true и при ошибке в `message` — сервер
+         * одинаково отвечает 200 на любой исход. Поэтому смотрим и на флаг,
+         * и на текст: «Подождите … мин. … сек.» — это отказ по кулдауну,
+         * и показывать его как успех нельзя.
+         */
+        parseGetoltActionResult(text) {
+            const raw = String(text == null ? '' : text).trim();
+            let json = null;
+            try { json = JSON.parse(raw); } catch (e) { /* не JSON — разберём текстом */ }
+
+            if (json && typeof json === 'object') {
+                const outer = json.data || {};
+                const inner = outer.data || outer.result || {};
+                const message = String(inner.message || json.message || '').trim();
+                const ok = inner.success === true || (inner.success === undefined && json.status === 'ok');
+                // Кулдаун приходит как «success:true» с текстом «Подождите…»
+                const wait = /Подождите/i.test(message);
+                return { ok: ok && !wait, message, cooldown: wait };
+            }
+
+            const plain = raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            return { ok: false, message: plain.slice(0, 200) || 'пустой ответ GetOLT', cooldown: false };
+        },
+
+        /**
+         * Перезагрузка ONU с порта OLT.
+         *
+         * Эндпоинт и набор параметров сняты с плагина GetOLT
+         * (pl.getolt.js, startOnuReboot): oltId + port + onuId, плюс
+         * необязательные processId и mac. Порядок аргументов у сервера
+         * не важен, но лишние параметры он молча игнорирует, поэтому
+         * передаём только то, что реально есть.
+         *
+         * Ответ — см. parseGetoltActionResult. Кулдаун 5 минут держит
+         * сервер, а плагин дублирует его в localStorage; здесь мы просто
+         * отдаём наружу текст, чтобы кнопка показала реальную причину.
+         */
+        async rebootOnu(o) {
+            const src = o || {};
+            const oltId = String(src.oltId || '').trim();
+            const port = String(src.port || '').trim();
+            const onuId = String(src.onuId || '').trim();
+            if (!oltId || !port || !onuId) {
+                return { ok: false, message: 'нет данных порта — перезагрузка невозможна', cooldown: false };
+            }
+
+            let url = '/user/plugin/getolt/getolt.do?method=rebootOnu'
+                + '&oltId=' + encodeURIComponent(oltId)
+                + '&port=' + encodeURIComponent(port)
+                + '&onuId=' + encodeURIComponent(onuId);
+            if (src.processId) url += '&processId=' + encodeURIComponent(src.processId);
+            const mac = String(src.macAttr || '').trim();
+            if (mac) url += '&mac=' + encodeURIComponent(mac);
+
+            try {
+                const text = await postForm(url, {});
+                return this.parseGetoltActionResult(text);
+            } catch (e) {
+                return { ok: false, message: e.message || String(e), cooldown: false };
+            }
+        },
+
+        /**
+         * Обновление порта OLT: заставить плагин переопросить порт и
+         * подтянуть свежие уровни сигнала со всех ONU на нём.
+         *
+         * Параметры — oltIp + portNumber (не oltId и не port: у плагина
+         * в startPortRefresh именно такие имена, и на чужие он отвечает
+         * «success:false» с пустым сообщением). Есть необязательный processId.
+         */
+        async refreshPort(o) {
+            const src = o || {};
+            const oltIp = String(src.oltIp || '').trim();
+            const port = String(src.port || '').trim();
+            if (!oltIp || !port) {
+                return { ok: false, message: 'нет IP OLT или номера порта', cooldown: false };
+            }
+
+            let url = '/user/plugin/getolt/getolt.do?method=refreshPort'
+                + '&oltIp=' + encodeURIComponent(oltIp)
+                + '&portNumber=' + encodeURIComponent(port);
+            if (src.processId) url += '&processId=' + encodeURIComponent(src.processId);
+
+            try {
+                const text = await postForm(url, {});
+                return this.parseGetoltActionResult(text);
+            } catch (e) {
+                return { ok: false, message: e.message || String(e), cooldown: false };
+            }
         },
 
         /* ------------------------------------------- почта: процесс и сообщение */
@@ -4565,6 +4673,32 @@
         }
         .tp-eq-group:first-child { padding-top: 0; }
         .tp-eq-chips { margin: 7px 0 0; gap: 5px; }
+        /* Действия с ONU — те же, что в GetOLT, но внутри карточки оборудования.
+           Кнопки маленькие и намеренно не .tp-btn: это не главное действие
+           экрана, а служебное, рядом с телеметрией. */
+        .tp-onu-actions {
+            display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        .tp-onu-btn {
+            font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer;
+            padding: 4px 10px; border-radius: 8px;
+            color: var(--tp-fg); background: var(--tp-fill-1);
+            border: 1px solid var(--tp-border);
+            transition: background .12s, color .12s, border-color .12s;
+        }
+        .tp-onu-btn:hover:not([disabled]) { background: var(--tp-fill-2); border-color: var(--tp-blue); color: var(--tp-blue); }
+        .tp-onu-btn:active:not([disabled]) { transform: scale(.985); }
+        .tp-onu-btn[disabled] { opacity: .6; cursor: default; }
+        /* Перезагрузка — действие с последствиями: абонент на минуту без связи.
+           Поэтому не синяя, а предупреждающая. */
+        .tp-onu-btn.is-warn:hover:not([disabled]) { border-color: var(--tp-warn); color: var(--tp-warn); }
+        .tp-onu-btn.is-busy { opacity: .7; cursor: progress; }
+        .tp-onu-btn.is-done { color: var(--tp-ok); border-color: var(--tp-ok); }
+        .tp-onu-btn.is-fail { color: var(--tp-bad); border-color: var(--tp-bad); }
+        .tp-onu-msg { font-size: 11.5px; color: var(--tp-fg3); }
+        .tp-onu-msg.is-ok { color: var(--tp-ok); }
+        .tp-onu-msg.is-bad { color: var(--tp-bad); }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
         .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
         .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
@@ -5376,25 +5510,53 @@
                 .map((el) => String(el.textContent || '').trim())
                 .filter(Boolean);
 
+            /*
+             * Атрибуты bg-* — то, на чём держатся кнопки самого GetOLT:
+             * bg-olt-id, bg-port, bg-onu-id, bg-mac, bg-olt-ip, bg-process-id,
+             * bg-reboot-key, bg-refresh-key. Плагин ставит их на кнопки
+             * «Перезагрузить ONU» и «Обновить порт», и именно из них он берёт
+             * параметры запроса. Читаем их с карточки целиком: разметку кнопок
+             * можно менять, атрибуты — это контракт с сервером.
+             *
+             * Раньше отсюда брался только bg-olt-id (для типа PON), а порт и
+             * ONU ID разбирались из подписи «Порт / ONU ID». Для показа этого
+             * хватало, но для запроса на перезагрузку — нет: серверу нужны
+             * ровно те значения, что лежат в атрибутах, а подпись может быть
+             * отформатирована иначе.
+             */
+            const attr = (name) => {
+                const el = card.querySelector('[' + name + ']');
+                return el ? String(el.getAttribute(name) || '').trim() : '';
+            };
+
             // «Порт / ONU ID» приходит одной строкой «11 / 91»
             const portRaw = map[normLabel('Порт / ONU ID')] || map[normLabel('Порт')] || '';
             const portParts = portRaw.split('/').map((s) => s.trim()).filter(Boolean);
+
+            const oltIdAttr = attr('bg-olt-id');
+            const portAttr = attr('bg-port');
+            const onuIdAttr = attr('bg-onu-id');
 
             return {
                 mac: String(mac).trim(),
                 // ID OLT из кнопки «Перезагрузить ONU»: по нему находим тип PON
                 // в списке OLT. В самой карточке типа нет, а угадывать его
                 // по формату MAC нельзя — вендор отдаёт и полный шестибайтовый.
-                oltId: (() => {
-                    const btn = card.querySelector('[bg-olt-id]');
-                    return btn ? String(btn.getAttribute('bg-olt-id') || '') : '';
-                })(),
+                oltId: oltIdAttr,
                 status: statusText,
                 online: /getolt-online/i.test(statusCls) || /^(online|up)$/i.test(statusText),
                 updated: updatedTitle || (upd ? String(upd.textContent || '').trim() : ''),
-                oltIp: map[normLabel('OLT IP')] || '',
-                port: portParts[0] || '',
-                onuId: portParts[1] || '',
+                oltIp: map[normLabel('OLT IP')] || attr('bg-olt-ip'),
+                // Порт и ONU ID — из атрибутов, подпись только как запасной путь
+                port: portAttr || portParts[0] || '',
+                onuId: onuIdAttr || portParts[1] || '',
+                // Ключи кулдауна плагина: по ним GetOLT помнит, что ONU уже
+                // перезагружали. Тот же ключ — чтобы кулдаун был общим для
+                // вкладки GetOLT и нашей панели, а не двумя независимыми.
+                rebootKey: attr('bg-reboot-key'),
+                refreshKey: attr('bg-refresh-key'),
+                processId: attr('bg-process-id'),
+                macAttr: attr('bg-mac'),
                 rx: pickNum(map[normLabel('Сигнал RX')]),
                 tx: pickNum(map[normLabel('Сигнал TX')]),
                 distance: map[normLabel('Дистанция')] || '',
@@ -5572,6 +5734,300 @@
         return parts[2] + '.' + parts[3];
     }
 
+    /**
+     * Кнопки действий с ONU — те же, что в GetOLT: «Обновить порт» и
+     * «Перезагрузить ONU».
+     *
+     * Разметка повторяет поведение плагина, но с двумя отличиями:
+     *
+     *  1) Параметры запроса кладём в data-атрибуты кнопки, а не читаем из
+     *     соседних элементов: после автообновления блок перерисовывается,
+     *     и всё, что лежало рядом, может исчезнуть. У самой кнопки данные
+     *     всегда под рукой.
+     *
+     *  2) Кулдаун перезагрузки — общий с плагином. GetOLT пишет отметку
+     *     в localStorage под ключом 'getolt_reboot_' + bg-reboot-key, и
+     *     мы читаем/пишем тот же ключ: перезагрузил в GetOLT — здесь
+     *     кнопка тоже в ожидании, и наоборот. Иначе оператор мог бы
+     *     нажать второй раз и получить отказ сервера.
+     *
+     * Кнопки рисуем только когда есть чем действовать: без oltId/port/onuId
+     * перезагрузка невозможна, без oltIp — обновление порта.
+     */
+    function onuActions(o) {
+        const src = o || {};
+        const canReboot = !!(src.oltId && src.port && src.onuId);
+        const canRefresh = !!(src.oltIp && src.port);
+        if (!canReboot && !canRefresh) return '';
+
+        const rebootAttr = [
+            `data-olt-id="${esc(src.oltId || '')}"`,
+            `data-port="${esc(src.port || '')}"`,
+            `data-onu-id="${esc(src.onuId || '')}"`,
+            `data-process-id="${esc(src.processId || '')}"`,
+            `data-mac="${esc(src.macAttr || '')}"`,
+            `data-reboot-key="${esc(src.rebootKey || '')}"`,
+        ].join(' ');
+
+        const refreshAttr = [
+            `data-olt-ip="${esc(src.oltIp || '')}"`,
+            `data-port="${esc(src.port || '')}"`,
+            `data-process-id="${esc(src.processId || '')}"`,
+        ].join(' ');
+
+        const cooldownLeft = rebootCooldownLeft(src.rebootKey);
+
+        return `<div class="tp-onu-actions">
+            ${canRefresh ? `<button type="button" class="tp-onu-btn" data-onu-act="refresh" ${refreshAttr}>Обновить порт</button>` : ''}
+            ${canReboot ? `<button type="button" class="tp-onu-btn is-warn" data-onu-act="reboot" ${rebootAttr}${cooldownLeft > 0 ? ' disabled' : ''}>`
+                + `${cooldownLeft > 0 ? `Ожидание ${cooldownText(cooldownLeft)}` : 'Перезагрузить ONU'}</button>` : ''}
+            <span class="tp-onu-msg"></span>
+        </div>`;
+    }
+
+    /** Сколько миллисекунд осталось до конца кулдауна перезагрузки. */
+    function rebootCooldownLeft(key) {
+        if (!key) return 0;
+        try {
+            const raw = window.localStorage.getItem('getolt_reboot_' + key);
+            if (!raw) return 0;
+            const last = parseInt(raw, 10);
+            if (!Number.isFinite(last)) return 0;
+            const left = GETOLT_REBOOT_COOLDOWN_MS - (Date.now() - last);
+            if (left <= 0) {
+                window.localStorage.removeItem('getolt_reboot_' + key);
+                return 0;
+            }
+            return left;
+        } catch (e) { return 0; }
+    }
+
+    /** «4:58» — как в плагине: минуты и секунды через двоеточие. */
+    function cooldownText(ms) {
+        const total = Math.max(0, Math.ceil(ms / 1000));
+        const mins = Math.floor(total / 60);
+        const secs = total % 60;
+        return mins + ':' + (secs < 10 ? '0' : '') + secs;
+    }
+
+    /** Пометка в localStorage, что ONU только что перезагружена. */
+    function markRebooted(key) {
+        if (!key) return;
+        try { window.localStorage.setItem('getolt_reboot_' + key, String(Date.now())); } catch (e) { /* приватный режим */ }
+    }
+
+    /**
+     * Обработчики кнопок действий с ONU.
+     *
+     * Одна делегированная функция на блок: после автообновления разметка
+     * перерисовывается, и вешать обработчик на каждую кнопку заново — это
+     * и лишние слушатели, и риск потерять их при частичной перерисовке.
+     *
+     * Кулдаун перезагрузки тикает через setInterval на самой кнопке, а не
+     * на панели: у двух ONU на договоре свои таймеры, и общий счётчик
+     * заставлял бы их перебивать друг друга. Таймер снимается вместе
+     * с кнопкой — проверяем document.contains.
+     */
+    function bindOnuActions(panel) {
+        if (!panel) return;
+        const root = panel.querySelector('.tp-lazy[data-lazy="equipment"]');
+        if (!root) return;
+
+        // Клик по любой из кнопок — обработчик один. Делегирование на обёртку,
+        // а не на .tp-lazy-body: тело перерисовывается при обновлении порта,
+        // и слушатель на нём пришлось бы вешать заново.
+        if (root.dataset.onuBound !== '1') {
+            root.dataset.onuBound = '1';
+            root.addEventListener('click', (ev) => {
+                const btn = ev.target && ev.target.closest
+                    ? ev.target.closest('.tp-onu-btn')
+                    : null;
+                if (!btn || btn.disabled) return;
+                ev.preventDefault();
+                ev.stopPropagation();
+
+                const act = btn.dataset.onuAct;
+                if (act === 'reboot') doOnuReboot(btn);
+                else if (act === 'refresh') doPortRefresh(btn);
+            });
+        }
+
+        // Состояние кулдауна восстанавливаем сразу после каждой отрисовки:
+        // оператор мог перезагрузить ONU в GetOLT минуту назад, и кнопка
+        // должна это показать, а не ждать, пока он нажмёт и получит отказ.
+        // Идём всегда, а не только при первом монтаже: после перерисовки
+        // кнопки новые, и старый отсчёт на них не висит.
+        root.querySelectorAll('.tp-onu-btn[data-reboot-key]').forEach((btn) => {
+            if (btn._tpCoolTimer) return; // уже тикает на этой кнопке
+            const left = rebootCooldownLeft(btn.dataset.rebootKey);
+            if (left > 0) startCooldown(btn, left);
+        });
+    }
+
+    /** Тикающий кулдаун на кнопке перезагрузки. */
+    function startCooldown(btn, msLeft) {
+        if (!btn) return;
+        if (btn._tpCoolTimer) clearInterval(btn._tpCoolTimer);
+
+        let left = msLeft;
+        btn.disabled = true;
+        btn.textContent = 'Ожидание ' + cooldownText(left);
+        btn.title = 'Повторная перезагрузка возможна через ' + cooldownText(left);
+
+        btn._tpCoolTimer = setInterval(() => {
+            if (!document.contains(btn)) {
+                clearInterval(btn._tpCoolTimer);
+                btn._tpCoolTimer = null;
+                return;
+            }
+            left -= 1000;
+            if (left <= 0) {
+                clearInterval(btn._tpCoolTimer);
+                btn._tpCoolTimer = null;
+                btn.disabled = false;
+                btn.textContent = 'Перезагрузить ONU';
+                btn.title = '';
+                const key = btn.dataset.rebootKey;
+                if (key) {
+                    try { window.localStorage.removeItem('getolt_reboot_' + key); } catch (e) { /* приватный режим */ }
+                }
+                return;
+            }
+            btn.textContent = 'Ожидание ' + cooldownText(left);
+            btn.title = 'Повторная перезагрузка возможна через ' + cooldownText(left);
+        }, 1000);
+    }
+
+    /** Сообщение рядом с кнопками: у каждой ONU своё. */
+    function onuSay(btn, text, cls) {
+        const box = btn && btn.closest ? btn.closest('.tp-onu-actions') : null;
+        const msg = box ? box.querySelector('.tp-onu-msg') : null;
+        if (!msg) return;
+        msg.className = 'tp-onu-msg' + (cls ? ' ' + cls : '');
+        msg.textContent = text || '';
+    }
+
+    /** Перезагрузка ONU по кнопке. */
+    async function doOnuReboot(btn) {
+        const port = btn.dataset.port || '';
+        const onuId = btn.dataset.onuId || '';
+        if (!window.confirm(`Перезагрузить ONU ${port}:${onuId}?\n\nАбонент потеряет связь на 1–2 минуты.`)) return;
+
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.classList.add('is-busy');
+        btn.textContent = 'Перезагрузка…';
+        onuSay(btn, '');
+
+        let res;
+        try {
+            res = await ERP.rebootOnu({
+                oltId: btn.dataset.oltId,
+                port,
+                onuId,
+                processId: btn.dataset.processId,
+                macAttr: btn.dataset.mac,
+            });
+        } catch (e) {
+            res = { ok: false, message: e.message || String(e), cooldown: false };
+        }
+
+        btn.classList.remove('is-busy');
+
+        if (res.ok) {
+            btn.classList.add('is-done');
+            btn.textContent = 'Перезагружена!';
+            onuSay(btn, res.message || 'ONU перезагружена.', 'is-ok');
+            // Отметку ставим в тот же ключ, что и плагин: кулдаун общий
+            markRebooted(btn.dataset.rebootKey);
+            setTimeout(() => {
+                if (!document.contains(btn)) return;
+                btn.classList.remove('is-done');
+                startCooldown(btn, GETOLT_REBOOT_COOLDOWN_MS);
+            }, 2000);
+            return;
+        }
+
+        // Отказ по кулдауну: сервер говорит, сколько ждать. Ставим отсчёт
+        // на остаток, а не на полные пять минут.
+        if (res.cooldown) {
+            const m = String(res.message || '').match(/(\d+)\s*мин\.?\s*(\d+)\s*сек/i);
+            const rest = m ? (Number(m[1]) * 60 + Number(m[2])) * 1000 : GETOLT_REBOOT_COOLDOWN_MS;
+            onuSay(btn, res.message, 'is-bad');
+            markRebooted(btn.dataset.rebootKey);
+            startCooldown(btn, rest);
+            return;
+        }
+
+        btn.classList.add('is-fail');
+        btn.textContent = orig;
+        btn.disabled = false;
+        onuSay(btn, res.message || 'не удалось перезагрузить', 'is-bad');
+        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 4000);
+    }
+
+    /** Обновление порта OLT по кнопке. */
+    async function doPortRefresh(btn) {
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.classList.add('is-busy');
+        btn.textContent = 'Обновление…';
+        onuSay(btn, '');
+
+        let res;
+        try {
+            res = await ERP.refreshPort({
+                oltIp: btn.dataset.oltIp,
+                port: btn.dataset.port,
+                processId: btn.dataset.processId,
+            });
+        } catch (e) {
+            res = { ok: false, message: e.message || String(e) };
+        }
+
+        btn.classList.remove('is-busy');
+
+        if (res.ok) {
+            btn.classList.add('is-done');
+            btn.textContent = 'Обновлено!';
+            onuSay(btn, 'Порт опрошен. Уровни сигнала обновятся в GetOLT.', 'is-ok');
+            // Данные в блоке устарели — через пару секунд перечитаем GetOLT
+            setTimeout(() => {
+                if (!document.contains(btn)) return;
+                btn.classList.remove('is-done');
+                btn.textContent = orig;
+                btn.disabled = false;
+                const panel = btn.closest('[id^="contract-tp-info-"]');
+                const cid = panel && panel.dataset.contractId;
+                if (panel && cid) {
+                    // Сбрасываем кэш GetOLT: без этого getolt.do с TTL 90 с
+                    // вернул бы тот же старый снимок, и «Обновлено» показало бы
+                    // прежние уровни сигнала — то есть кнопка выглядела бы
+                    // нерабочей.
+                    netDrop(/getolt\.do/i);
+                    ERP.getolt(cid).then((olt) => {
+                        const eq = panel.querySelector('.tp-lazy[data-lazy="equipment"] .tp-lazy-body');
+                        if (!eq || !olt || !olt.ok) return;
+                        // Перерисовываем только список ONU, объекты не трогаем
+                        ERP.equipment(cid).then((objs) => {
+                            if (!document.contains(eq)) return;
+                            setHtmlIfChanged(eq, renderEquipment(olt.onu, objs, panel._tpOltMap || null));
+                            bindCopyTargets(eq);
+                            bindOnuActions(panel);
+                        }).catch(() => {});
+                    }).catch(() => {});
+                }
+            }, 2000);
+            return;
+        }
+
+        btn.classList.add('is-fail');
+        btn.textContent = orig;
+        btn.disabled = false;
+        onuSay(btn, res.message || 'не удалось обновить порт', 'is-bad');
+        setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 4000);
+    }
+
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
     function renderEquipment(onuList, objects, oltMap) {
         const onu = onuList || [];
@@ -5640,6 +6096,7 @@
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
                         ${chips ? `<div class="tp-chips tp-eq-chips">${chips}</div>` : ''}
                         ${o.updated ? `<div class="tp-device-meta tp-eq-upd">Обновлено: ${esc(o.updated)}</div>` : ''}
+                        ${onuActions(o)}
                     </div>
                 </div>`;
             });
@@ -9785,6 +10242,9 @@
             ERP.oltList().catch(() => ({})),
         ]), ([objects, olt, oltMap]) => {
             const onu = (olt && olt.onu) || [];
+            // Справочник OLT запоминаем на панели: он нужен и при перерисовке
+            // блока после «Обновить порт» — иначе тип PON там потеряется.
+            if (oltMap && Object.keys(oltMap).length) panel._tpOltMap = oltMap;
             if (!onu.length && !(objects && objects.length)) {
                 // Плагин мог быть недоступен по правам — честно говорим об этом,
                 // а не «оборудование не привязано», что вводило бы в заблуждение
@@ -9804,6 +10264,9 @@
             fillLazy(panel, 'equipment', html);
             // Адрес OLT в блоке кликабелен — вешаем копирование после вставки
             bindCopyTargets(panel);
+            // Кнопки «Обновить порт» / «Перезагрузить ONU» — после вставки:
+            // до неё узлов в DOM ещё нет.
+            bindOnuActions(panel);
         });
 
         // Radius Logs > mode=errors, все окна за 24 ч по номеру договора.
