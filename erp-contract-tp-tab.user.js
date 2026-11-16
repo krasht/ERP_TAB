@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.72
+// @version      0.72.73
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.72';
+    const SELF_VERSION = '0.72.73';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1341,9 +1341,13 @@
          * поля регулярками по тексту. Возвращаем нормализованный набор полей,
          * а renderer решает, что показывать.
          */
-        async getolt(cid) {
+        async getolt(cid, opts) {
             const id = cid || this.contractId();
             if (!id) return { ok: false, onu: [], reason: 'no-contract' };
+            // noCache — для живого опроса во время обновления порта и
+            // перезагрузки ONU: TTL 90 с вернул бы тот же снимок, и прогресс
+            // выглядел бы замершим.
+            const noCache = !!(opts && opts.noCache);
 
             // Ссылка вкладки — самый надёжный источник: ERP сама кладёт туда
             // contractNumber, без которого плагин не найдёт договор.
@@ -1368,7 +1372,7 @@
 
             let html = '';
             try {
-                html = await fetchText(href);
+                html = await fetchText(href, { noCache });
             } catch (e) {
                 return { ok: false, onu: [], reason: 'fetch-failed', href };
             }
@@ -1496,8 +1500,13 @@
             if (mac) url += '&mac=' + encodeURIComponent(mac);
 
             try {
+                const t0 = Date.now();
                 const text = await postForm(url, {});
-                return this.parseGetoltActionResult(text);
+                const r = this.parseGetoltActionResult(text);
+                // Сколько сервер думал — оператору это интересно, и по нему
+                // видно, что запрос реально дошёл, а не отвалился мгновенно.
+                r.ms = Date.now() - t0;
+                return r;
             } catch (e) {
                 return { ok: false, message: e.message || String(e), cooldown: false, busy: false };
             }
@@ -1525,8 +1534,11 @@
             if (src.processId) url += '&processId=' + encodeURIComponent(src.processId);
 
             try {
+                const t0 = Date.now();
                 const text = await postForm(url, {});
-                return this.parseGetoltActionResult(text);
+                const r = this.parseGetoltActionResult(text);
+                r.ms = Date.now() - t0;
+                return r;
             } catch (e) {
                 return { ok: false, message: e.message || String(e), cooldown: false, busy: false };
             }
@@ -4723,6 +4735,11 @@
         .tp-onu-msg.is-bad { color: var(--tp-bad); }
         /* «Порт уже опрашивается» — не ошибка и не успех: это ожидание. */
         .tp-onu-msg.is-warn { color: var(--tp-warn); }
+        /* Возраст данных порта по GetOLT — тихо, рядом с кнопкой. */
+        .tp-onu-age {
+            font-size: 10.5px; color: var(--tp-fg3);
+            font-variant-numeric: tabular-nums;
+        }
         /* Уровни сигнала: зелёный — норма, оранжевый — на грани, красный — плохо */
         .tp-chip.is-good { background: var(--tp-ok-bg);   color: var(--tp-ok); }
         .tp-chip.is-warn { background: var(--tp-warn-bg); color: var(--tp-warn); }
@@ -5759,6 +5776,52 @@
     }
 
     /**
+     * Живой опрос GetOLT, пока идёт операция с ONU.
+     *
+     * Источник правды — сам плагин: он отдаёт на карточке ONU таймстемп
+     * «Обновлено: …» (title — точное время) и состояние кнопок. Пока опрос
+     * порта или перезагрузка ONU идёт, сервер не отвечает, но страница
+     * GetOLT уже содержит актуальное состояние — его и читаем.
+     *
+     * Зачем опрос, а не localStorage: оператор хочет видеть ПРОЦЕСС, а не
+     * отметку «нажал». Таймстемп меняется только когда OLT реально ответил,
+     * то есть он и есть индикатор завершения. Отметка в localStorage говорит
+     * лишь о том, что запрос ушёл, — это не то же самое.
+     *
+     * Возвращает stop(): вызывает onTick сразу и затем каждые intervalMs,
+     * пока не остановят или пока не выйдет maxMs. Ошибки сети глотаются:
+     * один неудачный опрос не должен ломать индикатор.
+     */
+    function watchGetolt(cid, onTick, opts) {
+        const o = opts || {};
+        const intervalMs = o.intervalMs || 3000;
+        const maxMs = o.maxMs || 120000;
+        const startedAt = Date.now();
+        let stopped = false;
+        let timer = null;
+
+        const tick = async () => {
+            if (stopped) return;
+            if (Date.now() - startedAt > maxMs) { stop(); return; }
+            try {
+                // noCache обязателен: иначе TTL вернёт тот же снимок и
+                // таймстемп «не изменится» — прогресс замрёт на глазах.
+                const olt = await ERP.getolt(cid, { noCache: true });
+                if (!stopped && olt && olt.ok) onTick(olt);
+            } catch (e) { /* сеть моргнула — следующий тик попробует снова */ }
+            if (!stopped) timer = setTimeout(tick, intervalMs);
+        };
+
+        const stop = () => {
+            stopped = true;
+            if (timer) { clearTimeout(timer); timer = null; }
+        };
+
+        tick();
+        return stop;
+    }
+
+    /**
      * Кнопки действий с ONU — те же, что в GetOLT: «Обновить порт» и
      * «Перезагрузить ONU».
      *
@@ -5773,7 +5836,9 @@
      *     в localStorage под ключом 'getolt_reboot_' + bg-reboot-key, и
      *     мы читаем/пишем тот же ключ: перезагрузил в GetOLT — здесь
      *     кнопка тоже в ожидании, и наоборот. Иначе оператор мог бы
-     *     нажать второй раз и получить отказ сервера.
+     *     нажать второй раз и получить отказ сервера. Это единственное,
+     *     что берём из localStorage: сам кулдаун — состояние сервера,
+     *     плагин хранит его там же, и второго источника у нас нет.
      *
      * Кнопки рисуем только когда есть чем действовать: без oltId/port/onuId
      * перезагрузка невозможна, без oltIp — обновление порта.
@@ -5886,6 +5951,11 @@
             const left = rebootCooldownLeft(btn.dataset.rebootKey);
             if (left > 0) startCooldown(btn, left);
         });
+
+        // Возраст данных из GetOLT — рядом с кнопкой «Обновить порт».
+        // Это и есть ответ на «когда порт реально опрашивался»: время берём
+        // из самого плагина, а не из своих отметок.
+        mountLastRefreshNote(panel);
     }
 
     /** Тикающий кулдаун на кнопке перезагрузки. */
@@ -5935,13 +6005,44 @@
     async function doOnuReboot(btn) {
         const port = btn.dataset.port || '';
         const onuId = btn.dataset.onuId || '';
+        const key = btn.dataset.rebootKey || '';
         if (!window.confirm(`Перезагрузить ONU ${port}:${onuId}?\n\nАбонент потеряет связь на 1–2 минуты.`)) return;
 
+        const panel = btn.closest('[id^="contract-tp-info-"]');
+        const cid = panel && panel.dataset.contractId;
         const orig = btn.textContent;
+
         btn.disabled = true;
         btn.classList.add('is-busy');
         btn.textContent = 'Перезагрузка…';
-        onuSay(btn, '');
+        onuSay(btn, 'Отправлено на OLT, ждём ответа…');
+
+        /*
+         * Живой индикатор, пока сервер думает.
+         *
+         * Источник правды — сам GetOLT: у ONU там есть «Обновлено: <точное
+         * время>» и статус online/offline. Пока идёт перезагрузка, OLT
+         * успевает уронить терминал в offline и поднять обратно — это видно
+         * именно на странице плагина, а не в ответе rebootOnu (тот приходит
+         * одним куском в конце).
+         *
+         * Счётчик секунд здесь — не «сколько нажатий прошло», а сколько
+         * реально ждём OLT. Оператору нужно видеть, что процесс живой.
+         */
+        let elapsed = 0;
+        let sawOffline = false;
+        const stopWatch = watchGetolt(cid, (olt) => {
+            const fresh = (olt.onu || []).find((o) => String(o.port) === port
+                && String(o.onuId) === onuId);
+            if (!fresh) return;
+            elapsed += 3;
+            if (!fresh.online) sawOffline = true;
+            if (!document.contains(btn)) return;
+            btn.textContent = `Перезагрузка… ${elapsed} с`;
+            onuSay(btn, sawOffline
+                ? `ONU ушла в offline, ждём возврата (${elapsed} с)…`
+                : `OLT ещё показывает прежнее состояние (${elapsed} с)…`);
+        }, { intervalMs: 3000, maxMs: 90000 });
 
         let res;
         try {
@@ -5955,15 +6056,20 @@
         } catch (e) {
             res = { ok: false, message: e.message || String(e), cooldown: false };
         }
+        stopWatch();
 
         btn.classList.remove('is-busy');
 
         if (res.ok) {
+            const spent = Math.max(1, Math.round(Number(res.ms || 0) / 1000));
             btn.classList.add('is-done');
             btn.textContent = 'Перезагружена!';
-            onuSay(btn, res.message || 'ONU перезагружена.', 'is-ok');
+            onuSay(btn, (res.message || 'ONU перезагружена.')
+                + (spent ? ` (${spent} с)` : ''), 'is-ok');
             // Отметку ставим в тот же ключ, что и плагин: кулдаун общий
-            markRebooted(btn.dataset.rebootKey);
+            markRebooted(key);
+            // GetOLT уже знает новое состояние — перечитываем блок
+            refreshEquipmentNow(panel, cid);
             setTimeout(() => {
                 if (!document.contains(btn)) return;
                 btn.classList.remove('is-done');
@@ -5978,7 +6084,7 @@
             const m = String(res.message || '').match(/(\d+)\s*мин\.?\s*(\d+)\s*сек/i);
             const rest = m ? (Number(m[1]) * 60 + Number(m[2])) * 1000 : GETOLT_REBOOT_COOLDOWN_MS;
             onuSay(btn, res.message, 'is-bad');
-            markRebooted(btn.dataset.rebootKey);
+            markRebooted(key);
             startCooldown(btn, rest);
             return;
         }
@@ -5990,6 +6096,92 @@
         setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 4000);
     }
 
+    /**
+     * Перечитать блок «Оборудование» из GetOLT без перезагрузки страницы.
+     *
+     * Общая функция для обеих кнопок: после операции данные в блоке
+     * устарели, и тянуть их надо в обход кэша.
+     */
+    function refreshEquipmentNow(panel, cid) {
+        if (!panel || !cid) return;
+        netDrop(/getolt\.do/i);
+        ERP.getolt(cid, { noCache: true }).then((olt) => {
+            const eq = panel.querySelector('.tp-lazy[data-lazy="equipment"] .tp-lazy-body');
+            if (!eq || !olt || !olt.ok) return;
+            ERP.equipment(cid).then((objs) => {
+                if (!document.contains(eq)) return;
+                setHtmlIfChanged(eq, renderEquipment(olt.onu, objs, panel._tpOltMap || null));
+                bindCopyTargets(eq);
+                bindOnuActions(panel);
+            }).catch(() => {});
+        }).catch(() => {});
+    }
+
+    /**
+     * Восстановление состояния операции после перезагрузки страницы.
+     *
+     * Оператор нажал «Обновить порт», ушёл пить чай, вернулся и нажал F5 —
+     * и блок должен показать, что опрос всё ещё идёт, а не притвориться,
+     * что ничего не было.
+     *
+     * Источник — сам GetOLT, а не localStorage: у ONU есть «Обновлено:
+     * <точное время>». Если оно свежее (меньше минуты), значит плагин
+     * только что перечитал порт, и операция действительно завершилась.
+     * Если старое — операция либо ещё идёт, либо её и не было; различить
+     * это без серверного флага нельзя, поэтому показываем возраст данных
+     * и не выдумываем «идёт опрос».
+     *
+     * Так честнее: показываем то, что реально знает сервер.
+     */
+    function mountLastRefreshNote(panel) {
+        const root = panel && panel.querySelector('.tp-lazy[data-lazy="equipment"]');
+        if (!root) return;
+        const eq = root.querySelector('.tp-lazy-body');
+        if (!eq) return;
+        eq.querySelectorAll('.tp-onu-age').forEach((el) => el.remove());
+
+        eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]').forEach((btn) => {
+            const port = btn.dataset.port;
+            const box = btn.closest('.tp-onu-actions');
+            if (!box) return;
+            const onu = btn.closest('.tp-device');
+            const upd = onu && onu.querySelector('.tp-eq-upd');
+            if (!upd) return;
+            // Точное время лежит в тексте «Обновлено: 16.11.2026 15:49:10»
+            const m = String(upd.textContent || '').match(/(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2})/);
+            if (!m) return;
+            const when = parseRuDateTime(m[1]);
+            if (!when) return;
+            const ageMs = Date.now() - when;
+            if (ageMs < 0 || ageMs > 24 * 3600 * 1000) return;
+            const note = document.createElement('span');
+            note.className = 'tp-onu-age';
+            note.textContent = `порт ${port}: данные ${ageText(ageMs)}`;
+            note.title = 'Время последнего опроса порта по данным GetOLT';
+            box.appendChild(note);
+        });
+    }
+
+    /** «16.11.2026 15:49:10» → Date (локальное время сервера). */
+    function parseRuDateTime(s) {
+        const m = String(s || '').match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
+        if (!m) return null;
+        const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]),
+            Number(m[4]), Number(m[5]), Number(m[6]));
+        return Number.isFinite(d.getTime()) ? d : null;
+    }
+
+    /** «12 сек. назад» / «3 мин. назад» / «2 ч. назад». */
+    function ageText(ms) {
+        const sec = Math.floor(ms / 1000);
+        if (sec < 60) return `${sec} сек. назад`;
+        const min = Math.floor(sec / 60);
+        if (min < 60) return `${min} мин. назад`;
+        const hr = Math.floor(min / 60);
+        if (hr < 24) return `${hr} ч. назад`;
+        return `${Math.floor(hr / 24)} дн. назад`;
+    }
+
     /** Обновление порта OLT по кнопке. */
     async function doPortRefresh(btn) {
         const orig = btn.textContent;
@@ -5997,10 +6189,46 @@
         // её dataset после ответа будет уже не с чего.
         const oltIp = btn.dataset.oltIp || '';
         const port = btn.dataset.port || '';
+        const panel = btn.closest('[id^="contract-tp-info-"]');
+        const cid = panel && panel.dataset.contractId;
+
         btn.disabled = true;
         btn.classList.add('is-busy');
         btn.textContent = 'Обновление…';
-        onuSay(btn, '');
+        onuSay(btn, 'Запускаю опрос порта на OLT…');
+
+        /*
+         * Снимок «до». По нему видно, дошло ли до нас новое состояние:
+         * таймстемп «Обновлено» у ONU на этом порту меняется только после
+         * того, как OLT реально перечитал терминалы.
+         */
+        const beforeMap = new Map();
+        const t0 = Date.now();
+        try {
+            const snap = await ERP.getolt(cid, { noCache: true });
+            (snap.onu || []).filter((o) => String(o.port) === port)
+                .forEach((o) => beforeMap.set(String(o.onuId), o.updated || ''));
+        } catch (e) { /* без снимка просто не покажем «обновилось» */ }
+
+        /*
+         * Живой индикатор. Опрос порта — это SNMP-обход всех ONU на нём,
+         * и на загруженном порту он идёт секунд пятнадцать. Всё это время
+         * кнопка не должна выглядеть зависшей.
+         */
+        let elapsed = 0;
+        let seenUpdated = false;
+        const stopWatch = watchGetolt(cid, (olt) => {
+            elapsed += 3;
+            const onPort = (olt.onu || []).filter((o) => String(o.port) === port);
+            if (onPort.some((o) => o.updated && o.updated !== beforeMap.get(String(o.onuId)))) {
+                seenUpdated = true;
+            }
+            if (!document.contains(btn)) return;
+            btn.textContent = `Обновление… ${elapsed} с`;
+            onuSay(btn, seenUpdated
+                ? `Данные с порта обновились (${elapsed} с)…`
+                : `OLT опрашивает порт, ждём новые данные (${elapsed} с)…`);
+        }, { intervalMs: 3000, maxMs: 90000 });
 
         let res;
         try {
@@ -6012,54 +6240,39 @@
         } catch (e) {
             res = { ok: false, message: e.message || String(e) };
         }
+        stopWatch();
 
         btn.classList.remove('is-busy');
 
         if (res.ok) {
+            const spent = Math.max(1, Math.round((Date.now() - t0) / 1000));
+            const okText = `Порт опрошен за ${spent} с — данные в блоке свежие.`;
             btn.classList.add('is-done');
             btn.textContent = 'Обновлено!';
-            onuSay(btn, 'Порт опрошен. Уровни сигнала обновятся в GetOLT.', 'is-ok');
-            // Данные в блоке устарели — через пару секунд перечитаем GetOLT
+            onuSay(btn, okText, 'is-ok');
+
+            /*
+             * Порядок важен. refreshEquipmentNow перерисовывает тело блока
+             * целиком — кнопка, на которой сейчас «Обновлено!», исчезает
+             * вместе с сообщением. Поэтому сначала показываем результат
+             * (оператор его видит), и только потом перечитываем GetOLT,
+             * а сообщение переносим на новую кнопку того же порта.
+             */
             setTimeout(() => {
-                if (!document.contains(btn)) return;
-                btn.classList.remove('is-done');
-                btn.textContent = orig;
-                btn.disabled = false;
-                const panel = btn.closest('[id^="contract-tp-info-"]');
-                const cid = panel && panel.dataset.contractId;
-                if (panel && cid) {
-                    // Сбрасываем кэш GetOLT: без этого getolt.do с TTL 90 с
-                    // вернул бы тот же старый снимок, и «Обновлено» показало бы
-                    // прежние уровни сигнала — то есть кнопка выглядела бы
-                    // нерабочей.
-                    netDrop(/getolt\.do/i);
-                    ERP.getolt(cid).then((olt) => {
-                        const eq = panel.querySelector('.tp-lazy[data-lazy="equipment"] .tp-lazy-body');
-                        if (!eq || !olt || !olt.ok) return;
-                        // Перерисовываем только список ONU, объекты не трогаем
-                        ERP.equipment(cid).then((objs) => {
-                            if (!document.contains(eq)) return;
-                            setHtmlIfChanged(eq, renderEquipment(olt.onu, objs, panel._tpOltMap || null));
-                            bindCopyTargets(eq);
-                            bindOnuActions(panel);
-                            /*
-                             * Перерисовка убила и кнопку, и сообщение рядом с ней.
-                             * Оператор только что нажал «Обновить порт» и должен
-                             * видеть подтверждение, а не пустоту. Ставим текст на
-                             * новую кнопку того же порта.
-                             */
-                            const fresh = Array.from(eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]'))
-                                .find((b) => b.dataset.port === port && b.dataset.oltIp === oltIp);
-                            if (fresh) {
-                                onuSay(fresh, 'Порт опрошен. Уровни сигнала обновятся в GetOLT.', 'is-ok');
-                                setTimeout(() => {
-                                    if (document.contains(fresh)) onuSay(fresh, '');
-                                }, 8000);
-                            }
-                        }).catch(() => {});
-                    }).catch(() => {});
-                }
-            }, 2000);
+                refreshEquipmentNow(panel, cid);
+                // Перерисовка асинхронная — ждём её и ставим текст заново
+                setTimeout(() => {
+                    const eq = panel && panel.querySelector('.tp-lazy[data-lazy="equipment"] .tp-lazy-body');
+                    const fresh = eq && Array.from(eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]'))
+                        .find((b) => b.dataset.port === port && b.dataset.oltIp === oltIp);
+                    if (!fresh) return;
+                    fresh.disabled = false;
+                    onuSay(fresh, okText, 'is-ok');
+                    setTimeout(() => {
+                        if (document.contains(fresh)) onuSay(fresh, '');
+                    }, 10000);
+                }, 1200);
+            }, 1200);
             return;
         }
 
