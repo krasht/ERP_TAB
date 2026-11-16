@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.76
+// @version      0.72.77
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.76';
+    const SELF_VERSION = '0.72.77';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -5934,6 +5934,52 @@
         try { window.localStorage.setItem('getolt_reboot_' + key, String(Date.now())); } catch (e) { /* приватный режим */ }
     }
 
+    /*
+     * Состояние «только что выполнено» для кнопок ONU.
+     *
+     * Перерисовка блока (refreshEquipmentNow) создаёт НОВЫЕ кнопки, поэтому
+     * текст «Опрошен за 16 с» на старой кнопке исчезает вместе с ней и на
+     * мгновение появляется исходный «Обновить порт». Оператор видит проблеск.
+     *
+     * Держим итог отдельно от DOM и применяем к свежей кнопке сразу после
+     * рендера — в bindOnuActions. Ключ — действие + порт + ONU ID, чтобы
+     * у двух ONU на разных портах не путались состояния.
+     */
+    const ONU_RESULT = new Map();   // key -> { text, cls, until }
+    const ONU_RESULT_MS = 10000;
+
+    const onuResultKey = (act, btn) => [
+        act,
+        btn.dataset.port || '',
+        btn.dataset.onuId || '',
+        btn.dataset.oltIp || '',
+    ].join('|');
+
+    /** Запомнить итог операции, чтобы он пережил перерисовку. */
+    function setOnuResult(act, btn, text, cls) {
+        const key = onuResultKey(act, btn);
+        ONU_RESULT.set(key, { text, cls, until: Date.now() + ONU_RESULT_MS });
+    }
+
+    /** Применить сохранённый итог к свежей кнопке (если он ещё жив). */
+    function applyOnuResult(act, btn) {
+        const key = onuResultKey(act, btn);
+        const saved = ONU_RESULT.get(key);
+        if (!saved) return false;
+        if (saved.until <= Date.now()) { ONU_RESULT.delete(key); return false; }
+        onuSay(btn, saved.text, saved.cls);
+        const left = saved.until - Date.now();
+        if (btn._tpMsgTimer) clearTimeout(btn._tpMsgTimer);
+        btn._tpMsgTimer = setTimeout(() => {
+            btn._tpMsgTimer = null;
+            ONU_RESULT.delete(key);
+            if (!document.contains(btn)) return;
+            btn.className = btn.classList.contains('is-warn') ? 'tp-onu-btn is-warn' : 'tp-onu-btn';
+            btn.textContent = btn.dataset.tpLabel || 'Обновить порт';
+        }, left);
+        return true;
+    }
+
     /**
      * Обработчики кнопок действий с ONU.
      *
@@ -5979,6 +6025,19 @@
             if (btn._tpCoolTimer) return; // уже тикает на этой кнопке
             const left = rebootCooldownLeft(btn.dataset.rebootKey);
             if (left > 0) startCooldown(btn, left);
+        });
+
+        /*
+         * Итог прошлой операции — на свежие кнопки.
+         *
+         * Перерисовка создала новые узлы, и текст «Опрошен за 16 с» на них
+         * ещё не стоит. Применяем сохранённый результат сразу, в том же
+         * кадре, где кнопки появились: иначе между «Обновлено!» и «Опрошен
+         * за 16 с» успевал мелькнуть исходный «Обновить порт».
+         */
+        root.querySelectorAll('.tp-onu-btn').forEach((btn) => {
+            if (btn._tpCoolTimer) return; // кулдаун важнее итога
+            applyOnuResult(btn.dataset.onuAct, btn);
         });
     }
 
@@ -6058,6 +6117,11 @@
         }
     }
 
+    /** Класс кнопки без состояния — по нему возвращаемся в норму. */
+    function onuBaseClass(btn) {
+        return btn && btn.classList.contains('is-warn') ? 'tp-onu-btn is-warn' : 'tp-onu-btn';
+    }
+
     /** Перезагрузка ONU по кнопке. */
     async function doOnuReboot(btn) {
         const port = btn.dataset.port || '';
@@ -6115,19 +6179,19 @@
 
         if (res.ok) {
             const spent = Math.max(1, Math.round(Number(res.ms || 0) / 1000));
-            // В кнопке — короткий итог, не весь серверный текст: он длинный
-            // («ONU 6:63 успешно перезагружена. Повторная перезагрузка…»)
-            // и не влезает в кнопку.
-            onuSay(btn, spent ? `Перезагружена за ${spent} с` : 'Перезагружена!', 'is-ok');
+            const okText = spent ? `Перезагружена за ${spent} с` : 'Перезагружена!';
             // Отметку ставим в тот же ключ, что и плагин: кулдаун общий
             markRebooted(key);
-            // GetOLT уже знает новое состояние — перечитываем блок
-            refreshEquipmentNow(panel, cid);
+            // Итог — в общее состояние: после перерисовки его подхватит
+            // свежая кнопка в bindOnuActions, без проблеска исходной подписи.
+            setOnuResult('reboot', btn, okText, 'is-ok');
+            onuSay(btn, okText, 'is-ok');
+            setTimeout(() => { refreshEquipmentNow(panel, cid); }, 1200);
+            // Кулдаун начнём после того, как покажется итог
             setTimeout(() => {
                 if (!document.contains(btn)) return;
-                btn.classList.remove('is-done');
                 startCooldown(btn, GETOLT_REBOOT_COOLDOWN_MS);
-            }, 2000);
+            }, 3200);
             return;
         }
 
@@ -6228,33 +6292,12 @@
         if (res.ok) {
             const spent = Math.max(1, Math.round((Date.now() - t0) / 1000));
             const okText = `Опрошен за ${spent} с`;
-
-            /*
-             * Итог — В КНОПКЕ, один раз.
-             *
-             * Раньше текст ставился здесь, потом refreshEquipmentNow сносил
-             * тело блока вместе с ним, и через 1.2 с текст ставился заново.
-             * Оператор видел «появилось → пропало → появилось».
-             *
-             * Теперь пишем только после перерисовки, на свежую кнопку.
-             * До этого момента состояние видно по самой кнопке: она
-             * в классе is-done и подписана «Опрошен за N с».
-             */
+            // Итог — в общее состояние, а не в DOM: перерисовка создаст новые
+            // кнопки, и bindOnuActions применит текст к ним сразу.
+            setOnuResult('refresh', btn, okText, 'is-ok');
             onuSay(btn, okText, 'is-ok');
-            setTimeout(() => {
-                refreshEquipmentNow(panel, cid);
-                // Перерисовка асинхронная — ждём её и ставим текст один раз
-                setTimeout(() => {
-                    const eq = panel && panel.querySelector('.tp-lazy[data-lazy="equipment"] .tp-lazy-body');
-                    const fresh = eq && Array.from(eq.querySelectorAll('.tp-onu-btn[data-onu-act="refresh"]'))
-                        .find((b) => b.dataset.port === port && b.dataset.oltIp === oltIp);
-                    if (!fresh) return;
-                    fresh.disabled = false;
-                    // autoClearMs вместо отдельного setTimeout: новый текст
-                    // сам погасит предыдущий таймер (см. onuSay)
-                    onuSay(fresh, okText, 'is-ok', 10000);
-                }, 1200);
-            }, 1200);
+            // Перечитываем блок: новые кнопки подхватят итог в bindOnuActions
+            setTimeout(() => { refreshEquipmentNow(panel, cid); }, 1200);
             return;
         }
 
