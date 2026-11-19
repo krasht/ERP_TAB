@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.80
+// @version      0.72.81
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.80';
+    const SELF_VERSION = '0.72.81';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4286,6 +4286,10 @@
             --tp-red: #ff3b30;
             --tp-orange: #ff9500;
             --tp-blue: #007aff;
+            /* Длительность сессии: свой смысловой цвет, чтобы её не путали
+               со статусом (зелёный/красный) и обычным серым текстом.
+               #0a6fd8 темнее акцентного #007aff — на 11.5px нужен контраст. */
+            --tp-dur: #0a6fd8;
 
             /* Смысловые цвета состояний. Раньше каждый оттенок успеха был
                прописан отдельно (#1f8f42, #1f8f3d, #5fe07f, #6ee7a0), и они
@@ -4348,6 +4352,8 @@
             --tp-warn-bg: rgba(255,179,64,.14);
             --tp-bad: #ff6961;
             --tp-bad-bg: rgba(255,105,97,.14);
+            /* На тёмном фоне #0a6fd8 тонет: берём светлый оттенок. */
+            --tp-dur: #6cb2ff;
             --tp-fill-1: rgba(255,255,255,.05);
             --tp-fill-2: rgba(255,255,255,.08);
             --tp-fill-3: rgba(255,255,255,.12);
@@ -5265,6 +5271,9 @@
         .tp-sess-main { min-width: 0; }
         .tp-sess-svc { font-weight: 600; font-size: 13px; }
         .tp-sess-meta { font-size: 11.5px; color: var(--tp-fg2); margin-top: 2px; font-variant-numeric: tabular-nums; }
+        /* Длительность сессии — отдельным цветом: это расчёт скрипта,
+           а не текст ERP, и её не должны путать с датами и статусом. */
+        .tp-sess-dur { color: var(--tp-dur); font-weight: 600; white-space: nowrap; }
         .tp-sess-btn {
             font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
             padding: 5px 11px; border-radius: var(--tp-radius-sm); border: 0; white-space: nowrap;
@@ -6832,6 +6841,33 @@
 
     const sessKey = (r) => `${r.conId}|${r.start}|${r.ip}`;
 
+    /**
+     * Длительность сессии по меткам ERP «ДД.ММ.ГГГГ ЧЧ:ММ:СС».
+     *
+     * Считаем как «Окончание − Начало»: это время, которое соединение было
+     * активно. Колонку «Активность» из ERP не используем — её формат не
+     * проверен на живой сессии, а начало и окончание приходят всегда.
+     *
+     * Возвращает '' для незавершённой сессии (нет окончания) и для битых
+     * меток: лучше не показать ничего, чем «NaN ч».
+     */
+    function sessDurationText(startRaw, endRaw) {
+        const a = toTsSafe(startRaw);
+        const b = toTsSafe(endRaw);
+        if (!a || !b || b < a) return '';
+
+        const sec = Math.round((b - a) / 1000);
+        if (sec < 60) return 'меньше минуты';
+
+        const days = Math.floor(sec / 86400);
+        const hours = Math.floor((sec % 86400) / 3600);
+        const mins = Math.floor((sec % 3600) / 60);
+
+        if (days > 0) return days + ' д' + (hours ? ' ' + hours + ' ч' : '');
+        if (hours > 0) return hours + ' ч' + (mins ? ' ' + mins + ' мин' : '');
+        return mins + ' мин';
+    }
+
     function renderSessions(container, data, isFirst) {
         const rows = (data && data.rows) || [];
         const body = container.querySelector('.tp-sess-body');
@@ -6879,13 +6915,21 @@
             // имени биллинга, пока сервису не выдан адрес.
             const serviceName = cleanBillServiceName(r.service, { dropLogin: true, dropAddr: true });
 
+            // Длительность — отдельным цветом: это расчёт скрипта, а не текст
+            // ERP, и её не должны путать со статусом «завершена».
+            // У активных сессий окончания нет, поэтому там её не показываем.
+            const dur = kind === 'history' ? sessDurationText(r.start, r.end) : '';
+            const durHtml = dur
+                ? ` · <span class="tp-sess-dur" title="Сессия была активна ${esc(dur)}">${esc(dur)}</span>`
+                : '';
+
             html += `<div class="tp-sess-row ${isNew ? 'tp-fresh' : ''}">
                 <div class="tp-sess-main">
                     <div class="tp-sess-svc">${esc(serviceName || 'Интернет')} ${typeChip} ${stateBadge}</div>
                     <div class="tp-sess-meta">
                         IP ${esc(r.ip || '—')} · ${esc(r.device || '—')}<br>
                         ${kind === 'history'
-                            ? `${esc(r.start)} → ${esc(r.end || '—')} · ${esc(r.status || '')}`
+                            ? `${esc(r.start)} → ${esc(r.end || '—')}${durHtml} · ${esc(r.status || '')}`
                             : `с ${esc(r.start)} · ${esc(r.status || '')}`}
                         ${r.traffic ? `<br>трафик ${esc(r.traffic)} Мб` : ''}
                     </div>
