@@ -93,19 +93,45 @@ if (-not $git) { throw 'git не найден. Установите git или �
 
 Push-Location $root
 try {
+    # Папка должна быть КОРНЕМ репозитория с remote. Иначе git молча возьмёт
+    # родительский репозиторий (например, C:\Users\<user>), коммит уйдёт туда,
+    # а push упадёт уже после того, как версия и .meta.js изменены.
+    $top = @(& $git rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $top -or -not $top[0]) {
+        throw "Папка не является git-репозиторием: $root.`nСклонируйте репозиторий (git clone https://github.com/krasht/ERP_TAB.git) или выполните git init + git remote add origin."
+    }
+    $topPath = (Resolve-Path -LiteralPath $top[0].Trim()).Path.TrimEnd('\', '/')
+    $rootPath = (Resolve-Path -LiteralPath $root).Path.TrimEnd('\', '/')
+    if ($topPath -ne $rootPath) {
+        throw "Папка не корень репозитория. Репозиторий: $topPath.`nКоммит ушёл бы в чужой репозиторий, поэтому останавливаюсь."
+    }
+
+    $remotes = @(& $git remote)
+    if ($LASTEXITCODE -ne 0 -or $remotes.Count -eq 0) {
+        throw 'У репозитория нет remote. Добавьте: git remote add origin https://github.com/krasht/ERP_TAB.git'
+    }
+
+    $branch = @(& $git rev-parse --abbrev-ref HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $branch -or -not $branch[0]) {
+        throw 'Не удалось определить текущую ветку'
+    }
+    $branch = $branch[0].Trim()
+
     & $git add -- erp-contract-tp-tab.user.js erp-contract-tp-tab.meta.js
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось добавить файлы в индекс (git add)' }
+
     & $git -c user.name="Vladimir Chugunov" -c user.email="krasht@users.noreply.github.com" `
         commit -m "release v$Version" --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать коммит' }
 
-    & $git push origin main
-    if ($LASTEXITCODE -ne 0) { throw 'Не удалось отправить на GitHub' }
+    & $git push origin $branch
+    if ($LASTEXITCODE -ne 0) { throw "Не удалось отправить ветку $branch на GitHub" }
 } finally {
     Pop-Location
 }
 
 Write-Host ''
-Write-Host "Готово: версия $Version на GitHub."
+Write-Host "Готово: версия $Version на GitHub (ветка $branch)."
 Write-Host 'Tampermonkey подхватит её сам, а открытая вкладка ERP покажет'
 Write-Host 'баннер «Доступна новая версия» в течение 3 секунд после загрузки.'
 Write-Host ''

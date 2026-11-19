@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.78
+// @version      0.72.79
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.78';
+    const SELF_VERSION = '0.72.79';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -595,6 +595,16 @@
 
     let contentBuilder = () => '';
 
+    /*
+     * Слушатели, которые обязана снимать переинъекция (см. teardown).
+     *
+     * Объявлены здесь, а не рядом с местом установки, чтобы teardown мог
+     * обратиться к ним, не рискуя попасть в temporal dead zone: он вызывается
+     * из destroy() новой копии, но порядок объявлений в файле об этом не знает.
+     */
+    let hashNavHandler = null;
+    let updateVisHandler = null;
+
     /**
      * Запрос к ERP без таймаута.
      * Методы ERP бывают очень медленными (история статусов — до 25 с, платежи — до 10 с),
@@ -696,7 +706,7 @@
 
     const esc = (s) => String(s == null ? '' : s)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
     const parseHtml = (html) => {
         const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -12457,11 +12467,13 @@
         watch.started = true;
 
         let scheduled = false;
-        let retryTimer = null;
         let retryCount = 0;
 
         const tick = () => {
             scheduled = false;
+            // Копию уже сняли (переинъекция): отложенный retry не должен
+            // доработать за teardown и заново собрать панель старым кодом.
+            if (!watch.started) return;
             // Скрытая вкладка: ни сети, ни DOM-работы. Вернёмся — schedule() придёт
             // от visibilitychange и всё догонит.
             if (document.hidden) return;
@@ -12502,10 +12514,10 @@
         // раз в 150 мс с полным обходом всех .ui-tabs документа. После
         // 20 попыток ждём обычного тика — он придёт от таймера или мутации.
         const retrySoon = () => {
-            if (retryTimer) return;
+            if (watch.retryTimer) return;
             if (retryCount >= 20) return;
             retryCount += 1;
-            retryTimer = setTimeout(() => { retryTimer = null; tick(); }, 150);
+            watch.retryTimer = setTimeout(() => { watch.retryTimer = null; tick(); }, 150);
         };
 
         // Тик в свободное время: если браузер занят отрисовкой ERP, ждём паузы.
@@ -12601,8 +12613,12 @@
         document.addEventListener('click', schedule, true);
         window.addEventListener('popstate', schedule);
         window.addEventListener('hashchange', schedule);
-        // Вернулись на вкладку — сразу проверяем, что карточка на месте
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) schedule(); });
+        // Вернулись на вкладку — сразу проверяем, что карточка на месте.
+        // Обработчик именованный: teardown обязан снять и его, иначе старая
+        // копия продолжит тикать после переинъекции.
+        const onVisible = () => { if (!document.hidden) schedule(); };
+        document.addEventListener('visibilitychange', onVisible);
+        watch.visHandler = onVisible;
         watch.clickHandler = schedule;
 
         const $ = window.jQuery;
@@ -12638,6 +12654,10 @@
         watch.started = false;
         if (watch.timer) { clearInterval(watch.timer); watch.timer = null; }
         if (watch.observer) { watch.observer.disconnect(); watch.observer = null; }
+        // Отложенный retry и слушатель видимости живут вне observer/таймера —
+        // без явного снятия старая копия продолжает тикать после переинъекции.
+        if (watch.retryTimer) { clearTimeout(watch.retryTimer); watch.retryTimer = null; }
+        if (watch.visHandler) { document.removeEventListener('visibilitychange', watch.visHandler); watch.visHandler = null; }
 
         // Таймеры автообновления всех панелей и сетевой кэш
         document.querySelectorAll(PANEL_SEL).forEach((p) => stopAutoRefresh(p));
@@ -12649,6 +12669,10 @@
             window.removeEventListener('hashchange', watch.clickHandler);
             watch.clickHandler = null;
         }
+        // Навигация по договорам и проверка обновлений — отдельные
+        // слушатели, не связанные с «сторожем»: снимаем их тоже.
+        if (hashNavHandler) { window.removeEventListener('hashchange', hashNavHandler); hashNavHandler = null; }
+        if (updateVisHandler) { document.removeEventListener('visibilitychange', updateVisHandler); updateVisHandler = null; }
         if (watch.jq) {
             try { watch.jq(document).off('ajaxComplete'); } catch (e) { /* jQuery уже выгружен */ }
             watch.jq = null;
@@ -15986,8 +16010,21 @@
             // своего направления, и по одному процессу вторая роль не видна.
             const anchors = [];
 
-            // 1) из адреса: оператор как раз смотрит карточку процесса
-            const hashPid = (String(location.hash || '').match(/^#(\d+)$/) || [])[1] || '';
+            /*
+             * 1) из адреса: оператор как раз смотрит карточку процесса.
+             *
+             * Но hash бывает и чужим: на карточке договора адрес выглядит как
+             * /user/contract_bill#3, где 3 — ID ДОГОВОРА, а не процесса.
+             * Раньше он уходил в processExecutorsEdit, и ERP отвечала
+             * 500 «Процесс не найден» при каждой загрузке страницы договора
+             * (проверено на живой базе). Поэтому адресный якорь берём только
+             * вне карточки договора.
+             */
+            const onContractPage = /contract/i.test(location.pathname)
+                || !!document.querySelector('#content > div[id^="contract_bill-"]');
+            const hashPid = onContractPage
+                ? ''
+                : ((String(location.hash || '').match(/^#(\d+)$/) || [])[1] || '');
             if (hashPid) anchors.push(hashPid);
 
             // 2) мои открытые и закрытые
@@ -16572,7 +16609,7 @@
      */
 
     // Для проверки хватает шапки скрипта (.meta.js, ~1 КБ), а не всего файла
-    // на 490 КБ: иначе каждый оператор несколько раз в день качал бы полный
+    // на ~1 МБ: иначе каждый оператор несколько раз в день качал бы полный
     // файл ради одной строки с версией.
     const SELF_URL = 'https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.user.js';
     const SELF_META_URL = 'https://raw.githubusercontent.com/krasht/ERP_TAB/main/erp-contract-tp-tab.meta.js';
@@ -16686,7 +16723,14 @@
 
     function updateBannerMount(remoteVersion) {
         const id = 'tp-update-banner';
-        if (document.getElementById(id)) return;
+        const shown = document.getElementById(id);
+        if (shown) {
+            // Тот же релиз — баннер уже верный. Другой (0.72.79 → 0.72.80) —
+            // пересобираем: иначе в тексте и в кнопке «Позже» осталась бы
+            // прежняя версия, и отложился бы не тот релиз.
+            if (shown.dataset.version === String(remoteVersion)) return;
+            updateBannerRemove();
+        }
 
         const style = document.createElement('style');
         style.id = 'tp-update-style';
@@ -16734,6 +16778,7 @@
 
         const box = document.createElement('div');
         box.id = id;
+        box.dataset.version = String(remoteVersion);
 
         const icon = document.createElement('div');
         icon.className = 'tp-upd-icon';
@@ -16941,14 +16986,15 @@
         // Оператор может не перезагружать ERP часами, а релиз выходит днём.
         // Вернулся на вкладку — тоже повод проверить, но здесь ограничитель
         // нужен: переключение туда-обратно не должно слать запрос каждый раз.
-        document.addEventListener('visibilitychange', () => {
+        updateVisHandler = () => {
             if (document.hidden) return;
             // Вернулись после установки в соседней вкладке — перезагружаем
             // страницу, иначе она так и останется на старом коде, а проверка
             // обновлений продолжит показывать баннер.
             if (maybeReloadAfterInstall()) return;
             updateCheck('focus');
-        });
+        };
+        document.addEventListener('visibilitychange', updateVisHandler);
     }
 
     contentBuilder = buildContent;
@@ -16961,7 +17007,7 @@
      */
     let lastContractId = (location.hash || '').match(/#(\d+)/) ? (location.hash.match(/#(\d+)/) || [])[1] : '';
 
-    window.addEventListener('hashchange', () => {
+    hashNavHandler = () => {
         // Договор сменили — данные ПРЕЖНЕГО договора не годятся, но кэш
         // остальных открытых карточек трогать нельзя: при трёх договорах
         // полный сброс означал ~45 запросов на каждый переход.
@@ -16981,7 +17027,8 @@
             const panel = host ? findPanel(host) : null;
             if (panel) applyContent(panel, contentBuilder);
         }, 600);
-    });
+    };
+    window.addEventListener('hashchange', hashNavHandler);
 
     window.__tpInfoTab = {
         setContent,
