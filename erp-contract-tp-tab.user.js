@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.84
+// @version      0.72.85
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.84';
+    const SELF_VERSION = '0.72.85';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -6532,7 +6532,9 @@
         const rowHtml = (n) => {
             const self = String(n.onuId) === String(o.onuId);
             const verdict = n.up && Number.isFinite(n.rx) ? (signalVerdict(n.rx, 'rx') || 'warn') : '';
-            const rxText = Number.isFinite(n.rx) ? n.rx.toFixed(1) : '—';
+            // У down-строки RX нет — оставляем ячейку пустой. Прочерк «—» перед
+            // «down» только сдвигал метку и читался как ещё одно значение.
+            const rxText = Number.isFinite(n.rx) ? n.rx.toFixed(1) : '';
             const tag = self ? 'вы' : (n.up ? '' : 'down');
             // В узкой колонке полный MAC не помещается: оставляем последние
             // четыре октета (вендорский префикс HWTC и старшие байты OUI
