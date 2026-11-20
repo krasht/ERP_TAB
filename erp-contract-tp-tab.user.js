@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.82
+// @version      0.72.83
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.82';
+    const SELF_VERSION = '0.72.83';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4755,7 +4755,7 @@
         .tp-eq-nb-title { font-weight: 600; color: var(--tp-fg); }
         .tp-eq-nb-title::after { content: ' · '; color: var(--tp-fg3); font-weight: 400; }
         .tp-eq-nb-stat { color: var(--tp-fg3); font-variant-numeric: tabular-nums; }
-        .tp-eq-nb-body { margin-top: 4px; max-height: 320px; overflow-y: auto; padding-right: 2px; }
+        .tp-eq-nb-body { margin-top: 4px; }
         .tp-eq-nb-head, .tp-eq-nb-row {
             display: grid; grid-template-columns: 34px minmax(0, 1fr) 56px 34px;
             gap: 8px; align-items: center; padding: 2px 6px;
