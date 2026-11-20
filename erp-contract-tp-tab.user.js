@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.86
+// @version      0.72.87
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.86';
+    const SELF_VERSION = '0.72.87';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -1429,7 +1429,22 @@
             }
 
             const map = {};
-            list.forEach((o) => { map[String(o.id)] = { title: o.title || '', vendor: o.vendor || '' }; });
+            list.forEach((o) => {
+                // Помимо названия и вендора храним паспорт OLT и счётчики
+                // по портам: их отдаёт тот же ответ, а карточке ONU они нужны,
+                // чтобы показать «Порт 7: 65/69 online · 4 без сигнала».
+                const ports = {};
+                (o.ports || []).forEach((p) => { ports[String(p.portNumber)] = p; });
+                map[String(o.id)] = {
+                    title: o.title || '',
+                    vendor: o.vendor || '',
+                    city: o.city || '',
+                    status: o.status || '',
+                    lastUpdate: o.lastUpdate || '',
+                    total: o.total || null,
+                    ports,
+                };
+            });
             OLT_CACHE.data = map;
             OLT_CACHE.until = now + 5 * 60 * 1000;
             return map;
@@ -4727,6 +4742,17 @@
         }
         .tp-eq-group:first-child { padding-top: 0; }
         .tp-eq-chips { margin: 7px 0 0; gap: 5px; }
+        /* Строка состояния порта: только цифры, без оценок. */
+        .tp-eq-port {
+            margin-top: 6px; font-size: 11px; color: var(--tp-fg2);
+            font-variant-numeric: tabular-nums;
+        }
+        .tp-eq-port .tp-port-on.is-all { color: var(--tp-ok); }
+        .tp-eq-port .tp-port-off { color: var(--tp-fg3); }
+        .tp-eq-port .tp-port-over,
+        .tp-eq-port .tp-port-med { color: var(--tp-warn); }
+        .tp-eq-port .tp-port-poor,
+        .tp-eq-port .tp-port-nosig { color: var(--tp-bad); }
         /* ---- соседи по порту внутри карточки ONU
            Свёрнуты по умолчанию: 69 строк не растягивают панель, а в
            заголовке уже виден диагноз — сколько ONU, обычный сигнал на
@@ -4758,7 +4784,21 @@
         .tp-eq-nb-body { margin-top: 4px; }
         /* Две колонки: 69 строк в одну колонку растягивали карточку на 1700px. */
         .tp-eq-nb-body.is-cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; align-items: start; }
+        .tp-eq-nb-body.is-cols > .tp-eq-nb-legend { grid-column: 1 / -1; }
         .tp-eq-nb-col { min-width: 0; }
+        /* Разделитель колонок: видно, что список продолжается, а не начинается заново. */
+        .tp-eq-nb-col + .tp-eq-nb-col { border-left: 1px solid var(--tp-border); }
+        /* Легенда цветов: без неё зелёный/жёлтый/красный в списке приходится угадывать. */
+        .tp-eq-nb-legend {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 3px 10px;
+            margin: 0 0 5px; font-size: 9px; color: var(--tp-fg3);
+        }
+        .tp-eq-nb-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+        .tp-eq-nb-dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; }
+        .tp-eq-nb-dot.is-good { background: var(--tp-ok); }
+        .tp-eq-nb-dot.is-warn { background: var(--tp-warn); }
+        .tp-eq-nb-dot.is-bad { background: var(--tp-bad); }
+        .tp-eq-nb-dot.is-down { background: var(--tp-fg3); }
         .tp-eq-nb-head, .tp-eq-nb-row {
             display: grid; grid-template-columns: 22px minmax(0, 1fr) 40px 30px;
             gap: 3px; align-items: center; padding: 2px 4px;
@@ -4775,16 +4815,22 @@
             font-size: 9.5px; font-weight: 650; letter-spacing: .06em;
             text-transform: uppercase; color: var(--tp-fg3);
             padding-bottom: 3px;
+            border-bottom: 1px solid var(--tp-border);
         }
         .tp-eq-nb-head span:nth-child(3) { text-align: right; }
         .tp-eq-nb-row {
             border-left: 2px solid transparent; border-radius: 6px;
             font-size: 11.5px; font-variant-numeric: tabular-nums;
         }
+        .tp-eq-nb-row:hover { background: var(--tp-fill-1); }
         .tp-eq-nb-row.is-good { border-left-color: var(--tp-ok); }
         .tp-eq-nb-row.is-warn { border-left-color: var(--tp-warn); }
         .tp-eq-nb-row.is-bad  { border-left-color: var(--tp-bad); }
-        .tp-eq-nb-row.is-self { background: rgba(0,122,255,.09); }
+        /* Своя строка: синий акцент важнее цвета сигнала, иначе на узком
+           экране (где метка «ВЫ» скрыта) её не отличить от соседей. */
+        .tp-eq-nb-row.is-self { background: rgba(0,122,255,.09); border-left-color: var(--tp-blue); }
+        .tp-eq-nb-row.is-self:hover { background: rgba(0,122,255,.12); }
+        .tp-eq-nb-row.is-self .tp-eq-nb-id { color: var(--tp-blue); font-weight: 700; }
         .tp-eq-nb-row.is-down { opacity: .55; }
         .tp-eq-nb-id { color: var(--tp-fg2); }
         .tp-eq-nb-mac {
@@ -5648,7 +5694,8 @@
      *     tbody tr > td: MAC | ONU ID | RX (dBm) | Статус | Договор | Обновлено
      *
      * «Договор» у соседей маскирован (***714), у своей строки — полный,
-     * поэтому ориентироваться на него нельзя: свою строку узнаём по ONU ID.
+     * поэтому ориентироваться на него нельзя: свою строку узнаём по ONU ID
+     * (и по классу getolt-target-row, который плагин ставит на неё сам).
      * RX у выключенных — «-», такие строки в статистику не идут.
      */
     function parseNeighborRows(card) {
@@ -5666,6 +5713,7 @@
                     rx: pickNum(cell(2)),
                     up: /^(up|online)$/i.test(state),
                     state,
+                    self: tr.classList.contains('getolt-target-row'),
                 };
             })
             .filter((n) => n.onuId);
@@ -6536,7 +6584,7 @@
         const portTitle = `Соседи${port}`;
 
         const rowHtml = (n) => {
-            const self = String(n.onuId) === String(o.onuId);
+            const self = n.self || String(n.onuId) === String(o.onuId);
             const verdict = n.up && Number.isFinite(n.rx) ? (signalVerdict(n.rx, 'rx') || 'warn') : '';
             // У down-строки RX нет: «down» пишем в ту же ячейку, где у живых
             // стоит уровень. Отдельная колонка метки сдвигала слово вправо
@@ -6559,6 +6607,14 @@
 
         const head = '<div class="tp-eq-nb-head"><span>ONU</span><span>MAC</span><span>RX</span><span></span></div>';
         const list = rows.map(rowHtml);
+        // Легенда: без неё зелёный/жёлтый/красный в списке приходится
+        // угадывать. Пороги те же, что у чипов Rx/Tx выше.
+        const legend = '<div class="tp-eq-nb-legend">'
+            + '<span class="tp-eq-nb-legend-item"><i class="tp-eq-nb-dot is-good"></i>норма</span>'
+            + '<span class="tp-eq-nb-legend-item"><i class="tp-eq-nb-dot is-warn"></i>средне</span>'
+            + '<span class="tp-eq-nb-legend-item"><i class="tp-eq-nb-dot is-bad"></i>плохо</span>'
+            + '<span class="tp-eq-nb-legend-item"><i class="tp-eq-nb-dot is-down"></i>нет сигнала</span>'
+            + '</div>';
 
         // Две колонки — чтобы 69 строк не растягивали карточку на 1700px.
         // Короткий список (меньше 12) не разбиваем: он и так компактный,
@@ -6580,9 +6636,37 @@
                 <span class="tp-eq-nb-stat">${esc(bits.join(' · '))}</span>
             </summary>
             <div class="tp-eq-nb-body${twoCols ? ' is-cols' : ''}">
+                ${legend}
                 ${body}
             </div>
         </details>`;
+    }
+
+    /**
+     * Строка состояния порта: только факты из ответа OLT.
+     *
+     * Показываем все ненулевые категории, чтобы не гадать, откуда «без
+     * сигнала»: у порта могут быть offline, пересвет, средне, плохо.
+     * Никаких оценок и порогов — причины у каждого свои.
+     */
+    function portHealthHtml(stat, port) {
+        if (!stat || !port) return '';
+        const total = Number(stat.onuCount || stat.totalOnu || 0);
+        if (!total) return '';
+        const online = Number(stat.online || 0);
+        const parts = [
+            `<span class="tp-port-on${online >= total ? ' is-all' : ''}">${online}/${total} online</span>`,
+        ];
+        const cat = (n, cls, label) => {
+            const v = Number(n || 0);
+            if (v > 0) parts.push(`<span class="${cls}">${v} ${label}</span>`);
+        };
+        cat(stat.offline, 'tp-port-off', 'offline');
+        cat(stat.overexposed, 'tp-port-over', 'пересвет');
+        cat(stat.medium, 'tp-port-med', 'средне');
+        cat(stat.poor, 'tp-port-poor', 'плохо');
+        cat(stat.noSignal, 'tp-port-nosig', 'без сигнала');
+        return `<div class="tp-eq-port">Порт ${esc(port)}: ${parts.join(' · ')}</div>`;
     }
 
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
@@ -6614,10 +6698,20 @@
                 // Адрес OLT копируем по последним двум октетам: на OLT его ищут
                 // именно так. Порт и ONU ID копировать не даём — их набирают
                 // в других полях.
-                const place = [
-                    o.oltIp ? `OLT ${copySpan(shortIp(o.oltIp), o.oltIp)}` : '',
-                    o.port ? `порт ${o.port}${o.onuId ? ' / ONU ' + o.onuId : ''}` : '',
-                ].filter(Boolean).join(' · ');
+                const olt = olts[String(o.oltId || '')] || null;
+                const oltName = olt && olt.title ? ` · ${esc(olt.title)}` : '';
+                const oltCity = olt && olt.city ? ` · ${esc(olt.city)}` : '';
+                const oltStatus = olt && olt.status && olt.status !== 'OK'
+                    ? ` <span class="tp-chip is-bad">${esc(olt.status)}</span>`
+                    : '';
+                const oltLine = o.oltIp
+                    ? `OLT ${copySpan(shortIp(o.oltIp), o.oltIp)}${oltName}${oltCity}${oltStatus}`
+                    : '';
+                const portLine = o.port
+                    ? `порт ${esc(o.port)}${o.onuId ? ' / ONU ' + esc(o.onuId) : ''}`
+                    : '';
+                const portStat = olt && olt.ports ? olt.ports[String(o.port || '')] : null;
+                const portHealth = portHealthHtml(portStat, o.port);
 
                 const chips = [
                     signalChip('Rx', o.rx, 'rx'),
@@ -6650,10 +6744,12 @@
                                 : `<span class="tp-chip is-bad">${esc(o.state || 'offline')}</span>`}
                         </div>
                         ${o.mac ? `<div class="tp-device-meta tp-mono">MAC ${copySpan(onuMacCopy(o.mac, tech), o.mac)}</div>` : ''}
-                        ${place ? `<div class="tp-device-meta">${place}</div>` : ''}
+                        ${oltLine ? `<div class="tp-device-meta">${oltLine}</div>` : ''}
+                        ${portLine ? `<div class="tp-device-meta">${portLine}</div>` : ''}
                         ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${macLine}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
                         ${chips ? `<div class="tp-chips tp-eq-chips">${chips}</div>` : ''}
+                        ${portHealth}
                         ${nb}
                         ${o.updated ? `<div class="tp-device-meta tp-eq-upd">Обновлено: ${esc(o.updated)}</div>` : ''}
                         ${onuActions(o)}
