@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.83
+// @version      0.72.84
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.83';
+    const SELF_VERSION = '0.72.84';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4756,9 +4756,20 @@
         .tp-eq-nb-title::after { content: ' · '; color: var(--tp-fg3); font-weight: 400; }
         .tp-eq-nb-stat { color: var(--tp-fg3); font-variant-numeric: tabular-nums; }
         .tp-eq-nb-body { margin-top: 4px; }
+        /* Две колонки: 69 строк в одну колонку растягивали карточку на 1700px. */
+        .tp-eq-nb-body.is-cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; align-items: start; }
+        .tp-eq-nb-col { min-width: 0; }
         .tp-eq-nb-head, .tp-eq-nb-row {
-            display: grid; grid-template-columns: 34px minmax(0, 1fr) 56px 34px;
-            gap: 8px; align-items: center; padding: 2px 6px;
+            display: grid; grid-template-columns: 22px minmax(0, 1fr) 40px 30px;
+            gap: 3px; align-items: center; padding: 2px 4px;
+        }
+        /* На узком экране две колонки тесные: убираем метку «вы/down» —
+           своя строка и так подсвечена фоном, down приглушён и без RX.
+           Освободившиеся 33px отдаём MAC, чтобы он не обрезался. */
+        @media (max-width: 1560px) {
+            .tp-eq-nb-head, .tp-eq-nb-row { grid-template-columns: 22px minmax(0, 1fr) 40px; }
+            .tp-eq-nb-tag { display: none; }
+            .tp-eq-nb-head span:nth-child(4) { display: none; }
         }
         .tp-eq-nb-head {
             font-size: 9.5px; font-weight: 650; letter-spacing: .06em;
@@ -4777,7 +4788,7 @@
         .tp-eq-nb-row.is-down { opacity: .55; }
         .tp-eq-nb-id { color: var(--tp-fg2); }
         .tp-eq-nb-mac {
-            font-family: var(--tp-font-mono); font-size: 10.5px;
+            font-family: var(--tp-font-mono); font-size: 9.5px;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
         .tp-eq-nb-rx { text-align: right; font-weight: 600; }
@@ -4785,8 +4796,8 @@
         .tp-eq-nb-row.is-warn .tp-eq-nb-rx { color: var(--tp-warn); }
         .tp-eq-nb-row.is-bad  .tp-eq-nb-rx { color: var(--tp-bad); }
         .tp-eq-nb-tag {
-            font-size: 9.5px; font-weight: 700; text-align: right;
-            text-transform: uppercase; letter-spacing: .04em; color: var(--tp-fg3);
+            font-size: 8.5px; font-weight: 700; text-align: right;
+            text-transform: uppercase; letter-spacing: .03em; color: var(--tp-fg3);
         }
         .tp-eq-nb-row.is-self .tp-eq-nb-tag { color: var(--tp-blue); }
         .tp-eq-nb-row.is-down .tp-eq-nb-tag { color: var(--tp-bad); }
@@ -6518,19 +6529,40 @@
         // строкой выше — в карточке ONU. Полный вариант — в title.
         const portTitle = `Соседи${port}`;
 
-        const body = rows.map((n) => {
+        const rowHtml = (n) => {
             const self = String(n.onuId) === String(o.onuId);
             const verdict = n.up && Number.isFinite(n.rx) ? (signalVerdict(n.rx, 'rx') || 'warn') : '';
             const rxText = Number.isFinite(n.rx) ? n.rx.toFixed(1) : '—';
             const tag = self ? 'вы' : (n.up ? '' : 'down');
+            // В узкой колонке полный MAC не помещается: оставляем последние
+            // четыре октета (вендорский префикс HWTC и старшие байты OUI
+            // для идентификации не нужны), полный — в подсказке.
+            const groups = macGroups(n.mac);
+            const shortMac = groups.length > 4 ? groups.slice(-4).join(':') : (groups.join(':') || n.mac);
             return `<div class="tp-eq-nb-row${verdict ? ' is-' + verdict : ''}`
                 + `${self ? ' is-self' : ''}${n.up ? '' : ' is-down'}">`
                 + `<span class="tp-eq-nb-id">${esc(n.onuId)}</span>`
-                + `<span class="tp-eq-nb-mac" title="${esc(n.mac)}">${esc(n.mac)}</span>`
+                + `<span class="tp-eq-nb-mac" title="${esc(n.mac)}">${esc(shortMac)}</span>`
                 + `<span class="tp-eq-nb-rx">${esc(rxText)}</span>`
                 + `<span class="tp-eq-nb-tag">${tag}</span>`
                 + '</div>';
-        }).join('');
+        };
+
+        const head = '<div class="tp-eq-nb-head"><span>ONU</span><span>MAC</span><span>RX</span><span></span></div>';
+        const list = rows.map(rowHtml);
+
+        // Две колонки — чтобы 69 строк не растягивали карточку на 1700px.
+        // Короткий список (меньше 12) не разбиваем: он и так компактный,
+        // а половина пустой колонки выглядела бы недоделкой.
+        const twoCols = list.length >= 12;
+        let body;
+        if (twoCols) {
+            const half = Math.ceil(list.length / 2);
+            body = `<div class="tp-eq-nb-col">${head}${list.slice(0, half).join('')}</div>`
+                + `<div class="tp-eq-nb-col">${head}${list.slice(half).join('')}</div>`;
+        } else {
+            body = `<div class="tp-eq-nb-col">${head}${list.join('')}</div>`;
+        }
 
         return `<details class="tp-eq-nb" data-nb-key="${esc(o.oltId || '')}|${esc(o.port || '')}|${esc(o.onuId || '')}">
             <summary class="tp-eq-nb-sum" title="${esc(portTitle)}">
@@ -6538,8 +6570,7 @@
                 <span class="tp-eq-nb-title">Соседи</span>
                 <span class="tp-eq-nb-stat">${esc(bits.join(' · '))}</span>
             </summary>
-            <div class="tp-eq-nb-body">
-                <div class="tp-eq-nb-head"><span>ONU</span><span>MAC</span><span>RX</span><span></span></div>
+            <div class="tp-eq-nb-body${twoCols ? ' is-cols' : ''}">
                 ${body}
             </div>
         </details>`;
