@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ERP — вкладка «Для ТП» в договоре
 // @namespace    https://sd.org.avanta-telecom.ru/
-// @version      0.72.81
+// @version      0.72.82
 // @description  Вкладка «Для ТП» рядом с «GetOLT» в карточке договора: данные абонента, оборудование, ошибки Radius, баланс/блокировка, тариф, примечания, кнопка «Доверительный платёж» (лимит). Плюс автозаполнение окна повторного входа
 // @author       Vladimir Chugunov
 // @match        https://sd.org.avanta-telecom.ru/user
@@ -28,7 +28,7 @@
     // Единственное место, где поднимается версия: отсюда её берут и защита от
     // повторной загрузки, и проверка обновлений. Раньше строка дублировалась,
     // и версию забывали поднять в одном из двух мест.
-    const SELF_VERSION = '0.72.81';
+    const SELF_VERSION = '0.72.82';
     window.__erpTpTab = { version: SELF_VERSION, destroy: null };
 
     /**
@@ -4686,6 +4686,10 @@
             background: rgba(0,122,255,.12); display: grid; place-items: center; font-size: 15px;
         }
         .tp-device-main { min-width: 0; flex: 1 1 auto; }
+        /* Раскрытые «Соседи по порту» делают карточку высокой: иконка
+           должна остаться сверху, а не центрироваться по всей высоте. */
+        .tp-device.has-nb { align-items: flex-start; }
+        .tp-device.has-nb .tp-device-icon { margin-top: 2px; }
         .tp-device-name { font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
         .tp-device-meta { font-size: 12px; color: var(--tp-fg2); }
         /* Копируемый фрагмент: адрес OLT и подобное.
@@ -4723,6 +4727,71 @@
         }
         .tp-eq-group:first-child { padding-top: 0; }
         .tp-eq-chips { margin: 7px 0 0; gap: 5px; }
+        /* ---- соседи по порту внутри карточки ONU
+           Свёрнуты по умолчанию: 69 строк не растягивают панель, а в
+           заголовке уже виден диагноз — сколько ONU, обычный сигнал на
+           порту и сигнал абонента. Данные приходят вместе с GetOLT,
+           поэтому блок не делает ни одного дополнительного запроса. */
+        .tp-eq-nb { margin-top: 8px; }
+        .tp-eq-nb > summary {
+            display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 4px;
+            padding: 5px 6px; border-radius: 8px;
+            background: var(--tp-fill-1);
+            /* 10.5px, а не 11.5: строка «Соседи · 69 ONU · обычно … · у абонента …»
+               должна укладываться в одну строку и на 1366px. */
+            font-size: 10.5px; color: var(--tp-fg2);
+            cursor: pointer; list-style: none;
+        }
+        .tp-eq-nb > summary::-webkit-details-marker { display: none; }
+        .tp-eq-nb > summary:hover { background: var(--tp-fill-2); }
+        .tp-eq-nb-caret {
+            width: 0; height: 0; flex: 0 0 auto;
+            border-left: 4px solid currentColor;
+            border-top: 3.5px solid transparent;
+            border-bottom: 3.5px solid transparent;
+            transition: transform .12s ease;
+        }
+        .tp-eq-nb[open] .tp-eq-nb-caret { transform: rotate(90deg); }
+        .tp-eq-nb-title { font-weight: 600; color: var(--tp-fg); }
+        .tp-eq-nb-title::after { content: ' · '; color: var(--tp-fg3); font-weight: 400; }
+        .tp-eq-nb-stat { color: var(--tp-fg3); font-variant-numeric: tabular-nums; }
+        .tp-eq-nb-body { margin-top: 4px; max-height: 320px; overflow-y: auto; padding-right: 2px; }
+        .tp-eq-nb-head, .tp-eq-nb-row {
+            display: grid; grid-template-columns: 34px minmax(0, 1fr) 56px 34px;
+            gap: 8px; align-items: center; padding: 2px 6px;
+        }
+        .tp-eq-nb-head {
+            font-size: 9.5px; font-weight: 650; letter-spacing: .06em;
+            text-transform: uppercase; color: var(--tp-fg3);
+            padding-bottom: 3px;
+        }
+        .tp-eq-nb-head span:nth-child(3) { text-align: right; }
+        .tp-eq-nb-row {
+            border-left: 2px solid transparent; border-radius: 6px;
+            font-size: 11.5px; font-variant-numeric: tabular-nums;
+        }
+        .tp-eq-nb-row.is-good { border-left-color: var(--tp-ok); }
+        .tp-eq-nb-row.is-warn { border-left-color: var(--tp-warn); }
+        .tp-eq-nb-row.is-bad  { border-left-color: var(--tp-bad); }
+        .tp-eq-nb-row.is-self { background: rgba(0,122,255,.09); }
+        .tp-eq-nb-row.is-down { opacity: .55; }
+        .tp-eq-nb-id { color: var(--tp-fg2); }
+        .tp-eq-nb-mac {
+            font-family: var(--tp-font-mono); font-size: 10.5px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .tp-eq-nb-rx { text-align: right; font-weight: 600; }
+        .tp-eq-nb-row.is-good .tp-eq-nb-rx { color: var(--tp-ok); }
+        .tp-eq-nb-row.is-warn .tp-eq-nb-rx { color: var(--tp-warn); }
+        .tp-eq-nb-row.is-bad  .tp-eq-nb-rx { color: var(--tp-bad); }
+        .tp-eq-nb-tag {
+            font-size: 9.5px; font-weight: 700; text-align: right;
+            text-transform: uppercase; letter-spacing: .04em; color: var(--tp-fg3);
+        }
+        .tp-eq-nb-row.is-self .tp-eq-nb-tag { color: var(--tp-blue); }
+        .tp-eq-nb-row.is-down .tp-eq-nb-tag { color: var(--tp-bad); }
+        html[data-theme="dark"] .tp-eq-nb-row.is-self,
+        html[data-theme="modern-dark"] .tp-eq-nb-row.is-self { background: rgba(10,132,255,.18); }
         /* Действия с ONU — те же, что в GetOLT, но внутри карточки оборудования.
            Кнопки маленькие и намеренно не .tp-btn: это не главное действие
            экрана, а служебное, рядом с телеметрией. */
@@ -5555,6 +5624,57 @@
     }
 
     /**
+     * Соседи по порту из таблицы GetOLT.
+     *
+     * Плагин кладёт её в каждую карточку ONU:
+     *   table.getolt-neighbors-table
+     *     tbody tr > td: MAC | ONU ID | RX (dBm) | Статус | Договор | Обновлено
+     *
+     * «Договор» у соседей маскирован (***714), у своей строки — полный,
+     * поэтому ориентироваться на него нельзя: свою строку узнаём по ONU ID.
+     * RX у выключенных — «-», такие строки в статистику не идут.
+     */
+    function parseNeighborRows(card) {
+        const table = card.querySelector('table.getolt-neighbors-table');
+        if (!table) return [];
+
+        return Array.from(table.querySelectorAll('tbody tr'))
+            .map((tr) => {
+                const tds = Array.from(tr.querySelectorAll('td'));
+                const cell = (i) => (tds[i] ? String(tds[i].textContent || '').replace(/\s+/g, ' ').trim() : '');
+                const state = cell(3);
+                return {
+                    mac: cell(0),
+                    onuId: cell(1),
+                    rx: pickNum(cell(2)),
+                    up: /^(up|online)$/i.test(state),
+                    state,
+                };
+            })
+            .filter((n) => n.onuId);
+    }
+
+    /**
+     * «Обычный сигнал на порту» — медиана RX по живым соседям.
+     *
+     * Медиана, а не среднее: один аномально слабый или сильный ONU не должен
+     * сдвигать ориентир для всех остальных. Строки без RX (down) не входят.
+     */
+    function neighborStats(list) {
+        const rows = list || [];
+        const rxs = rows
+            .filter((n) => n.up && Number.isFinite(n.rx))
+            .map((n) => n.rx)
+            .sort((a, b) => a - b);
+        let median = NaN;
+        if (rxs.length) {
+            const mid = Math.floor(rxs.length / 2);
+            median = rxs.length % 2 ? rxs[mid] : (rxs[mid - 1] + rxs[mid]) / 2;
+        }
+        return { total: rows.length, median };
+    }
+
+    /**
      * Разбирает страницу GetOLT в список ONU.
      *
      * Реальная разметка плагина (проверено на живой карточке):
@@ -5627,6 +5747,10 @@
             const portAttr = attr('bg-port');
             const onuIdAttr = attr('bg-onu-id');
 
+            // Соседи по порту — из таблицы в этой же карточке. Отдельного
+            // запроса не нужно: плагин отдаёт её вместе с данными ONU.
+            const neighbors = parseNeighborRows(card);
+
             return {
                 mac: String(mac).trim(),
                 // ID OLT из кнопки «Перезагрузить ONU»: по нему находим тип PON
@@ -5654,6 +5778,8 @@
                 voltage: map[normLabel('Напряжение')] || '',
                 state: map[normLabel('Статус')] || statusText,
                 macs,
+                neighbors,
+                nbStats: neighborStats(neighbors),
                 raw: map,
             };
         };
@@ -6257,7 +6383,14 @@
             if (!eq || !olt || !olt.ok) return;
             ERP.equipment(cid).then((objs) => {
                 if (!document.contains(eq)) return;
+                // Раскрытые «Соседи по порту» переживают перерисовку: иначе
+                // после «Обновить порт» список захлопывался бы у оператора.
+                const openNb = new Set(Array.from(eq.querySelectorAll('details.tp-eq-nb[open]'))
+                    .map((d) => d.dataset.nbKey));
                 setHtmlIfChanged(eq, renderEquipment(olt.onu, objs, panel._tpOltMap || null));
+                eq.querySelectorAll('details.tp-eq-nb').forEach((d) => {
+                    if (openNb.has(d.dataset.nbKey)) d.open = true;
+                });
                 bindCopyTargets(eq);
                 bindOnuActions(panel);
             }).catch(() => {});
@@ -6360,6 +6493,58 @@
         setTimeout(() => { if (document.contains(btn)) btn.classList.remove('is-fail'); }, 6000);
     }
 
+    /**
+     * «Соседи по порту» внутри карточки ONU.
+     *
+     * Свёрнут по умолчанию: в заголовке уже есть диагноз (сколько ONU,
+     * обычный сигнал, сигнал абонента), а раскрытый список — детали.
+     * Таблица приходит в том же ответе GetOLT, поэтому запросов не добавляет.
+     *
+     * «Обычно» — медиана по живым соседям. Так оператор видит, проблема
+     * на всём порту (все около −25) или только у этого абонента.
+     */
+    function renderNeighbors(o) {
+        const rows = (o && o.neighbors) || [];
+        if (!rows.length) return '';
+
+        const st = (o && o.nbStats) || {};
+        const bits = [`${st.total || rows.length} ONU`];
+        if (Number.isFinite(st.median)) bits.push(`обычно ${st.median.toFixed(1)} дБм`);
+        if (Number.isFinite(o.rx)) bits.push(`у абонента ${o.rx.toFixed(1)} дБм`);
+
+        const port = o.port ? ` по порту ${o.port}` : '';
+        // В заголовке оставляем только «Соседи»: полный текст с номером порта
+        // не помещается в одну строку рядом с цифрами, а порт и так виден
+        // строкой выше — в карточке ONU. Полный вариант — в title.
+        const portTitle = `Соседи${port}`;
+
+        const body = rows.map((n) => {
+            const self = String(n.onuId) === String(o.onuId);
+            const verdict = n.up && Number.isFinite(n.rx) ? (signalVerdict(n.rx, 'rx') || 'warn') : '';
+            const rxText = Number.isFinite(n.rx) ? n.rx.toFixed(1) : '—';
+            const tag = self ? 'вы' : (n.up ? '' : 'down');
+            return `<div class="tp-eq-nb-row${verdict ? ' is-' + verdict : ''}`
+                + `${self ? ' is-self' : ''}${n.up ? '' : ' is-down'}">`
+                + `<span class="tp-eq-nb-id">${esc(n.onuId)}</span>`
+                + `<span class="tp-eq-nb-mac" title="${esc(n.mac)}">${esc(n.mac)}</span>`
+                + `<span class="tp-eq-nb-rx">${esc(rxText)}</span>`
+                + `<span class="tp-eq-nb-tag">${tag}</span>`
+                + '</div>';
+        }).join('');
+
+        return `<details class="tp-eq-nb" data-nb-key="${esc(o.oltId || '')}|${esc(o.port || '')}|${esc(o.onuId || '')}">
+            <summary class="tp-eq-nb-sum" title="${esc(portTitle)}">
+                <span class="tp-eq-nb-caret"></span>
+                <span class="tp-eq-nb-title">Соседи</span>
+                <span class="tp-eq-nb-stat">${esc(bits.join(' · '))}</span>
+            </summary>
+            <div class="tp-eq-nb-body">
+                <div class="tp-eq-nb-head"><span>ONU</span><span>MAC</span><span>RX</span><span></span></div>
+                ${body}
+            </div>
+        </details>`;
+    }
+
     /** Блок «Оборудование»: ONU с OLT + объекты договора из биллинга. */
     function renderEquipment(onuList, objects, oltMap) {
         const onu = onuList || [];
@@ -6414,7 +6599,9 @@
                         + `${macs.length > 1 ? ` и ещё ${macs.length - 1}` : ''}`
                     : '';
 
-                html += `<div class="tp-device">
+                const nb = renderNeighbors(o);
+
+                html += `<div class="tp-device${nb ? ' has-nb' : ''}">
                     <div class="tp-device-icon">${o.online ? '●' : '○'}</div>
                     <div class="tp-device-main">
                         <div class="tp-device-name">ONU
@@ -6427,6 +6614,7 @@
                         ${macLine ? `<div class="tp-device-meta tp-mono">за ONU: ${macLine}</div>` : ''}
                         ${telemetry ? `<div class="tp-device-meta">${esc(telemetry)}</div>` : ''}
                         ${chips ? `<div class="tp-chips tp-eq-chips">${chips}</div>` : ''}
+                        ${nb}
                         ${o.updated ? `<div class="tp-device-meta tp-eq-upd">Обновлено: ${esc(o.updated)}</div>` : ''}
                         ${onuActions(o)}
                     </div>
